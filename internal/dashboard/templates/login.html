@@ -1,0 +1,14 @@
+{{define "content"}}
+<section class="login card">
+  <h1>email-me</h1>
+  <p class="muted">Operator dashboard</p>
+  {{with .Data.Error}}<div class="flash error" role="alert">{{.}}</div>{{end}}
+  {{with .Data.SharedHost}}<div class="banner warn">Tip: open the dashboard at <a href="{{.}}/login">{{.}}</a> instead. Browsers share <code>localhost</code> cookies with every local port, so a web server another local process runs could receive your session; a dedicated host name keeps the cookie to email-me.</div>{{end}}
+  <form method="post" action="/login">
+    <input type="hidden" name="next" value="{{.Data.Next}}">
+    <label for="password">Admin password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Log in</button>
+  </form>
+</section>
+{{end}}

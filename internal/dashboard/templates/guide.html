@@ -1,0 +1,5 @@
+{{define "content"}}
+<h1>Agent guide</h1>
+<p class="hint">This is what agents receive from <code>GET {{.Data.BaseURL}}/</code>. It contains no aliases, addresses or agent names; those come from the authenticated <code>/v1/capabilities</code>.</p>
+<pre class="guide">{{.Data.Guide}}</pre>
+{{end}}

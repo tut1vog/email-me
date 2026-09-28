@@ -1,0 +1,24 @@
+{{define "content"}}
+{{$d := .Data}}
+<h1>Token for {{$d.Agent.Name}}</h1>
+<div class="banner warn"><strong>Copy this token now.</strong> It is shown only once; email-me stores only a hash of it.</div>
+<section class="card">
+  <label for="token">Token (ID <code>{{$d.TokenID}}</code>)</label>
+  <div class="copy-row"><input id="token" readonly value="{{$d.Token}}"><button type="button" data-copy="token">Copy</button></div>
+
+  <h2>Give the agent</h2>
+  <p>Set two environment variables where the agent runs:</p>
+  <pre id="env">EMAIL_ME_URL={{$d.BaseURL}}
+EMAIL_ME_TOKEN={{$d.Token}}</pre>
+  <p><button type="button" data-copy="env" class="secondary">Copy</button></p>
+
+  <p>And add this to the agent's instructions or system prompt:</p>
+  <pre id="snippet">{{$d.Snippet}}</pre>
+  <p><button type="button" data-copy="snippet" class="secondary">Copy</button></p>
+
+  <h2>Try it</h2>
+  <pre id="curl">curl -s -H "Authorization: Bearer $EMAIL_ME_TOKEN" $EMAIL_ME_URL/v1/capabilities</pre>
+  <p class="hint">If agents reach the gateway from another host, make sure that path uses TLS or an encrypted tunnel: signing requires the gateway to see message content.</p>
+  <p><a class="button" href="/agents/{{$d.Agent.ID}}#tokens">Done</a></p>
+</section>
+{{end}}

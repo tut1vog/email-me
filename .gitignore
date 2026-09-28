@@ -1,0 +1,8 @@
+# Local deployment files (never commit real config or secrets)
+/config/
+/secrets/
+/data/
+
+# Build output
+/email-me
+/dist/

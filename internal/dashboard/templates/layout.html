@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · email-me</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+{{if .LoggedIn}}
+<header class="top">
+  <a class="brand" href="/">email-me</a>
+  <nav>
+    <a href="/" {{if eq .Nav "overview"}}aria-current="page"{{end}}>Overview</a>
+    <a href="/agents" {{if or (eq .Nav "agents") (eq .Nav "agent") (eq .Nav "agent_new") (eq .Nav "token") (eq .Nav "agent_delete")}}aria-current="page"{{end}}>Agents</a>
+    <a href="/recipients" {{if eq .Nav "recipients"}}aria-current="page"{{end}}>Recipients</a>
+    <a href="/audit" {{if eq .Nav "audit"}}aria-current="page"{{end}}>Audit</a>
+    <a href="/settings" {{if or (eq .Nav "settings") (eq .Nav "guide")}}aria-current="page"{{end}}>Settings</a>
+  </nav>
+  <form method="post" action="/logout" class="logout">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit" class="link">Log out</button>
+  </form>
+</header>
+{{end}}
+<main>
+{{range .Flash}}<div class="flash {{.Kind}}" role="status">{{.Message}}</div>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>

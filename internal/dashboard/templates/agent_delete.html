@@ -1,0 +1,20 @@
+{{define "content"}}
+{{$d := .Data}}{{$a := $d.Agent}}
+<h1>Delete {{$a.Name}}</h1>
+<section class="card">
+  <p>This permanently deletes the agent, all its tokens (agents using them get <code>401</code>) and its signing keys. Audit rows are kept until retention removes them.</p>
+  {{if $d.Keys}}
+  <p><strong>Download revocation certificates first</strong> if you imported or published these keys; they cannot be recovered after deletion.</p>
+  <ul>
+    {{range $d.Keys}}<li><code>{{.Fingerprint}}</code> — revocation certificate: <a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/revocation.asc">retired</a> (normal choice; past signatures stay valid) or <a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/revocation-compromised.asc">compromised</a></li>{{end}}
+  </ul>
+  {{end}}
+  <form method="post" action="/agents/{{$a.ID}}/delete" class="form">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="confirm">Type <code>{{$a.Name}}</code> to confirm</label>
+    <input id="confirm" name="confirm" autocomplete="off" required>
+    <button type="submit" class="danger">Delete agent</button>
+    <a href="/agents/{{$a.ID}}">Cancel</a>
+  </form>
+</section>
+{{end}}

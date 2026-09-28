@@ -1,0 +1,18 @@
+{{define "content"}}
+<h1>Recipients</h1>
+<p class="hint">Recipients are defined in <code>config.yaml</code> (read-only here). Agents only ever see the alias and description.</p>
+<table class="card">
+  <thead><tr><th>Alias</th><th>Address</th><th>Description</th><th>Encryption</th><th>PGP key</th></tr></thead>
+  <tbody>
+  {{range .Data.Rows}}
+    <tr>
+      <td><strong>{{.Alias}}</strong></td>
+      <td>{{.R.Address}}</td>
+      <td>{{.R.Description}}</td>
+      <td>{{if .R.RequireEncryption}}<span class="tag">required</span>{{else if .KeyFpr}}available{{else}}<span class="muted">unavailable</span>{{end}}</td>
+      <td>{{if .KeyFpr}}<code title="{{.KeyFpr}}">…{{short .KeyFpr}}</code>{{if not .KeyExpiry.IsZero}} · expires {{ts .KeyExpiry}}{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

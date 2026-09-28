@@ -1,0 +1,40 @@
+{{define "content"}}
+{{$d := .Data}}
+<h1>Settings</h1>
+{{range $d.Warnings}}<div class="banner warn">{{.}}</div>{{end}}
+
+<section class="card">
+  <h2>Upstream SMTP</h2>
+  {{with $d.SMTP}}<p>Last check {{ts .At}}: {{if .OK}}<span class="tag ok">ok</span>{{else}}<span class="tag danger">failed</span> {{.Err}}{{end}}</p>{{end}}
+  <form method="post" action="/settings/test-smtp" class="inline">
+    <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings">
+    <button type="submit" class="secondary">Test connection</button>
+  </form>
+  <form method="post" action="/settings/test-send" class="inline">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
+    <button type="submit" class="secondary">Send test</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Agent onboarding</h2>
+  <p><a href="/settings/guide">Preview the agent guide</a> served at the API's <code>GET /</code>.</p>
+</section>
+
+<section class="card">
+  <h2>Signing keys</h2>
+  {{if $d.SigningEnabled}}
+    <p><a class="button secondary" href="/keys.asc">Download all agent public keys</a>{{if $d.MasterFpr}} (includes the master certification key <code>{{$d.MasterFpr}}</code>){{end}}</p>
+    <p class="hint">Import these into your mail client to verify signatures.{{if $d.MasterFpr}} In GnuPG you can instead trust the master key once; agent keys it certifies are then valid automatically. Thunderbird ignores certifications, so import agent keys there individually.{{end}}</p>
+  {{else}}
+    <p class="muted">Signing is not configured.</p>
+  {{end}}
+</section>
+
+<section class="card">
+  <h2>Effective configuration</h2>
+  <p class="hint">Secrets are read from files and never shown. Edit <code>config.yaml</code> and restart to change these.</p>
+  <pre class="config">{{$d.ConfigYAML}}</pre>
+</section>
+{{end}}

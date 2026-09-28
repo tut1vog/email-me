@@ -1,0 +1,70 @@
+# email-me configuration. Copy to ./config/config.yaml and edit.
+# Secrets are never written here: every *_file points at a Docker secret.
+# The file is validated at startup and every problem is reported at once.
+
+data_dir: /data                     # holds state.db (agents, token hashes, keys, audit metadata)
+
+api:
+  listen: "0.0.0.0:8025"            # inside the container; compose publishes 127.0.0.1 only
+  public_url: ""                    # e.g. https://email-me.example.ts.net — used in the agent guide
+  docs: public                      # public | authenticated — who may read /, /llms.txt, /openapi.json
+  tls:                              # optional built-in TLS for the agent API
+    cert_file: ""
+    key_file: ""
+  trusted_proxies: []               # CIDRs of reverse proxies whose X-Forwarded-* headers are honored
+  external_transport_encryption: false   # true = you assert agents reach the API over an encrypted
+                                         # tunnel (Tailscale/WireGuard/SSH); silences plain-HTTP warnings
+
+dashboard:
+  listen: "0.0.0.0:8026"
+  admin_password_file: /run/secrets/admin_password   # plaintext (≥12 chars) or an argon2id PHC hash
+  session_ttl: 12h
+
+upstream:
+  smtp:
+    host: smtp.gmail.com
+    port: 587
+    security: starttls              # starttls | tls | none (none only to localhost unless allow_plaintext)
+    username: you@gmail.com
+    password_file: /run/secrets/smtp_password         # e.g. a Gmail app password
+    timeout: 30s
+  from: you@gmail.com               # envelope and header From address
+  from_name_template: "{agent} via email-me"
+
+recipients:                         # agents address these aliases; they never see the addresses
+  me:
+    address: you@gmail.com
+    description: "Personal inbox — general results and reports"
+    # pgp_public_key_file: /config/keys/me.asc   # enables encrypt: pgp and e2e for this alias
+  # work:
+  #   address: you@company.com
+  #   description: "Work inbox — only work-related results"
+  #   pgp_public_key_file: /config/keys/work.asc
+  #   require_encryption: true
+
+signing:                            # per-agent signing keys held by the gateway; on by default when set
+  key_encryption_key_file: /run/secrets/signing_kek     # openssl rand -hex 32
+  key_validity: 2y
+  # certify_with:                   # optional master key that certifies every agent key
+  #   pgp_private_key_file: /run/secrets/master_key.asc
+  #   passphrase_file: /run/secrets/master_key_passphrase
+
+defaults:
+  policy:                           # applied to agents unless their policy overrides a field
+    recipients: []                  # grant aliases per agent in the dashboard
+    services: [markdown, attachments, thread, sign]
+    max_message_bytes: 10MiB        # decoded body + attachments
+    max_attachments: 10
+    allowed_attachment_types: []    # empty = any; e.g. ["text/*", "application/pdf", "image/*"]
+    rate_limit: { per_hour: 20, per_day: 100 }
+    subject_prefix: "[{agent}] "
+    require_encryption: false
+    # require_signing: omitted = true when signing is configured, false otherwise
+
+audit:
+  retention_days: 30
+  log_subject: false                # subjects are content; off by default
+
+log:
+  level: info                       # debug | info | warn | error
+  format: json                      # json | text

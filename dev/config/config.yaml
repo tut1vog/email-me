@@ -1,0 +1,26 @@
+# Development only: delivers to the Mailpit container. The secrets in
+# dev/secrets are throwaway values; never reuse them.
+api:
+  listen: "0.0.0.0:8025"
+dashboard:
+  listen: "0.0.0.0:8026"
+  admin_password_file: /run/secrets/admin_password
+upstream:
+  smtp:
+    host: mailpit
+    port: 1025
+    security: none
+    allow_plaintext: true
+  from: email-me@dev.local
+recipients:
+  me:
+    address: me@dev.local
+    description: "Developer inbox (Mailpit)"
+  ops:
+    address: ops@dev.local
+    description: "Pretend on-call inbox"
+signing:
+  key_encryption_key_file: /run/secrets/signing_kek
+log:
+  level: debug
+  format: text

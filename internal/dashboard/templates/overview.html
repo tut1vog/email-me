@@ -1,0 +1,59 @@
+{{define "content"}}
+{{$d := .Data}}
+<h1>Overview</h1>
+
+{{if $d.Insecure}}
+<div class="banner danger" role="alert">
+  <strong>Plain HTTP from a non-local network in the last 7 days.</strong>
+  Tokens and message content for these agents crossed the network unencrypted:
+  <ul>
+  {{range $d.Insecure}}<li><a href="/agents/{{.ID}}">{{.Name}}</a>{{if .RequireSigning}} <span class="tag danger">signing required — content was necessarily plaintext on this hop</span>{{end}}</li>{{end}}
+  </ul>
+  Use TLS (<code>api.tls</code> or a TLS reverse proxy with <code>trusted_proxies</code>), or an encrypted tunnel (Tailscale, WireGuard, SSH) with <code>api.external_transport_encryption: true</code>.
+</div>
+{{end}}
+
+{{range $d.Notices}}<div class="banner {{.Kind}}">{{.Text}}</div>{{end}}
+
+{{if $d.FirstRun}}
+<section class="card first-run">
+  <h2>Welcome to email-me</h2>
+  <p>No agents yet. To let an AI agent email you:</p>
+  <ol>
+    <li><a href="/agents/new">Create an agent</a> and grant it one or more recipient aliases.</li>
+    <li>Issue a token for it and give the agent the token and the onboarding snippet.</li>
+    <li>The agent reads the guide at the API's base URL and starts sending.</li>
+  </ol>
+  <p><a class="button" href="/agents/new">Create your first agent</a></p>
+</section>
+{{else}}
+<section class="card">
+  <h2>Activity</h2>
+  <table>
+    <thead><tr><th>Agent</th><th colspan="3">Last 24 hours</th><th colspan="3">Last 7 days</th></tr>
+    <tr class="sub"><th></th><th>sent</th><th>rejected</th><th>failed</th><th>sent</th><th>rejected</th><th>failed</th></tr></thead>
+    <tbody>
+    {{range $d.Rows}}
+      <tr>
+        <td><a href="/agents/{{.Agent.ID}}">{{.Agent.Name}}</a>{{if not .Agent.Enabled}} <span class="tag">disabled</span>{{end}}</td>
+        <td>{{.Day.Sent}}</td><td>{{.Day.Rejected}}</td><td class="{{if .Day.Failed}}bad{{end}}">{{.Day.Failed}}</td>
+        <td>{{.Week.Sent}}</td><td>{{.Week.Rejected}}</td><td class="{{if .Week.Failed}}bad{{end}}">{{.Week.Failed}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}
+
+<section class="card">
+  <h2>Upstream SMTP</h2>
+  <p><code>{{$d.Upstream}}</code> —
+  {{with $d.SMTP}}
+    {{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger">failed</span> {{.Err}}{{end}} (checked {{ts .At}})
+  {{else}}not checked yet{{end}}</p>
+  <form method="post" action="/settings/test-smtp">
+    <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/">
+    <button type="submit" class="secondary">Test connection</button>
+  </form>
+</section>
+{{end}}

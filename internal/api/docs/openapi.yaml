@@ -1,0 +1,422 @@
+openapi: 3.1.0
+info:
+  title: email-me agent API
+  version: 1.0.0
+  summary: Send email to your operator's pre-registered inboxes.
+  description: |
+    email-me is a send-only gateway. An AI agent authenticates with a bearer
+    token and can deliver email only to recipient aliases (such as `me`) that
+    its operator granted. Real addresses are never revealed. Messages are
+    delivered synchronously and never stored.
+
+    Typical flow for an agent:
+    1. `GET /v1/capabilities` to learn your aliases, services and limits.
+    2. `POST /v1/messages` to send. Always include an `idempotency_key` and
+       reuse it when retrying.
+
+    Human-readable guide: `GET /`.
+servers:
+  - url: http://localhost:8025
+security:
+  - bearerAuth: []
+tags:
+  - name: discovery
+  - name: messages
+paths:
+  /:
+    get:
+      tags: [discovery]
+      operationId: getGuide
+      summary: Usage guide for agents (markdown).
+      description: Start here. Explains authentication, sending, error handling and encryption. Public unless the operator requires authentication for docs.
+      security: [{}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: The guide.
+          content:
+            text/markdown:
+              schema: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /llms.txt:
+    get:
+      tags: [discovery]
+      operationId: getLlmsTxt
+      summary: Same content as GET /.
+      security: [{}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: The guide.
+          content:
+            text/markdown:
+              schema: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /openapi.json:
+    get:
+      tags: [discovery]
+      operationId: getOpenAPI
+      summary: This OpenAPI document.
+      security: [{}, {bearerAuth: []}]
+      responses:
+        "200":
+          description: The OpenAPI document.
+          content:
+            application/json:
+              schema: {type: object}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /healthz:
+    get:
+      tags: [discovery]
+      operationId: getHealth
+      summary: Liveness probe.
+      security: [{}]
+      responses:
+        "200":
+          description: The gateway is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status: {type: string, const: ok}
+  /v1/capabilities:
+    get:
+      tags: [discovery]
+      operationId: getCapabilities
+      summary: What this token may do.
+      description: Call this before your first send. Lists the recipient aliases you may use (with a description of each inbox's purpose), the services you may request, your limits and remaining quota, your signing status and how your connection reached the gateway.
+      responses:
+        "200":
+          description: Capabilities of the calling agent.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Capabilities"}
+              example:
+                agent: bench-runner
+                recipients:
+                  - alias: me
+                    description: Personal inbox for general results and reports
+                    encryption_available: true
+                    encryption_required: false
+                services: [markdown, attachments, thread, sign, encrypt]
+                limits:
+                  max_message_bytes: 10485760
+                  max_attachments: 10
+                  allowed_attachment_types: []
+                  remaining_this_hour: 18
+                  remaining_today: 97
+                subject_prefix: "[bench-runner] "
+                signing: {available: true, required: true, default: true, fingerprint: 3F2A9C1D3F2A9C1D3F2A9C1D3F2A9C1D3F2A9C1D}
+                e2e_available: false
+                transport: tls
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /v1/recipients/{alias}/pgp-key:
+    get:
+      tags: [discovery]
+      operationId: getRecipientKey
+      summary: Recipient's OpenPGP public key, for end-to-end encryption.
+      description: Requires the `e2e` service and access to the alias. Use the key to encrypt a MIME entity yourself, then send it with `options.encrypt` = `e2e`.
+      parameters:
+        - name: alias
+          in: path
+          required: true
+          schema: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+      responses:
+        "200":
+          description: ASCII-armored public key.
+          headers:
+            X-Email-Me-Key-Fingerprint:
+              description: Fingerprint of the returned key.
+              schema: {type: string}
+          content:
+            application/pgp-keys:
+              schema: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/messages:
+    post:
+      tags: [messages]
+      operationId: sendMessage
+      summary: Send an email to one or more of your recipient aliases.
+      description: |
+        Delivered synchronously: `200` means the upstream mail server accepted
+        the message. Nothing is stored. Always set `idempotency_key` and reuse
+        it on retries so a retry is never delivered twice.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SendRequest"}
+            examples:
+              markdown:
+                summary: Markdown report
+                value:
+                  to: [me]
+                  subject: Nightly benchmark finished
+                  body: {markdown: "## Results\n- p50: 12ms\n- p99: 48ms"}
+                  options: {thread: nightly-bench}
+                  idempotency_key: bench-2026-09-28
+              attachment:
+                summary: Plain text with a CSV attachment, encrypted
+                value:
+                  to: [me]
+                  subject: Export ready
+                  body: {text: "The export is attached."}
+                  attachments:
+                    - {filename: results.csv, content_type: text/csv, content_base64: "cnVuLHA1MAoxLDEybXMK"}
+                  options: {encrypt: pgp}
+                  idempotency_key: export-8841
+              e2e:
+                summary: End-to-end encrypted (no subject, no attachments)
+                value:
+                  to: [me]
+                  body: {pgp_message: "-----BEGIN PGP MESSAGE-----\n...\n-----END PGP MESSAGE-----\n"}
+                  options: {encrypt: e2e}
+                  idempotency_key: secret-17
+      responses:
+        "200":
+          description: Accepted by the upstream mail server.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SendResponse"}
+              example: {id: msg_k3j5m2n4p6q7r8s9t2v3, status: sent, encrypted: false, signed: true}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "413": {$ref: "#/components/responses/TooLarge"}
+        "415": {$ref: "#/components/responses/UnsupportedType"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "429": {$ref: "#/components/responses/RateLimited"}
+        "502": {$ref: "#/components/responses/UpstreamFailed"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "Your agent token, `em_<id>_<secret>`. Never include it in emails, logs or files."
+  schemas:
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [agent, recipients, services, limits, subject_prefix, signing, e2e_available, transport]
+      properties:
+        agent: {type: string, description: Your agent name. It appears in the From display name and subject prefix.}
+        recipients:
+          type: array
+          description: Aliases you may send to. Choose by description.
+          items:
+            type: object
+            additionalProperties: false
+            required: [alias, description, encryption_available, encryption_required]
+            properties:
+              alias: {type: string}
+              description: {type: string, description: What this inbox is for.}
+              encryption_available: {type: boolean, description: "True if `options.encrypt: pgp` works for this alias (you also need the `encrypt` service)."}
+              encryption_required: {type: boolean, description: Sends to this alias must use pgp or e2e encryption.}
+        services:
+          type: array
+          description: Services you may request.
+          items: {$ref: "#/components/schemas/Service"}
+        limits:
+          type: object
+          additionalProperties: false
+          required: [max_message_bytes, max_attachments, allowed_attachment_types, remaining_this_hour, remaining_today]
+          properties:
+            max_message_bytes: {type: integer, description: Maximum decoded size of body plus attachments.}
+            max_attachments: {type: integer}
+            allowed_attachment_types: {type: array, items: {type: string}, description: "Allowed attachment media types such as `text/*`. Empty means any."}
+            remaining_this_hour: {type: integer}
+            remaining_today: {type: integer}
+        subject_prefix: {type: string, description: Prefix the gateway adds to your subject.}
+        signing:
+          type: object
+          additionalProperties: false
+          required: [available, required, default]
+          properties:
+            available: {type: boolean, description: Your messages can be signed with your agent key.}
+            required: {type: boolean, description: Every message must be signed; `options.sign` false and e2e are rejected.}
+            default: {type: boolean, description: Messages are signed when `options.sign` is omitted.}
+            fingerprint: {type: string, description: Fingerprint of your active signing key.}
+        e2e_available: {type: boolean, description: "True if you may send `options.encrypt: e2e`."}
+        transport:
+          type: string
+          enum: [tls, local, tunnel, insecure]
+          description: How this request reached the gateway. If `insecure`, tell your operator and avoid sending secrets.
+    Service:
+      type: string
+      enum: [markdown, html, attachments, encrypt, e2e, sign, thread, priority]
+    SendRequest:
+      type: object
+      additionalProperties: false
+      required: [to, body]
+      properties:
+        to:
+          type: array
+          minItems: 1
+          items: {type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"}
+          description: Recipient aliases from your capabilities.
+        subject:
+          type: string
+          maxLength: 255
+          description: Required unless `options.encrypt` is `e2e` (then omit it and put the subject inside your encrypted MIME entity). The gateway adds your subject prefix.
+        body:
+          $ref: "#/components/schemas/Body"
+        attachments:
+          type: array
+          description: Requires the `attachments` service. Not allowed with e2e.
+          items: {$ref: "#/components/schemas/Attachment"}
+        options:
+          $ref: "#/components/schemas/Options"
+        idempotency_key:
+          type: string
+          maxLength: 200
+          description: Unique per message. Reuse it when retrying; a completed send with the same key is replayed for 24 hours instead of being sent again.
+    Body:
+      type: object
+      additionalProperties: false
+      description: Exactly one field must be set.
+      minProperties: 1
+      maxProperties: 1
+      properties:
+        text: {type: string, description: Plain text.}
+        markdown: {type: string, description: "GitHub-flavored markdown, rendered to sanitized HTML with the markdown kept as the plain-text alternative. Requires the `markdown` service."}
+        html: {type: string, description: "HTML, sanitized with a strict allowlist (no images, scripts or styles). Requires the `html` service."}
+        pgp_message: {type: string, description: "ASCII-armored OpenPGP ciphertext of a MIME entity. Only with `options.encrypt: e2e`."}
+    Attachment:
+      type: object
+      additionalProperties: false
+      required: [filename, content_type, content_base64]
+      properties:
+        filename: {type: string}
+        content_type: {type: string, description: "Media type, e.g. `text/csv`."}
+        content_base64: {type: string, description: Standard base64 of the file content.}
+    Options:
+      type: object
+      additionalProperties: false
+      properties:
+        encrypt:
+          type: string
+          enum: [none, pgp, e2e]
+          default: none
+          description: "`pgp`: the gateway encrypts to the recipients' keys (requires the `encrypt` service). `e2e`: you send ciphertext in `body.pgp_message` (requires the `e2e` service; never signed)."
+        sign:
+          type: boolean
+          description: Sign with your agent key. Defaults to true when you have the `sign` service. `false` is rejected when signing is required.
+        thread:
+          type: string
+          maxLength: 200
+          description: Stable key that groups related messages into one inbox thread. Requires the `thread` service.
+        priority:
+          type: string
+          enum: [low, normal, high]
+          default: normal
+          description: "`high` requires the `priority` service."
+    SendResponse:
+      type: object
+      additionalProperties: false
+      required: [id, status, encrypted, signed]
+      properties:
+        id: {type: string, description: Message identifier.}
+        status: {type: string, const: sent}
+        encrypted: {type: boolean}
+        signed: {type: boolean}
+        idempotent_replay: {type: boolean, description: True if this response was replayed from an earlier request with the same idempotency_key; nothing was sent again.}
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - unauthorized
+            - agent_disabled
+            - source_ip_not_allowed
+            - recipient_not_allowed
+            - service_not_allowed
+            - encryption_required
+            - signing_required
+            - message_too_large
+            - attachment_type_not_allowed
+            - validation_failed
+            - rate_limited
+            - upstream_failed
+            - signing_unavailable
+            - encryption_unavailable
+            - not_found
+            - method_not_allowed
+            - internal_error
+        message: {type: string, description: What went wrong and how to fix it.}
+        details: {type: object, description: "Structured context, such as the aliases you may use."}
+        docs: {type: string, description: Where to read more.}
+  responses:
+    BadRequest:
+      description: "`invalid_request`: malformed JSON, unknown fields, or missing required fields. Fix the request; do not resend it unchanged."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: invalid_request, message: "body must contain exactly one of text, markdown, html, pgp_message", docs: /openapi.json}
+    Unauthorized:
+      description: "`unauthorized`: token missing, malformed, unknown, expired or revoked. Stop and tell your operator."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: unauthorized, message: "Invalid, expired or revoked token. Ask your operator for a valid token.", docs: /}
+    Forbidden:
+      description: "`agent_disabled`, `source_ip_not_allowed`, `recipient_not_allowed`, `service_not_allowed`, `encryption_required` or `signing_required`: the request is valid but not permitted by your policy."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: recipient_not_allowed, message: "Recipient alias 'work' is not permitted for this agent. Allowed: me.", details: {allowed: [me]}, docs: /openapi.json}
+    NotFound:
+      description: "`not_found`: no such path, or the recipient has no public key."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: not_found, message: See GET / for usage.}
+    TooLarge:
+      description: "`message_too_large`: body plus attachments exceed `max_message_bytes`, or too many attachments."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: message_too_large, message: "Message is 12582912 bytes; the limit is 10485760 bytes.", details: {limit: 10485760}}
+    UnsupportedType:
+      description: "`attachment_type_not_allowed`: an attachment's content type is not in `allowed_attachment_types`."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: attachment_type_not_allowed, message: "Attachment 'a.exe' has type application/x-msdownload, which is not allowed.", details: {allowed: ["text/*"]}}
+    Unprocessable:
+      description: "`validation_failed`: a field has an invalid value (bad alias syntax, bad base64, invalid PGP payload, incompatible options)."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: validation_failed, message: "attachments[0].content_base64 is not valid base64"}
+    RateLimited:
+      description: "`rate_limited`: hourly or daily limit reached. Wait `Retry-After` seconds, then retry."
+      headers:
+        Retry-After:
+          description: Seconds until a send slot frees up.
+          schema: {type: integer}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: rate_limited, message: "Rate limit reached (20 per hour). Retry after 1200 seconds.", details: {retry_after_seconds: 1200}}
+    UpstreamFailed:
+      description: "`upstream_failed`: the upstream mail server rejected the message or was unreachable. Retry later with the same `idempotency_key`."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: upstream_failed, message: "The upstream mail server did not accept the message. Retry later with the same idempotency_key.", details: {upstream_code: 451}}
+    Unavailable:
+      description: "`signing_unavailable` (signing requested or required but not possible: not configured, or your key expired) or `encryption_unavailable` (the recipient's PGP key expired or was revoked). Tell your operator; do not retry."
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: signing_unavailable, message: "Your signing key has expired. Ask your operator to rotate it."}

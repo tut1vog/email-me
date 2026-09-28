@@ -1,0 +1,35 @@
+services:
+  email-me:
+    build: .
+    image: ghcr.io/tut1vog/email-me:latest
+    restart: unless-stopped
+    ports:
+      # Localhost only. To let agents on other hosts in, put a TLS reverse
+      # proxy or an encrypted tunnel in front of the API (see README).
+      - "127.0.0.1:8025:8025"   # agent API
+      - "127.0.0.1:8026:8026"   # dashboard — keep this local
+    volumes:
+      - ./config:/config:ro
+      - email-me-data:/data
+    secrets:
+      - smtp_password
+      - admin_password
+      - signing_kek
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  smtp_password:
+    file: ./secrets/smtp_password
+  admin_password:
+    file: ./secrets/admin_password
+  signing_kek:
+    file: ./secrets/signing_kek
+
+volumes:
+  email-me-data:
