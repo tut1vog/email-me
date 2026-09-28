@@ -137,7 +137,10 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("Referrer-Policy", "no-referrer")
+		// same-origin, not no-referrer: under no-referrer browsers send
+		// "Origin: null" on the dashboard's own form POSTs, which sameOrigin
+		// must reject. Nothing is sent to other origins either way.
+		h.Set("Referrer-Policy", "same-origin")
 		h.Set("Cache-Control", "no-store")
 		if r.Method == http.MethodPost {
 			if !s.sameOrigin(r) {

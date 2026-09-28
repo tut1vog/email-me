@@ -140,7 +140,7 @@ func TestLoginRequiredAndHeaders(t *testing.T) {
 		t.Fatalf("unauthenticated: %d %s", p.status, p.header.Get("Location"))
 	}
 	lp := d.get("/login")
-	for h, want := range map[string]string{"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"} {
+	for h, want := range map[string]string{"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin"} {
 		if lp.header.Get(h) != want {
 			t.Errorf("%s = %q", h, lp.header.Get(h))
 		}
