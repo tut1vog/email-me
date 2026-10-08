@@ -1,25 +1,36 @@
 # email-me configuration. Copy to ./config/config.yaml and edit.
 # Secrets are never written here: every *_file points at a Docker secret.
 # The file is validated at startup and every problem is reported at once.
+#
+# Two kinds of keys:
+# - Bootstrap keys (data_dir, listen addresses, api.tls, secret files, log)
+#   are read from this file at every start, including restarts from the
+#   dashboard or SIGHUP.
+# - Keys marked "seed" are imported into state.db on the first start and
+#   managed on the dashboard's Settings page from then on; later edits here
+#   are ignored. Leave them out to start with defaults: a fresh install may
+#   even omit upstream: and set the SMTP server on the dashboard.
 
 data_dir: /data                     # holds state.db (agents, token hashes, recipients, keys, audit metadata)
 
 api:
   listen: "0.0.0.0:8025"            # inside the container; compose publishes 127.0.0.1 only
-  public_url: ""                    # e.g. https://email-me.example.ts.net — used in the agent guide
-  docs: public                      # public | authenticated — who may read /, /llms.txt, /openapi.json
+  public_url: ""                    # seed: e.g. https://email-me.example.ts.net — used in the agent guide
+  docs: public                      # seed: public | authenticated — who may read /, /llms.txt, /openapi.json
   tls:                              # optional built-in TLS for the agent API
     cert_file: ""
     key_file: ""
-  trusted_proxies: []               # CIDRs of reverse proxies whose X-Forwarded-* headers are honored
-  external_transport_encryption: false   # true = you assert agents reach the API over an encrypted
+  trusted_proxies: []               # seed: CIDRs of reverse proxies whose X-Forwarded-* headers are honored
+  external_transport_encryption: false   # seed: true = you assert agents reach the API over an encrypted
                                          # tunnel (Tailscale/WireGuard/SSH); silences plain-HTTP warnings
 
 dashboard:
   listen: "0.0.0.0:8026"
   admin_password_file: /run/secrets/admin_password   # plaintext (≥12 chars) or an argon2id PHC hash
-  session_ttl: 12h
+  session_ttl: 12h                  # seed
 
+# seed: imported on first boot, then managed on the dashboard (the whole
+# section, the password included; password_file is read only then).
 upstream:
   smtp:
     host: smtp.gmail.com
@@ -48,11 +59,12 @@ recipients:
 
 signing:                            # per-agent signing keys held by the gateway; on by default when set
   key_encryption_key_file: /run/secrets/signing_kek     # openssl rand -hex 32
-  key_validity: 2y
+  key_validity: 2y                  # seed: lifetime of newly generated agent keys
   # certify_with:                   # optional master key that certifies every agent key
   #   pgp_private_key_file: /run/secrets/master_key.asc
   #   passphrase_file: /run/secrets/master_key_passphrase
 
+# seed: imported on first boot, then managed on the dashboard (Default policy).
 defaults:
   policy:                           # applied to agents unless their policy overrides a field
     recipients: []                  # grant aliases per agent in the dashboard
@@ -65,6 +77,7 @@ defaults:
     require_encryption: false
     # require_signing: omitted = true when signing is configured, false otherwise
 
+# seed: imported on first boot, then managed on the dashboard.
 audit:
   retention_days: 30
   log_subject: false                # subjects are content; off by default

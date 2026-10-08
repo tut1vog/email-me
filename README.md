@@ -7,7 +7,7 @@ A self-hosted, send-only email gateway that lets AI agents running anywhere emai
 - **Nothing is stored**: message bodies, subjects and attachments live only in memory; the audit log holds metadata.
 - Messages are **signed with a per-agent OpenPGP key** held by the gateway (on by default), and can be **encrypted** to your key.
 - The API **explains itself**: an agent only needs a URL and a token. `GET /` returns a usage guide written for LLMs and links to `/openapi.json`. No SDK, MCP server or CLI is needed on the agent side.
-- A **dashboard** (the only management interface) manages agents, tokens, policies, recipients, keys and the audit log.
+- A **dashboard** (the only management interface) manages agents, tokens, policies, recipients, keys, settings and the audit log.
 
 The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi.yaml`](internal/api/docs/openapi.yaml), served at `/openapi.json`; the guide agents read first is [`internal/api/docs/guide.md.tmpl`](internal/api/docs/guide.md.tmpl).
 
@@ -17,13 +17,13 @@ The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi
 
    ```sh
    mkdir -p config secrets
-   cp config.example.yaml config/config.yaml        # then edit upstream (and the first recipient)
+   cp config.example.yaml config/config.yaml        # then edit upstream (and the first recipient), or leave them out
    printf '%s' 'your-smtp-app-password' > secrets/smtp_password
    printf '%s' 'a-long-dashboard-password' > secrets/admin_password
    openssl rand -hex 32 > secrets/signing_kek         # encrypts agent signing keys at rest
    ```
 
-   The container runs as uid 65532. On Linux, make the secrets readable by it: `sudo chown 65532:65532 secrets/* && chmod 400 secrets/*`.
+   `upstream` and the SMTP password can also be left out and set on the dashboard's **Settings** page after the first start. The container runs as uid 65532. On Linux, make the secrets readable by it: `sudo chown 65532:65532 secrets/* && chmod 400 secrets/*`.
 
 2. Start it:
 
@@ -33,7 +33,7 @@ The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi
 
    Both ports are published on `127.0.0.1` only: the agent API on `8025`, the dashboard on `8026`.
 
-3. Open `http://email-me.localhost:8026` (Chrome and Firefox resolve `*.localhost` to your machine) and log in with the admin password. On the **Recipients** page, check the recipient imported from `config.yaml` or add your address (optionally pasting your PGP public key). Then create an agent, grant it one or more aliases, and issue a token. The token page shows everything to hand to the agent:
+3. Open `http://email-me.localhost:8026` (Chrome and Firefox resolve `*.localhost` to your machine) and log in with the admin password. If the overview says **Configure SMTP**, set the upstream server on the **Settings** page and click **Restart now**. On the **Recipients** page, check the recipient imported from `config.yaml` or add your address (optionally pasting your PGP public key). Then create an agent, grant it one or more aliases, and issue a token. The token page shows everything to hand to the agent:
 
    ```
    EMAIL_ME_URL=http://localhost:8025
@@ -57,9 +57,9 @@ Why `email-me.localhost` instead of `localhost`: browsers send a host's cookies 
 
 The defaults keep everything on localhost. To accept agents from other machines, expose **only the API** (never the dashboard), and protect the path:
 
-- **An encrypted tunnel**, such as Tailscale, WireGuard or an SSH tunnel. Set `api.external_transport_encryption: true` so email-me knows the path is encrypted.
-- **A TLS reverse proxy** such as Caddy in front of port 8025. Set `api.trusted_proxies` to the proxy's address and `api.public_url` to the public HTTPS URL.
-- **Built-in TLS** with `api.tls.cert_file` and `api.tls.key_file`.
+- **An encrypted tunnel**, such as Tailscale, WireGuard or an SSH tunnel. Tick *Transport is encrypted outside email-me* (`api.external_transport_encryption`) on the Settings page so email-me knows the path is encrypted.
+- **A TLS reverse proxy** such as Caddy in front of port 8025. On the Settings page, set the trusted proxies (`api.trusted_proxies`) to the proxy's address and the public URL (`api.public_url`) to the public HTTPS URL.
+- **Built-in TLS** with `api.tls.cert_file` and `api.tls.key_file` in `config.yaml`.
 
 **Use TLS or a tunnel on every non-localhost path.** Signing is on by default, and to sign a message the gateway has to read it, so message content crosses the agent → gateway hop in plaintext unless that hop is encrypted. email-me classifies every request as `tls`, `local`, `tunnel` or `insecure`, tells the agent in `/v1/capabilities`, records it in the audit log, and shows a dashboard banner when agents send over `insecure` connections. It warns; it never blocks.
 
@@ -79,8 +79,11 @@ The defaults keep everything on localhost. To accept agents from other machines,
 ## Operations
 
 - **Health**: the image has a Docker `HEALTHCHECK` (`email-me healthcheck`), and `GET /healthz` on the API.
-- **Config changes**: edit `config/config.yaml` and restart. The config is validated at startup and every problem is listed at once. Recipients are the exception: they are managed in the dashboard and take effect immediately. The `recipients:` section only seeds an empty database (first boot, or after every recipient was deleted); later edits to it are ignored.
-- **State**: `state.db` in the `email-me-data` volume holds agents, token hashes, recipients and their PGP public keys, encrypted signing keys and audit metadata. Back it up together with `signing_kek`; without the KEK the signing keys cannot be decrypted.
+- **Settings**: the upstream SMTP server and its password, the From address, the agent API's public URL, guide access and trusted proxies, the default policy, the dashboard session lifetime, audit retention and signing-key validity are edited on the dashboard's **Settings** page and stored in `state.db`. Saving does not touch the running gateway: a banner on every page lists what changed until you click **Restart now**, which restarts email-me inside the container. In-flight sends finish first, the listeners are down for a moment, and you log in again. `docker kill -s HUP <container>` restarts the same way. The SMTP password is write-only on the page and stored encrypted with the signing KEK (unencrypted without a KEK, which the dashboard flags).
+- **`config.yaml`** keeps the bootstrap keys: `data_dir`, the listen addresses, `api.tls`, the admin password file, the `signing` key files, and `log`. They are read at every start, so after editing the file use **Restart now** (or `SIGHUP`), or restart the container when the change also needs new mounts or ports. Every problem is listed at once; if the file no longer loads, a restart from the dashboard or `SIGHUP` is refused and the gateway keeps running.
+- **Seeds**: the file's other sections (`upstream`, the managed `api`, `dashboard` and `signing` keys, `defaults`, `audit`) and `recipients:` are imported into `state.db` on the first start and ignored afterwards (a log line says so; you may delete them). `upstream.smtp.password_file` is read only then. Recipients are managed on the **Recipients** page and take effect immediately; the `recipients:` section is imported again only when the database has none.
+- **Upgrading** from a version that read these settings from `config.yaml`: the first start imports your current values once, so nothing changes; from then on, edit them on the dashboard.
+- **State**: `state.db` in the `email-me-data` volume holds agents, token hashes, recipients and their PGP public keys, settings and the SMTP password, encrypted signing keys and audit metadata. Back it up together with `signing_kek`; without the KEK the signing keys and the stored SMTP password cannot be decrypted (the dashboard then asks for the password again).
 - **Admin password as a hash**: `admin_password` may hold an argon2id PHC string instead of plaintext, e.g. `printf '%s' 'password' | argon2 "$(openssl rand -hex 16)" -id -t 3 -m 16 -p 2 -e`.
 
 ## Development
@@ -92,4 +95,4 @@ docker compose -f compose.dev.yml up --build   # email-me + Mailpit
 
 The dev stack delivers to Mailpit (`http://localhost:8027`); the dashboard password is `dev-password-change-me`. The secrets in `dev/` are throwaway values.
 
-Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/recipients` (recipient registry), `internal/store` (SQLite), `internal/config`, `internal/policy`.
+Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/recipients` (recipient registry), `internal/settings` (managed settings), `internal/store` (SQLite), `internal/config`, `internal/policy`.
