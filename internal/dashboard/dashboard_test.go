@@ -34,6 +34,7 @@ type dash struct {
 	ts       *httptest.Server
 	c        *http.Client
 	restart  *fakeRestart
+	srv      *dashboard.Server
 }
 
 // fakeRestart stands in for the process restart: it counts requests and
@@ -101,7 +102,7 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c, restart: rs}
+	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c, restart: rs, srv: srv}
 }
 
 type page struct {
@@ -210,6 +211,9 @@ func TestLoginRequiredAndHeaders(t *testing.T) {
 
 func TestLoginFlowAndThrottle(t *testing.T) {
 	d := newDash(t, testutil.Options{})
+	// A frozen clock keeps the 1s lockout from expiring while argon2 runs
+	// slowly under -race load.
+	dashboard.FreezeThrottle(d.srv, time.Now())
 	for i := 0; i < 5; i++ {
 		if p := d.post("/login", url.Values{"password": {"wrong"}}); p.status != http.StatusUnauthorized {
 			t.Fatalf("attempt %d: %d", i, p.status)

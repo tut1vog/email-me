@@ -114,7 +114,12 @@ type throttleEntry struct {
 // NewLoginThrottle allows `free` failed attempts, then locks the IP out for
 // 1s, 2s, 4s… (up to max) after each further failure.
 func NewLoginThrottle(free int, max time.Duration) *LoginThrottle {
-	return &LoginThrottle{m: map[string]*throttleEntry{}, now: time.Now, free: free, max: max}
+	return NewLoginThrottleAt(free, max, time.Now)
+}
+
+// NewLoginThrottleAt is NewLoginThrottle with an injectable clock.
+func NewLoginThrottleAt(free int, max time.Duration, now func() time.Time) *LoginThrottle {
+	return &LoginThrottle{m: map[string]*throttleEntry{}, now: now, free: free, max: max}
 }
 
 // Allowed reports whether ip may attempt a login, and if not, for how long it must wait.
