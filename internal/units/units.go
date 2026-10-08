@@ -144,3 +144,28 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 }
 
 func (d Duration) MarshalYAML() (any, error) { return d.String(), nil }
+
+// UnmarshalJSON accepts either a duration string or a number of nanoseconds.
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var n int64
+	if err := json.Unmarshal(data, &n); err == nil {
+		if n < 0 {
+			return fmt.Errorf("negative duration")
+		}
+		*d = Duration(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("duration must be a number or string")
+	}
+	v, err := ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = v
+	return nil
+}
+
+// MarshalJSON emits the duration string ("30s", "12h0m0s", "2y").
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }

@@ -67,3 +67,31 @@ func TestParseDuration(t *testing.T) {
 		t.Errorf("String() = %q", s)
 	}
 }
+
+func TestDurationJSON(t *testing.T) {
+	for _, d := range []Duration{0, Duration(30 * time.Second), Duration(90 * time.Minute), Duration(12 * time.Hour), Duration(90 * 24 * time.Hour), Duration(2 * 365 * 24 * time.Hour)} {
+		out, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back Duration
+		if err := json.Unmarshal(out, &back); err != nil || back != d {
+			t.Errorf("round trip %v via %s = %v, %v", d.D(), out, back.D(), err)
+		}
+	}
+	if out, _ := json.Marshal(Duration(2 * 365 * 24 * time.Hour)); string(out) != `"2y"` {
+		t.Fatalf("marshal = %s", out)
+	}
+	var d Duration
+	if err := json.Unmarshal([]byte(`"90d"`), &d); err != nil || d.D() != 90*24*time.Hour {
+		t.Fatalf("json string: %v %v", d.D(), err)
+	}
+	if err := json.Unmarshal([]byte(`1000000000`), &d); err != nil || d.D() != time.Second {
+		t.Fatalf("json number: %v %v", d.D(), err)
+	}
+	for _, bad := range []string{`"soon"`, `-1`, `true`, `""`} {
+		if err := json.Unmarshal([]byte(bad), &d); err == nil {
+			t.Errorf("Unmarshal(%s) should fail", bad)
+		}
+	}
+}
