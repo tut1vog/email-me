@@ -33,8 +33,39 @@ func TestMigrationsIdempotent(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 2 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
 		t.Fatalf("user_version = %d, %v", v, err)
+	}
+}
+
+func TestSettings(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, err := s.GetSettings(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("empty table: %v", err)
+	}
+	seed := &Settings{Doc: []byte(`{"audit":{"retention_days":30}}`), SMTPPassword: []byte{0, 1, 2}, PasswordSealed: true}
+	if ok, err := s.SeedSettings(ctx, seed); !ok || err != nil {
+		t.Fatalf("seed empty table: %v %v", ok, err)
+	}
+	got, err := s.GetSettings(ctx)
+	if err != nil || string(got.Doc) != string(seed.Doc) || string(got.SMTPPassword) != "\x00\x01\x02" || !got.PasswordSealed || got.UpdatedAt.IsZero() {
+		t.Fatalf("GetSettings = %+v, %v", got, err)
+	}
+	// Seeding only fills an empty table.
+	if ok, err := s.SeedSettings(ctx, &Settings{Doc: []byte(`{}`)}); ok || err != nil {
+		t.Fatalf("seeded a non-empty table: %v %v", ok, err)
+	}
+	if err := s.SaveSettings(ctx, &Settings{Doc: []byte(`{"audit":{"retention_days":7}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetSettings(ctx)
+	if string(got.Doc) != `{"audit":{"retention_days":7}}` || got.SMTPPassword != nil || got.PasswordSealed {
+		t.Fatalf("after save: %+v", got)
+	}
+	var n int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM settings").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("settings is a single row: %d %v", n, err)
 	}
 }
 
