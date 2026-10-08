@@ -23,6 +23,10 @@ type Sender interface {
 	Check(ctx context.Context) error
 }
 
+// ErrNotConfigured means no upstream server or From address is set yet (a
+// fresh install); sends fail with it until the operator sets them.
+var ErrNotConfigured = errors.New("not configured; set it on the dashboard's Settings page")
+
 // Error is a delivery failure with the upstream SMTP reply code, if any.
 type Error struct {
 	Code int
@@ -48,6 +52,9 @@ func NewSMTP(cfg config.SMTP) *SMTP {
 }
 
 func (s *SMTP) dial(ctx context.Context) (*smtp.Client, error) {
+	if s.cfg.Host == "" {
+		return nil, &Error{Err: ErrNotConfigured}
+	}
 	timeout := s.cfg.Timeout.D()
 	d := &net.Dialer{Timeout: timeout}
 	var conn net.Conn
@@ -87,6 +94,10 @@ func (s *SMTP) dial(ctx context.Context) (*smtp.Client, error) {
 
 // Send delivers msg; it returns only after the server accepted the data.
 func (s *SMTP) Send(ctx context.Context, from string, to []string, msg []byte) error {
+	if from == "" {
+		// An empty MAIL FROM is the null sender reserved for bounces.
+		return &Error{Err: ErrNotConfigured}
+	}
 	c, err := s.dial(ctx)
 	if err != nil {
 		return err

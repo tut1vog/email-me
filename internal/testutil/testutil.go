@@ -286,6 +286,11 @@ func NewEnv(t testing.TB, o Options) *Env {
 	if err != nil {
 		t.Fatalf("loading test config: %v\n%s", err, env.YAML)
 	}
+	problems, warnings := cfg.ValidateSeed()
+	if len(problems) > 0 {
+		t.Fatalf("test config: %v\n%s", problems, env.YAML)
+	}
+	cfg.Warnings = append(cfg.Warnings, warnings...)
 	env.Config = cfg
 	return env
 }

@@ -71,6 +71,11 @@ func serve(cfgPath string) error {
 	if err != nil {
 		return err
 	}
+	problems, warnings := cfg.ValidateSeed()
+	if len(problems) > 0 {
+		return &config.ValidationError{Problems: problems}
+	}
+	cfg.Warnings = append(cfg.Warnings, warnings...)
 	log := newLogger(cfg.Log)
 	for _, w := range cfg.Warnings {
 		log.Warn(w)

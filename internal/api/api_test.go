@@ -24,12 +24,14 @@ import (
 	"github.com/emersion/go-pgpmail"
 
 	"github.com/tut1vog/email-me/internal/api"
+	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/units"
+	"github.com/tut1vog/email-me/internal/upstream"
 )
 
 // ---- discovery -------------------------------------------------------------
@@ -907,4 +909,17 @@ func TestRecipientChangesApplyWithoutRestart(t *testing.T) {
 
 func msgText(to string) map[string]any {
 	return map[string]any{"to": []string{to}, "subject": "s", "body": map[string]any{"text": "b"}}
+}
+
+func TestUpstreamNotConfigured(t *testing.T) {
+	h := newHarness(t, testutil.Options{})
+	_, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"})})
+	h.srv.Sender = upstream.NewSMTP(config.SMTP{Port: 587, Security: "starttls"})
+	r := h.do("POST", "/v1/messages", tok, msg("me", "s", "b"))
+	if r.status != 502 || r.code(t) != "upstream_failed" || !strings.Contains(r.json(t)["message"].(string), "not configured") {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+	if h.env.SMTP.Count() != 0 {
+		t.Fatal("nothing must be sent")
+	}
 }

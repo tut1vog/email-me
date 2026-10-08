@@ -183,6 +183,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		s.Log.Warn("upstream delivery failed", "agent", c.agent.Name, "err", err)
 		e := newErr(http.StatusBadGateway, CodeUpstreamFailed,
 			"The upstream mail server did not accept the message. Retry later with the same idempotency_key.")
+		if errors.Is(err, upstream.ErrNotConfigured) {
+			e = newErr(http.StatusBadGateway, CodeUpstreamFailed,
+				"The gateway's upstream mail server is not configured yet. Tell your operator, then retry with the same idempotency_key.")
+		}
 		if code != 0 {
 			e = e.with("upstream_code", code)
 		}

@@ -1,6 +1,12 @@
 // Package config loads and validates config.yaml and the secret files it
 // references. Validation collects every problem so the operator can fix them
 // in one pass.
+//
+// Keys are of two kinds. Bootstrap keys (listen addresses, TLS, secret
+// files, log) are read from config.yaml on every start and validated by
+// Parse. Managed keys (see Settings) live in the state database and are
+// edited on the dashboard; their sections in config.yaml only seed an empty
+// database, and are validated then by ValidateSeed.
 package config
 
 import (
@@ -80,21 +86,24 @@ type Dashboard struct {
 }
 
 type Upstream struct {
-	SMTP             SMTP   `yaml:"smtp"`
-	From             string `yaml:"from"`
-	FromNameTemplate string `yaml:"from_name_template"`
+	SMTP             SMTP   `yaml:"smtp" json:"smtp"`
+	From             string `yaml:"from" json:"from"`
+	FromNameTemplate string `yaml:"from_name_template" json:"from_name_template"`
 }
 
+// SMTP is the upstream server. The password is never part of the stored
+// settings document: it is read from password_file when seeding and kept
+// in its own column afterwards.
 type SMTP struct {
-	Host           string         `yaml:"host"`
-	Port           int            `yaml:"port"`
-	Security       string         `yaml:"security"`
-	Username       string         `yaml:"username"`
-	PasswordFile   string         `yaml:"password_file"`
-	Timeout        units.Duration `yaml:"timeout"`
-	AllowPlaintext bool           `yaml:"allow_plaintext"`
+	Host           string         `yaml:"host" json:"host"`
+	Port           int            `yaml:"port" json:"port"`
+	Security       string         `yaml:"security" json:"security"`
+	Username       string         `yaml:"username" json:"username"`
+	PasswordFile   string         `yaml:"password_file" json:"-"`
+	Timeout        units.Duration `yaml:"timeout" json:"timeout"`
+	AllowPlaintext bool           `yaml:"allow_plaintext" json:"allow_plaintext"`
 
-	Password string `yaml:"-"`
+	Password string `yaml:"-" json:"-"`
 }
 
 // Addr returns host:port.
@@ -128,12 +137,12 @@ type CertifyWith struct {
 }
 
 type Defaults struct {
-	Policy policy.Policy `yaml:"policy"`
+	Policy policy.Policy `yaml:"policy" json:"policy"`
 }
 
 type Audit struct {
-	RetentionDays int  `yaml:"retention_days"`
-	LogSubject    bool `yaml:"log_subject"`
+	RetentionDays int  `yaml:"retention_days" json:"retention_days"`
+	LogSubject    bool `yaml:"log_subject" json:"log_subject"`
 }
 
 type Log struct {
@@ -159,6 +168,9 @@ func Load(path string) (*Config, error) {
 }
 
 // Parse is Load without the file read (secrets are still read from disk).
+// It validates the bootstrap keys only; managed keys are decoded (they may
+// seed the state database) but not defaulted or checked: see ValidateSeed
+// and ValidateManaged.
 func Parse(data []byte) (*Config, error) {
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -166,13 +178,35 @@ func Parse(data []byte) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
-	c.applyDefaults()
+	c.applyBootstrapDefaults()
 	v := &validator{}
-	c.validate(v)
+	c.validateBootstrap(v)
 	if len(v.errs) > 0 {
 		return nil, &ValidationError{Problems: v.errs}
 	}
+	c.Warnings = append(c.Warnings, v.warns...)
 	return &c, nil
+}
+
+// ValidateManaged applies defaults to the managed settings and validates
+// them, collecting every problem. It also sets the derived fields
+// (API.TrustedNets, DefaultPolicy) and normalizes values (public_url loses
+// its trailing slash). Warnings are returned, not added to c.Warnings.
+func (c *Config) ValidateManaged() (problems, warnings []string) {
+	c.ApplyManagedDefaults()
+	v := &validator{}
+	c.validateManaged(v, false)
+	return v.errs, v.warns
+}
+
+// ValidateSeed is ValidateManaged for the managed sections of config.yaml
+// when they seed an empty state database: it also reads
+// upstream.smtp.password_file into Upstream.SMTP.Password.
+func (c *Config) ValidateSeed() (problems, warnings []string) {
+	c.ApplyManagedDefaults()
+	v := &validator{}
+	c.validateManaged(v, true)
+	return v.errs, v.warns
 }
 
 // ValidationError lists every problem found in the config.
@@ -182,24 +216,38 @@ func (e *ValidationError) Error() string {
 	return "invalid configuration:\n  - " + strings.Join(e.Problems, "\n  - ")
 }
 
-type validator struct{ errs []string }
+type validator struct{ errs, warns []string }
 
 func (v *validator) add(format string, args ...any) {
 	v.errs = append(v.errs, fmt.Sprintf(format, args...))
 }
 
-func (c *Config) applyDefaults() {
+func (v *validator) warn(format string, args ...any) {
+	v.warns = append(v.warns, fmt.Sprintf(format, args...))
+}
+
+func (c *Config) applyBootstrapDefaults() {
 	if c.DataDir == "" {
 		c.DataDir = "/data"
 	}
 	if c.API.Listen == "" {
 		c.API.Listen = "0.0.0.0:8025"
 	}
-	if c.API.Docs == "" {
-		c.API.Docs = "public"
-	}
 	if c.Dashboard.Listen == "" {
 		c.Dashboard.Listen = "0.0.0.0:8026"
+	}
+	if c.Log.Level == "" {
+		c.Log.Level = "info"
+	}
+	if c.Log.Format == "" {
+		c.Log.Format = "json"
+	}
+}
+
+// ApplyManagedDefaults fills unset managed settings with their defaults.
+func (c *Config) ApplyManagedDefaults() {
+	if c.API.Docs == "" {
+		c.API.Docs = "public"
 	}
 	if c.Dashboard.SessionTTL == 0 {
 		c.Dashboard.SessionTTL = units.Duration(12 * time.Hour)
@@ -229,24 +277,15 @@ func (c *Config) applyDefaults() {
 	if c.Audit.RetentionDays == 0 {
 		c.Audit.RetentionDays = 30
 	}
-	if c.Log.Level == "" {
-		c.Log.Level = "info"
-	}
-	if c.Log.Format == "" {
-		c.Log.Format = "json"
-	}
 }
 
-func (c *Config) validate(v *validator) {
-	c.validateAPI(v)
+// validateBootstrap checks the keys read from config.yaml on every start,
+// and the recipient seeds.
+func (c *Config) validateBootstrap(v *validator) {
+	c.validateListenTLS(v)
 	c.validateDashboard(v)
-	c.validateUpstream(v)
 	c.validateRecipients(v)
 	c.validateSigning(v)
-	c.validateDefaults(v)
-	if c.Audit.RetentionDays < 1 {
-		v.add("audit.retention_days must be at least 1")
-	}
 	if !slices.Contains([]string{"debug", "info", "warn", "error"}, c.Log.Level) {
 		v.add("log.level must be one of debug, info, warn, error")
 	}
@@ -255,13 +294,27 @@ func (c *Config) validate(v *validator) {
 	}
 }
 
-func (c *Config) validateAPI(v *validator) {
+// validateManaged checks the settings managed on the dashboard. seed means
+// they come from config.yaml, so the SMTP password is read from its file.
+func (c *Config) validateManaged(v *validator, seed bool) {
+	c.validateAPISettings(v)
+	if c.Dashboard.SessionTTL.D() < time.Minute {
+		v.add("dashboard.session_ttl must be at least 1m")
+	}
+	c.validateUpstream(v, seed)
+	if s := c.Signing; s != nil && (s.KeyValidity.D() < 24*time.Hour || s.KeyValidity.D() > 50*365*24*time.Hour) {
+		v.add("signing.key_validity must be between 1d and 50y")
+	}
+	c.validateDefaults(v)
+	if c.Audit.RetentionDays < 1 {
+		v.add("audit.retention_days must be at least 1")
+	}
+}
+
+func (c *Config) validateListenTLS(v *validator) {
 	a := &c.API
 	if _, _, err := net.SplitHostPort(a.Listen); err != nil {
 		v.add("api.listen: %v", err)
-	}
-	if a.Docs != "public" && a.Docs != "authenticated" {
-		v.add("api.docs must be public or authenticated")
 	}
 	if a.TLS.Enabled() {
 		if a.TLS.CertFile == "" || a.TLS.KeyFile == "" {
@@ -272,6 +325,15 @@ func (c *Config) validateAPI(v *validator) {
 			a.Certificate = &cert
 		}
 	}
+}
+
+func (c *Config) validateAPISettings(v *validator) {
+	a := &c.API
+	if a.Docs != "public" && a.Docs != "authenticated" {
+		v.add("api.docs must be public or authenticated")
+	}
+	// Assigned, not appended: a Config is validated again after every save.
+	var nets []netip.Prefix
 	for _, p := range a.TrustedProxies {
 		pfx, err := netip.ParsePrefix(p)
 		if err != nil {
@@ -282,8 +344,9 @@ func (c *Config) validateAPI(v *validator) {
 			}
 			pfx = netip.PrefixFrom(addr, addr.BitLen())
 		}
-		a.TrustedNets = append(a.TrustedNets, pfx.Masked())
+		nets = append(nets, pfx.Masked())
 	}
+	a.TrustedNets = nets
 	if a.PublicURL != "" {
 		u, err := url.Parse(a.PublicURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -291,8 +354,7 @@ func (c *Config) validateAPI(v *validator) {
 		} else {
 			a.PublicURL = strings.TrimRight(a.PublicURL, "/")
 			if u.Scheme == "http" && !IsLoopbackHost(u.Hostname()) && !a.TLS.Enabled() && !a.ExternalTransportEncryption {
-				c.Warnings = append(c.Warnings, fmt.Sprintf(
-					"api.public_url %s is plain HTTP on a non-localhost host: agent tokens and (because signing needs plaintext) message content cross the network unencrypted. Use TLS (api.tls or a TLS reverse proxy) or an encrypted tunnel with external_transport_encryption: true", a.PublicURL))
+				v.warn("api.public_url %s is plain HTTP on a non-localhost host: agent tokens and (because signing needs plaintext) message content cross the network unencrypted. Use TLS (api.tls or a TLS reverse proxy) or an encrypted tunnel with external_transport_encryption: true", a.PublicURL)
 			}
 		}
 	}
@@ -332,38 +394,57 @@ func (c *Config) validateDashboard(v *validator) {
 	d.AdminPasswordHash = hash
 }
 
-func (c *Config) validateUpstream(v *validator) {
+// validateUpstream checks the upstream settings. A missing host or from
+// address is only a warning: a fresh install starts without them and the
+// operator sets them on the dashboard; sends fail until then.
+func (c *Config) validateUpstream(v *validator, seed bool) {
 	s := &c.Upstream.SMTP
-	if s.Host == "" {
-		v.add("upstream.smtp.host is required")
+	if s.Host == "" || c.Upstream.From == "" {
+		v.warn("upstream SMTP is not configured: set it on the Settings page")
+	}
+	if s.Host != "" && !validHost(s.Host) {
+		v.add("upstream.smtp.host must be a hostname or IP address, without a port")
 	}
 	if s.Port < 1 || s.Port > 65535 {
 		v.add("upstream.smtp.port must be 1-65535")
 	}
+	if s.Timeout.D() <= 0 {
+		v.add("upstream.smtp.timeout must be positive")
+	}
 	switch s.Security {
 	case "starttls", "tls":
 	case "none":
-		if !IsLoopbackHost(s.Host) && !s.AllowPlaintext {
+		if s.Host == "" || IsLoopbackHost(s.Host) {
+			break
+		}
+		if !s.AllowPlaintext {
 			v.add("upstream.smtp.security none is only allowed to localhost; set allow_plaintext: true to override (development only)")
-		} else if !IsLoopbackHost(s.Host) {
-			c.Warnings = append(c.Warnings, "upstream.smtp uses plaintext SMTP to a non-localhost host (allow_plaintext: true); use this for development only")
+		} else {
+			v.warn("upstream.smtp uses plaintext SMTP to a non-localhost host (allow_plaintext: true); use this for development only")
 		}
 	default:
 		v.add("upstream.smtp.security must be starttls, tls or none")
 	}
 	if s.Username != "" {
-		if s.PasswordFile == "" {
+		switch {
+		case !seed:
+			if s.Password == "" {
+				v.add("upstream.smtp.password is required when username is set")
+			}
+		case s.PasswordFile == "":
 			v.add("upstream.smtp.password_file is required when username is set")
-		} else if pw, err := readSecret(s.PasswordFile); err != nil {
-			v.add("upstream.smtp.password_file: %v", err)
-		} else {
-			s.Password = pw
+		default:
+			if pw, err := readSecret(s.PasswordFile); err != nil {
+				v.add("upstream.smtp.password_file: %v", err)
+			} else {
+				s.Password = pw
+			}
 		}
 	}
-	if c.Upstream.From == "" {
-		v.add("upstream.from is required")
-	} else if a, err := mail.ParseAddress(c.Upstream.From); err != nil || a.Name != "" {
-		v.add("upstream.from must be a bare email address")
+	if c.Upstream.From != "" {
+		if a, err := mail.ParseAddress(c.Upstream.From); err != nil || a.Name != "" {
+			v.add("upstream.from must be a bare email address")
+		}
 	}
 	if strings.ContainsAny(c.Upstream.FromNameTemplate, "\r\n") {
 		v.add("upstream.from_name_template must not contain line breaks")
@@ -426,9 +507,6 @@ func (c *Config) validateSigning(v *validator) {
 		v.add("signing.key_encryption_key_file: %v", err)
 	} else {
 		s.KEK = kek
-	}
-	if s.KeyValidity.D() < 24*time.Hour || s.KeyValidity.D() > 50*365*24*time.Hour {
-		v.add("signing.key_validity must be between 1d and 50y")
 	}
 	if cw := s.CertifyWith; cw != nil {
 		data, err := os.ReadFile(cw.PGPPrivateKeyFile)
@@ -497,6 +575,15 @@ func readSecret(path string) (string, error) {
 		return "", errors.New("file is empty")
 	}
 	return s, nil
+}
+
+// validHost reports whether host looks like a hostname or IP address (no
+// port, scheme or whitespace).
+func validHost(host string) bool {
+	if _, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		return true
+	}
+	return !strings.ContainsAny(host, ":/ \t\r\n[]@")
 }
 
 // IsLoopbackHost reports whether a hostname (no port) is localhost or a loopback IP.
