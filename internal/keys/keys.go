@@ -6,9 +6,6 @@ package keys
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"strings"
@@ -255,38 +252,11 @@ func (m *Manager) open(k *store.AgentKey) (*openpgp.Entity, error) {
 	return e, nil
 }
 
-// seal encrypts plaintext with the KEK; the fingerprint is bound as AAD so a
-// ciphertext cannot be swapped onto another key row.
-func (m *Manager) seal(plain []byte, fpr string) ([]byte, error) {
-	gcm, err := m.gcm()
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	return gcm.Seal(nonce, nonce, plain, []byte(fpr)), nil
-}
+// seal encrypts a private key with the KEK; the fingerprint is bound as AAD
+// so a ciphertext cannot be swapped onto another key row.
+func (m *Manager) seal(plain []byte, fpr string) ([]byte, error) { return Seal(m.kek, plain, fpr) }
 
-func (m *Manager) unseal(blob []byte, fpr string) ([]byte, error) {
-	gcm, err := m.gcm()
-	if err != nil {
-		return nil, err
-	}
-	if len(blob) < gcm.NonceSize() {
-		return nil, errors.New("ciphertext too short")
-	}
-	return gcm.Open(nil, blob[:gcm.NonceSize()], blob[gcm.NonceSize():], []byte(fpr))
-}
-
-func (m *Manager) gcm() (cipher.AEAD, error) {
-	block, err := aes.NewCipher(m.kek)
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCM(block)
-}
+func (m *Manager) unseal(blob []byte, fpr string) ([]byte, error) { return Unseal(m.kek, blob, fpr) }
 
 func revocationCert(e *openpgp.Entity, cfg *packet.Config, reason packet.ReasonForRevocation, text string) (string, error) {
 	if err := e.RevokeKey(reason, text, cfg); err != nil {
