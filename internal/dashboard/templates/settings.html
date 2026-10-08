@@ -1,5 +1,5 @@
 {{define "content"}}
-{{$d := .Data}}
+{{$d := .Data}}{{$f := $d.Form}}{{$c := $d.Config}}
 {{if $d.Warnings}}
 <ul class="attention">
 {{range $d.Warnings}}
@@ -11,15 +11,74 @@
 </ul>
 {{end}}
 
+<p class="hint">Saved settings are stored in the state database and take effect when the gateway restarts.</p>
+
+{{$u := $f.Upstream}}
 <section class="card" id="upstream">
   <div class="card-header">
-    <div><h2>Upstream SMTP</h2><p><code>{{$d.Upstream}}</code></p></div>
-    <div class="card-actions">{{with $d.SMTP}}{{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger">failed</span>{{end}}{{else}}<span class="tag">not checked</span>{{end}}</div>
+    <div><h2>Upstream SMTP</h2><p>{{if $d.Configured}}Running with <code>{{$d.Upstream}}</code>.{{else}}Not configured: agents cannot send until it is set and the gateway restarted.{{end}}</p></div>
+    <div class="card-actions">{{if not $d.Configured}}<span class="tag danger">not configured</span>{{else}}{{with $d.SMTP}}{{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger">failed</span>{{end}}{{else}}<span class="tag">not checked</span>{{end}}{{end}}</div>
   </div>
-  <div class="card-body">
-    <p class="small text-2">{{with $d.SMTP}}Last check {{ts .At}}{{if not .OK}}: {{.Err}}{{end}}.{{else}}Not checked since the dashboard started.{{end}}</p>
+  <form method="post" action="/settings/upstream">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="card-body">
+      <div class="field-grid">
+        <div class="field">
+          <label for="smtp_host">Host</label>
+          <input id="smtp_host" name="host" value="{{$u.Host}}" placeholder="smtp.example.com" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="smtp_security">Security</label>
+          <select id="smtp_security" name="security">
+            {{range $d.Securities}}<option value="{{.}}" {{if eq . $u.Security}}selected{{end}}>{{.}}</option>{{end}}
+          </select>
+        </div>
+        <div class="field">
+          <label for="smtp_port">Port <span class="muted">(optional)</span></label>
+          <input id="smtp_port" name="port" value="{{$u.Port}}" inputmode="numeric" placeholder="default">
+          <p class="hint">Blank: 587 for starttls, 465 for tls, 25 for none.</p>
+        </div>
+        <div class="field">
+          <label for="smtp_timeout">Timeout</label>
+          <input id="smtp_timeout" name="timeout" value="{{$u.Timeout}}" placeholder="30s">
+        </div>
+        <div class="field">
+          <label for="smtp_username">Username <span class="muted">(optional)</span></label>
+          <input id="smtp_username" name="username" value="{{$u.Username}}" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="smtp_password">Password</label>
+          <input id="smtp_password" name="password" type="password" autocomplete="new-password" placeholder="{{if $d.HasPassword}}Leave blank to keep{{end}}">
+          <p class="hint">{{if eq $d.Password "sealed"}}A password is stored, encrypted with the key-encryption key.{{else if eq $d.Password "unsealed"}}A password is stored <strong>unencrypted</strong>: set <code>signing.key_encryption_key_file</code> in config.yaml to encrypt it.{{else if eq $d.Password "undecryptable"}}The stored password <strong>cannot be decrypted</strong>: the key-encryption key changed or was removed. Enter it again.{{else}}No password is stored.{{end}} It is never shown.</p>
+          {{if $d.HasPassword}}<label class="check"><input type="checkbox" name="remove_password"> Remove the stored password</label>{{end}}
+        </div>
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" name="allow_plaintext" {{if $u.AllowPlaintext}}checked{{end}}> Allow plaintext SMTP to a non-localhost server</label>
+        <p class="hint">Only with security <code>none</code>, for development: credentials and mail cross the network unencrypted.</p>
+      </div>
+      <div class="field-grid">
+        <div class="field">
+          <label for="smtp_from">From address</label>
+          <input id="smtp_from" name="from" type="email" value="{{$u.From}}" placeholder="gateway@example.com" autocomplete="off">
+          <p class="hint">Every message is sent from it; agents' signing keys carry it too.</p>
+        </div>
+        <div class="field">
+          <label for="smtp_from_name">From name</label>
+          <input id="smtp_from_name" name="from_name_template" value="{{$u.FromNameTemplate}}" placeholder="{agent} via email-me">
+          <p class="hint"><code>{agent}</code> is replaced by the agent's name.</p>
+        </div>
+      </div>
+    </div>
+    <div class="card-footer">
+      <button type="submit">Save upstream settings</button>
+    </div>
+  </form>
+  <div class="card-body card-section">
+    {{if $d.Configured}}
+    <p class="small text-2">{{with $d.SMTP}}Last check {{ts .At}}{{if not .OK}}: {{.Err}}{{end}}.{{else}}Not checked since the gateway started.{{end}} The tests use the running settings, the ones agents use.</p>
     <form method="post" action="/settings/test-smtp" class="inline">
-      <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings">
+      <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings#upstream">
       <button type="submit" class="secondary">Test connection</button>
     </form>
     {{if $d.Aliases}}
@@ -31,17 +90,97 @@
     {{else}}
     <p class="small muted"><a href="/recipients/new">Add a recipient</a> to send a test message.</p>
     {{end}}
+    {{end}}
+    {{if $d.TestSaved}}
+    <form method="post" action="/settings/test-smtp-saved" class="inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <span class="small text-2">Upstream changes are saved but not running yet.</span>
+      <button type="submit" class="secondary">Test saved settings</button>
+    </form>
+    {{else if not $d.Configured}}
+    <p class="small muted">Save a host and From address, then restart to send.</p>
+    {{end}}
   </div>
 </section>
 
-<div class="card-grid">
-<section class="card" id="onboarding">
-  <div class="card-header"><h2>Agent onboarding</h2></div>
-  <div class="card-body">
-    <p class="small text-2">Agents read their guide at the API's <code>GET /</code>.</p>
-    <a class="button secondary" href="/settings/guide">Preview the agent guide</a>
+{{$a := $f.API}}
+<form method="post" action="/settings/api" class="card" id="api">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <div class="card-header">
+    <div><h2>Agent API</h2><p>Listening on <code>{{$c.API.Listen}}</code>, {{if $c.API.TLS.Enabled}}with TLS{{else}}without TLS{{end}} (set in config.yaml).</p></div>
   </div>
-</section>
+  <div class="card-body">
+    <div class="field">
+      <label for="public_url">Public URL <span class="muted">(optional)</span></label>
+      <input id="public_url" name="public_url" value="{{$a.PublicURL}}" placeholder="https://email-me.example.com" autocomplete="off" spellcheck="false">
+      <p class="hint">The base URL agents use, shown in the guide and token snippets. Blank: <code>localhost</code> and the listen port.</p>
+    </div>
+    <div class="field">
+      <label for="docs">Agent guide</label>
+      <select id="docs" name="docs">
+        <option value="public" {{if eq $a.Docs "public"}}selected{{end}}>public</option>
+        <option value="authenticated" {{if eq $a.Docs "authenticated"}}selected{{end}}>authenticated</option>
+      </select>
+      <p class="hint">Whether <code>GET /</code> and the OpenAPI spec need a token.</p>
+    </div>
+    <div class="field">
+      <label for="trusted_proxies">Trusted proxies <span class="muted">(optional)</span></label>
+      <input id="trusted_proxies" name="trusted_proxies" value="{{$a.TrustedProxies}}" placeholder="172.18.0.0/16, 10.0.0.1" autocomplete="off" spellcheck="false">
+      <p class="hint">IPs or CIDRs, separated by commas or spaces, whose <code>X-Forwarded-*</code> headers are believed (a reverse proxy in front of the API).</p>
+    </div>
+    <div class="field">
+      <label class="check"><input type="checkbox" name="external_transport_encryption" {{if $a.External}}checked{{end}}> Transport is encrypted outside email-me</label>
+      <p class="hint">Plain HTTP that arrives through an encrypted tunnel (WireGuard, SSH, a service mesh) counts as secure.</p>
+    </div>
+  </div>
+  <div class="card-footer">
+    <button type="submit">Save API settings</button>
+  </div>
+</form>
+
+<form method="post" action="/settings/policy" class="card" id="policy">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <div class="card-header">
+    <div><h2>Default policy</h2><p>What agents get unless their own policy overrides it. Rows left on Default use the built-in default.</p></div>
+  </div>
+  <div class="card-body">
+    {{template "policy_rows" $d.Policy}}
+  </div>
+  <div class="card-footer">
+    <button type="submit">Save default policy</button>
+  </div>
+</form>
+
+<div class="card-grid">
+<form method="post" action="/settings/dashboard" class="card" id="dashboard">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <div class="card-header"><h2>Dashboard</h2></div>
+  <div class="card-body">
+    <div class="field">
+      <label for="session_ttl">Session lifetime</label>
+      <input id="session_ttl" name="session_ttl" value="{{$f.Dashboard.SessionTTL}}" placeholder="12h">
+      <p class="hint">How long a login lasts, e.g. <code>12h</code> or <code>7d</code>; at least <code>1m</code>.</p>
+    </div>
+  </div>
+  <div class="card-footer"><button type="submit">Save dashboard settings</button></div>
+</form>
+
+<form method="post" action="/settings/audit" class="card" id="audit">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <div class="card-header"><h2>Audit log</h2></div>
+  <div class="card-body">
+    <div class="field">
+      <label for="retention_days">Retention (days)</label>
+      <input id="retention_days" name="retention_days" value="{{$f.Audit.RetentionDays}}" inputmode="numeric" placeholder="30">
+    </div>
+    <div class="field">
+      <label class="check"><input type="checkbox" name="log_subject" {{if $f.Audit.LogSubject}}checked{{end}}> Log subjects</label>
+      <p class="hint">Subjects can be sensitive; off, only metadata is kept.</p>
+    </div>
+  </div>
+  <div class="card-footer"><button type="submit">Save audit settings</button></div>
+</form>
+</div>
 
 <section class="card" id="signing">
   <div class="card-header"><h2>Signing keys</h2>{{if $d.SigningEnabled}}<span class="tag ok">enabled</span>{{else}}<span class="tag">off</span>{{end}}</div>
@@ -57,19 +196,47 @@
     </details>
     {{end}}
   {{else}}
-    <p class="muted">Signing is not configured.</p>
+    <p class="muted">Signing is not configured. Set <code>signing.key_encryption_key_file</code> in config.yaml and restart to give every agent its own signing key.</p>
   {{end}}
   </div>
+  {{if $d.SigningEnabled}}
+  <form method="post" action="/settings/signing" class="card-section">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="card-body">
+      <div class="field">
+        <label for="key_validity">Key validity</label>
+        <input id="key_validity" name="key_validity" value="{{$f.Signing.KeyValidity}}" placeholder="2y">
+        <p class="hint">Lifetime of newly generated agent keys, e.g. <code>1y</code>; between <code>1d</code> and <code>50y</code>. Existing keys keep theirs.</p>
+      </div>
+    </div>
+    <div class="card-footer"><button type="submit">Save signing settings</button></div>
+  </form>
+  {{end}}
 </section>
-</div>
 
-<section class="card" id="config">
-  <div class="card-header"><div><h2>Effective configuration</h2><p>Read-only. Edit <code>config.yaml</code> and restart; secrets are read from files and never shown. Its <code>recipients</code> section only seeds an empty database: manage recipients on the <a href="/recipients">Recipients</a> page.</p></div></div>
+<section class="card" id="onboarding">
+  <div class="card-header"><h2>Agent onboarding</h2></div>
   <div class="card-body">
-    <details class="disclosure">
-      <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Show effective config</summary>
-      <pre class="config">{{$d.ConfigYAML}}</pre>
-    </details>
+    <p class="small text-2">Agents read their guide at the API's <code>GET /</code>.</p>
+    <a class="button secondary" href="/settings/guide">Preview the agent guide</a>
+  </div>
+</section>
+
+<section class="card" id="bootstrap">
+  <div class="card-header"><div><h2>From config.yaml</h2><p>Read-only. These keys are read from <code>config.yaml</code> at every start: edit the file, then restart. Secrets are read from the files named here and never shown. The file's other sections only seeded the database on the first start and are ignored now: manage them above and on the <a href="/recipients">Recipients</a> page.</p></div></div>
+  <div class="card-body">
+    <dl class="grid">
+      <dt><code>data_dir</code></dt><dd><code>{{$c.DataDir}}</code></dd>
+      <dt><code>api.listen</code></dt><dd><code>{{$c.API.Listen}}</code></dd>
+      <dt><code>api.tls</code></dt><dd>{{if $c.API.TLS.Enabled}}certificate <code>{{$c.API.TLS.CertFile}}</code>, key <code>{{$c.API.TLS.KeyFile}}</code>{{else}}off{{end}}</dd>
+      <dt><code>dashboard.listen</code></dt><dd><code>{{$c.Dashboard.Listen}}</code></dd>
+      <dt><code>dashboard.admin_password_file</code></dt><dd><code>{{$c.Dashboard.AdminPasswordFile}}</code></dd>
+      <dt><code>signing.key_encryption_key_file</code></dt><dd>{{with $c.Signing}}<code>{{.KeyEncryptionKeyFile}}</code>{{else}}not set: signing is off{{end}}</dd>
+      {{with $c.Signing}}{{with .CertifyWith}}
+      <dt><code>signing.certify_with</code></dt><dd>private key <code>{{.PGPPrivateKeyFile}}</code>{{with .PassphraseFile}}, passphrase <code>{{.}}</code>{{end}}</dd>
+      {{end}}{{end}}
+      <dt><code>log</code></dt><dd>level <code>{{$c.Log.Level}}</code>, format <code>{{$c.Log.Format}}</code></dd>
+    </dl>
   </div>
 </section>
 {{end}}

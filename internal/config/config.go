@@ -394,13 +394,17 @@ func (c *Config) validateDashboard(v *validator) {
 	d.AdminPasswordHash = hash
 }
 
+// UpstreamNotConfigured is the warning for a missing upstream host or From
+// address.
+const UpstreamNotConfigured = "upstream SMTP is not configured: set it on the Settings page"
+
 // validateUpstream checks the upstream settings. A missing host or from
 // address is only a warning: a fresh install starts without them and the
 // operator sets them on the dashboard; sends fail until then.
 func (c *Config) validateUpstream(v *validator, seed bool) {
 	s := &c.Upstream.SMTP
 	if s.Host == "" || c.Upstream.From == "" {
-		v.warn("upstream SMTP is not configured: set it on the Settings page")
+		v.warn(UpstreamNotConfigured)
 	}
 	if s.Host != "" && !validHost(s.Host) {
 		v.add("upstream.smtp.host must be a hostname or IP address, without a port")

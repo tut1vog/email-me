@@ -157,7 +157,7 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 	// defaults.policy.recipients naming a missing alias is flagged, not fatal.
 	g := newDash(t, testutil.Options{DefaultsPolicy: "recipients: [me, ghost]"})
 	g.login()
-	if b := g.get("/").body; !strings.Contains(b, "Default policy") || !strings.Contains(b, "ghost") {
+	if b := g.get("/").body; !strings.Contains(b, "Default policy") || !strings.Contains(b, "ghost") || !strings.Contains(b, `href="/settings#policy"`) {
 		t.Error("unknown default alias must be flagged")
 	}
 }

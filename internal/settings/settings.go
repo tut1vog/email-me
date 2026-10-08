@@ -28,6 +28,9 @@ import (
 // passwordAAD binds a sealed SMTP password to its column.
 const passwordAAD = "settings.smtp_password"
 
+// WarningPrefix starts the config warnings that repeat LoadProblems.
+const WarningPrefix = "saved settings: "
+
 // passwordKey is the pending key reported when only the password changed.
 const passwordKey = "upstream.smtp.password"
 
@@ -153,7 +156,7 @@ func (m *Manager) load(ctx context.Context, row *store.Settings, cfg *config.Con
 	problems = append(problems, invalid...)
 	cfg.Warnings = append(cfg.Warnings, warnings...)
 	for _, p := range problems {
-		cfg.Warnings = append(cfg.Warnings, "saved settings: "+p)
+		cfg.Warnings = append(cfg.Warnings, WarningPrefix+p)
 	}
 
 	m.running, m.runningPW = cfg.Managed(), pw

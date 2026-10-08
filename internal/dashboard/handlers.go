@@ -13,15 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
-	"github.com/tut1vog/email-me/internal/api/docs"
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/compose"
 	"github.com/tut1vog/email-me/internal/config"
-	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/units"
 )
@@ -138,9 +135,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "computing warnings", err)
 		return
 	}
-	s.smtpMu.Lock()
-	smtp := s.smtpCheck
-	s.smtpMu.Unlock()
+	smtp := s.lastSMTPCheck()
 	if smtp != nil && !smtp.OK {
 		notices = append(notices, notice{Kind: "danger", Title: "Upstream SMTP",
 			Text: "The last connection test failed: " + smtp.Err, Link: "/settings#upstream"})
@@ -154,7 +149,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		"Notices":      notices,
 		"Insecure":     insecure,
 		"SMTP":         smtp,
-		"Upstream":     s.Config.Upstream.SMTP.Addr(),
+		"Upstream":     upstreamAddr(s.Config),
 	})
 }
 
@@ -166,8 +161,31 @@ type insecureAgent struct {
 
 func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, []insecureAgent, error) {
 	var out []notice
-	for _, w := range s.Config.Warnings {
+	for _, w := range s.configWarnings() {
 		out = append(out, notice{Kind: "warn", Title: "Configuration", Text: w, Link: "/settings"})
+	}
+	for _, p := range s.Settings.LoadProblems() {
+		out = append(out, notice{Kind: "danger", Title: "Saved settings",
+			Text: p + ".", Link: "/settings"})
+	}
+	if p := s.Settings.Pending(); len(p) > 0 {
+		out = append(out, notice{Kind: "warn", Title: "Restart to apply",
+			Text: "Saved settings are not in effect yet: " + strings.Join(p, ", ") + ".", Link: "/settings#restart"})
+	}
+	if !upstreamConfigured(s.Config) {
+		out = append(out, notice{Kind: "danger", Title: "Configure SMTP",
+			Text: "No upstream SMTP server or From address is set, so every send fails. Set them on the Settings page and restart.",
+			Link: "/settings#upstream"})
+	}
+	switch s.Settings.PasswordState() {
+	case settings.Unsealed:
+		out = append(out, notice{Kind: "warn", Title: "SMTP password",
+			Text: "Stored unencrypted in the state database. Set signing.key_encryption_key_file in config.yaml to encrypt it.",
+			Link: "/settings#upstream"})
+	case settings.Undecryptable:
+		out = append(out, notice{Kind: "danger", Title: "SMTP password",
+			Text: "The stored password cannot be decrypted: the key-encryption key changed or was removed. Enter it again.",
+			Link: "/settings#upstream"})
 	}
 	if !s.Keys.Enabled() {
 		out = append(out, notice{Kind: "info", Title: "Signing is not configured",
@@ -181,8 +199,8 @@ func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, 
 	}
 	if u := s.Recipients.UnknownAliases(s.Config.Defaults.Policy); len(u) > 0 {
 		out = append(out, notice{Kind: "warn", Title: "Default policy",
-			Text: "defaults.policy.recipients in config.yaml names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
-			Link: "/recipients"})
+			Text: "The default policy names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
+			Link: "/settings#policy"})
 	}
 	for _, rc := range s.Recipients.All() {
 		if rc.Key == nil {
@@ -217,6 +235,10 @@ func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, 
 		signing := "/agents/" + a.ID + "/signing"
 		k, err := s.Keys.ActiveKey(ctx, a.ID)
 		switch {
+		case errors.Is(err, store.ErrNotFound) && s.Config.Upstream.From == "":
+			out = append(out, notice{Kind: "warn", Title: title,
+				Text: "No signing key. One can be generated once a From address is set on the Settings page and the gateway restarted.",
+				Link: "/settings#upstream"})
 		case errors.Is(err, store.ErrNotFound):
 			out = append(out, notice{Kind: "warn", Title: title, Text: "No signing key.", Link: signing})
 		case err != nil:
@@ -521,6 +543,7 @@ func (s *Server) agentSigning(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := sh.Data["KeyState"]
+	sh.Data["NoFrom"] = s.Config.Upstream.From == ""
 	sh.Data["KeyExpired"] = state == "expired"
 	sh.Data["KeyExpiring"] = state == "expiring"
 	sh.Data["RetiredKeys"] = sh.Retired
@@ -937,8 +960,7 @@ func (s *Server) createRecipient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Re-render rather than redirect, so the operator does not lose a pasted key.
-	w.WriteHeader(http.StatusUnprocessableEntity)
-	s.render(w, r, "recipient_new", "New recipient", map[string]any{"Form": in})
+	s.renderStatus(w, r, http.StatusUnprocessableEntity, "recipient_new", "New recipient", map[string]any{"Form": in})
 }
 
 func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
@@ -1146,83 +1168,4 @@ func csvSafe(s string) string {
 		return "'" + s
 	}
 	return s
-}
-
-// ---- settings -------------------------------------------------------------
-
-func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
-	y, err := yaml.Marshal(s.Config)
-	if err != nil {
-		s.fail(w, "rendering config", err)
-		return
-	}
-	s.smtpMu.Lock()
-	smtp := s.smtpCheck
-	s.smtpMu.Unlock()
-	var master string
-	if m := s.Keys.Master(); m != nil {
-		master = pgp.Fingerprint(m)
-	}
-	s.render(w, r, "settings", "Settings", map[string]any{
-		"ConfigYAML":     string(y),
-		"SMTP":           smtp,
-		"Upstream":       s.Config.Upstream.SMTP.Addr(),
-		"Aliases":        s.Recipients.Aliases(),
-		"SigningEnabled": s.Keys.Enabled(),
-		"MasterFpr":      master,
-		"Warnings":       s.Config.Warnings,
-	})
-}
-
-func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Upstream.SMTP.Timeout.D()+5*time.Second)
-	defer cancel()
-	err := s.Sender.Check(ctx)
-	st := &smtpStatus{At: s.now(), OK: err == nil}
-	if err != nil {
-		st.Err = err.Error()
-		s.flash(r, "error", "SMTP connection test failed: %v", err)
-	} else {
-		s.flash(r, "ok", "Connected and authenticated to %s.", s.Config.Upstream.SMTP.Addr())
-	}
-	s.smtpMu.Lock()
-	s.smtpCheck = st
-	s.smtpMu.Unlock()
-	s.redirect(w, r, safeNext(r.PostForm.Get("back")))
-}
-
-func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
-	alias := r.PostForm.Get("alias")
-	rc, ok := s.Recipients.Get(alias)
-	if !ok {
-		s.flash(r, "error", "Unknown recipient alias %q.", alias)
-		s.redirect(w, r, "/settings")
-		return
-	}
-	now := s.now()
-	msg := &compose.Message{
-		FromName: "email-me dashboard", FromAddr: s.Config.Upstream.From, To: []string{rc.Address},
-		Subject: "[email-me] Test message", Agent: "dashboard", MessageID: compose.NewMessageID(), Date: now,
-		Text: "This is a test message sent from the email-me dashboard at " + now.UTC().Format(time.RFC1123) +
-			".\n\nIf you can read it, delivery to the \"" + alias + "\" alias works.\n",
-	}
-	raw, err := compose.Build(msg)
-	if err == nil {
-		ctx, cancel := context.WithTimeout(r.Context(), s.Config.Upstream.SMTP.Timeout.D()+5*time.Second)
-		defer cancel()
-		err = s.Sender.Send(ctx, s.Config.Upstream.From, []string{rc.Address}, raw)
-	}
-	if err != nil {
-		s.flash(r, "error", "Test message to %s failed: %v", alias, err)
-	} else {
-		s.Log.Info("dashboard test message sent", "alias", alias)
-		s.flash(r, "ok", "Test message sent to %s.", alias)
-	}
-	s.redirect(w, r, "/settings")
-}
-
-func (s *Server) guidePreview(w http.ResponseWriter, r *http.Request) {
-	s.render(w, r, "guide", "Agent guide", map[string]any{
-		"Guide": docs.Guide(s.apiBaseURL()), "BaseURL": s.apiBaseURL(),
-	})
 }

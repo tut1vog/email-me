@@ -265,3 +265,32 @@ func TestDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNoKeysWithoutFromAddress(t *testing.T) {
+	st, m, a, _ := setup(t, nil)
+	ctx := context.Background()
+	b, err := st.CreateAgent(ctx, "other", "", policy.Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(ctx, b.ID, b.Name); err != nil {
+		t.Fatal(err)
+	}
+	noFrom := keys.NewManager(st, keys.Options{KEK: kek(7), Validity: 365 * 24 * time.Hour})
+	if _, err := noFrom.Create(ctx, a.ID, a.Name); !errors.Is(err, keys.ErrNoFrom) {
+		t.Fatalf("Create without a From address: %v", err)
+	}
+	if _, err := noFrom.Rotate(ctx, b.ID, b.Name); !errors.Is(err, keys.ErrNoFrom) {
+		t.Fatalf("Rotate without a From address: %v", err)
+	}
+	n, err := noFrom.EnsureAll(ctx)
+	if n != 0 || !errors.Is(err, keys.ErrNoFrom) {
+		t.Fatalf("EnsureAll without a From address: %d, %v", n, err)
+	}
+	if _, err := st.ActiveKey(ctx, a.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("no key may be generated without a From address")
+	}
+	if n, err := m.EnsureAll(ctx); n != 1 || err != nil {
+		t.Fatalf("EnsureAll with a From address: %d, %v", n, err)
+	}
+}

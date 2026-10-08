@@ -7,6 +7,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -35,9 +36,19 @@ type dash struct {
 
 func newDash(t *testing.T, o testutil.Options) *dash {
 	t.Helper()
+	return newDashWith(t, o, nil)
+}
+
+// newDashWith is newDash with a hook that can change the state database
+// before the settings are loaded from it.
+func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *store.Store)) *dash {
+	t.Helper()
 	env := testutil.NewEnv(t, o)
 	cfg := env.Config
 	st := testutil.OpenStore(t, env)
+	if prepare != nil {
+		prepare(env, st)
+	}
 	sm := testutil.BootstrapSettings(t, env, st)
 	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg)
 	if err != nil {
@@ -48,7 +59,7 @@ func newDash(t *testing.T, o testutil.Options) *dash {
 		ko.KEK, ko.Validity = cfg.Signing.KEK, cfg.Signing.KeyValidity.D()
 	}
 	km := keys.NewManager(st, ko)
-	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger()})
+	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,10 +390,22 @@ func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
 			t.Fatalf("settings page leaks a secret: %q", secret)
 		}
 	}
-	if !strings.Contains(s, "password_file") {
-		t.Fatal("settings should show the effective config")
+	if strings.Contains(s, "Effective configuration") || strings.Contains(s, filepath.Join(d.env.Dir, "smtp_password")) {
+		t.Fatal("the YAML dump is gone, and the SMTP password file is only a seed")
 	}
-	p := d.post("/settings/test-smtp", d.form("back", "/settings"))
+	for _, want := range []string{`id="bootstrap"`, d.env.Config.Dashboard.AdminPasswordFile, d.env.Config.Signing.KeyEncryptionKeyFile,
+		`name="password" type="password" autocomplete="new-password"`, "encrypted with the key-encryption key", `value="gateway@example.com"`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("settings page lacks %q", want)
+		}
+	}
+	// A rejected save shows what was typed, except the password.
+	p := d.post("/settings/upstream", d.form("host", "smtp.example.net", "port", "abc", "security", "starttls", "password", "typed-secret", "from", "gateway@example.com"))
+	if p.status != http.StatusUnprocessableEntity || !strings.Contains(p.body, "Port must be a number") ||
+		!strings.Contains(p.body, `value="smtp.example.net"`) || strings.Contains(p.body, "typed-secret") {
+		t.Fatalf("rejected upstream save: %d", p.status)
+	}
+	p = d.post("/settings/test-smtp", d.form("back", "/settings"))
 	if p.status != http.StatusSeeOther || !strings.Contains(d.get("/settings").body, "Connected and authenticated") {
 		t.Fatal("SMTP test should succeed against the fake server")
 	}

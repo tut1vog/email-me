@@ -82,7 +82,8 @@ func TestOverviewAttentionOrderAndLinks(t *testing.T) {
 	if warn < 0 || info < 0 || warn > info {
 		t.Fatalf("attention list must put warnings before info (warn at %d, info at %d)", warn, info)
 	}
-	for _, want := range []string{"Needs attention (2)", `href="/settings"`, `href="/settings#signing"`, "Create your first agent"} {
+	// Without a KEK the SMTP password is also stored unencrypted.
+	for _, want := range []string{"Needs attention (3)", `href="/settings"`, `href="/settings#signing"`, `href="/settings#upstream"`, "Stored unencrypted", "Create your first agent"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("overview lacks %q", want)
 		}
@@ -132,6 +133,7 @@ func TestPagesHaveNoInlineStyleOrScript(t *testing.T) {
 	d.login()
 	a := d.createAgent("bench", "me")
 	d.st.InsertAudit(context.Background(), &store.AuditEntry{AgentID: a.ID, Status: store.StatusSent, Transport: "insecure", Signed: true, TS: time.Now()})
+	d.post("/settings/audit", d.form("retention_days", "60")) // a pending restart adds the banner
 	for _, path := range []string{"/", "/agents", "/audit", "/settings", "/recipients", "/recipients/new", "/recipients/me", "/recipients/ops", "/recipients/me/delete", "/settings/guide"} {
 		p := d.get(path)
 		if p.status != 200 {

@@ -21,6 +21,7 @@ import (
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/units"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -41,6 +42,7 @@ type Deps struct {
 	Config     *config.Config
 	Store      *store.Store
 	Recipients *recipients.Registry
+	Settings   *settings.Manager
 	Keys       *keys.Manager
 	Sender     upstream.Sender
 	Log        *slog.Logger
@@ -146,7 +148,14 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /audit", s.auditPage)
 	authed("GET /audit.csv", s.auditCSV)
 	authed("GET /settings", s.settings)
+	authed("POST /settings/upstream", s.saveUpstream)
+	authed("POST /settings/api", s.saveAPI)
+	authed("POST /settings/policy", s.saveDefaultPolicy)
+	authed("POST /settings/dashboard", s.saveDashboard)
+	authed("POST /settings/audit", s.saveAudit)
+	authed("POST /settings/signing", s.saveSigning)
 	authed("POST /settings/test-smtp", s.testSMTP)
+	authed("POST /settings/test-smtp-saved", s.testSMTPSaved)
 	authed("POST /settings/test-send", s.testSend)
 	authed("GET /settings/guide", s.guidePreview)
 	authed("GET /keys.asc", s.keyBundle)
@@ -282,15 +291,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	// Begin counts the attempt before the expensive password check, so
 	// parallel guesses cannot all slip past the throttle.
 	if ok, wait := s.throttle.Begin(ip); !ok {
-		w.WriteHeader(http.StatusTooManyRequests)
-		s.render(w, r, "login", "Log in", map[string]any{"Next": next, "SharedHost": sharedHostHint(r.Host),
+		s.renderStatus(w, r, http.StatusTooManyRequests, "login", "Log in", map[string]any{"Next": next, "SharedHost": sharedHostHint(r.Host),
 			"Error": fmt.Sprintf("Too many failed attempts. Try again in %d seconds.", int(wait.Seconds())+1)})
 		return
 	}
 	if !s.verifyPassword(r.Context(), r.PostForm.Get("password")) {
 		s.Log.Warn("dashboard login failed", "ip", ip)
-		w.WriteHeader(http.StatusUnauthorized)
-		s.render(w, r, "login", "Log in", map[string]any{"Next": next, "Error": "Wrong password.", "SharedHost": sharedHostHint(r.Host)})
+		s.renderStatus(w, r, http.StatusUnauthorized, "login", "Log in", map[string]any{"Next": next, "Error": "Wrong password.", "SharedHost": sharedHostHint(r.Host)})
 		return
 	}
 	s.throttle.Success(ip)
@@ -348,9 +355,19 @@ type page struct {
 	Flash    []auth.Flash
 	LoggedIn bool
 	Data     any
+
+	// Saved settings not in effect yet (dotted keys) and when they were
+	// saved; problems with the stored settings at boot. Logged in only.
+	Pending      []string
+	SavedAt      time.Time
+	LoadProblems []string
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, name, title string, data any) {
+	s.renderStatus(w, r, http.StatusOK, name, title, data)
+}
+
+func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request, status int, name, title string, data any) {
 	t, ok := s.pages[name]
 	if !ok {
 		http.Error(w, "unknown page", http.StatusInternalServerError)
@@ -359,8 +376,12 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name, title stri
 	p := page{Title: title, Nav: name, Section: sectionOf(name), Data: data}
 	if sess := sessionFrom(r); sess != nil {
 		p.CSRF, p.Flash, p.LoggedIn = sess.CSRF, sess.PopFlash(), true
+		if s.Settings != nil {
+			p.Pending, p.SavedAt, p.LoadProblems = s.Settings.Pending(), s.Settings.SavedAt(), s.Settings.LoadProblems()
+		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := t.Execute(w, p); err != nil {
 		s.Log.Error("rendering dashboard page", "page", name, "err", err)
 	}

@@ -844,6 +844,10 @@ h1 .tag, .page-title .tag { font-size: var(--fs-sm); height: 22px; margin-left: 
 .banner details.help { margin: 4px 0 0; }
 .banner .form-actions { margin-top: var(--s-2); }
 
+/* Restart-to-apply banner: the pending keys and an inline Restart form. */
+.banner code { overflow-wrap: anywhere; }
+.banner form.inline { margin: var(--s-2) 0 0; }
+
 .flash-text { min-width: 0; padding-top: 1px; }
 .flash-close { margin: -4px -8px -4px 0; color: var(--muted); }
 html:not(.js) [data-dismiss] { display: none; }
@@ -1017,6 +1021,17 @@ legend {
 }
 .filters select,
 .filters input:not([type=checkbox], [type=radio]) { width: auto; min-width: 12ch; }
+
+/* Settings cards: short fields side by side, and a second part of a card
+   (the SMTP tests, the signing form) set off by a rule. */
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0 var(--s-4);
+  max-width: 760px;
+}
+.field-grid > .field { max-width: none; }
+.card-section { border-top: 1px solid var(--border); }
 
 /* A form laid out on one line (settings: test buttons). */
 form.inline {

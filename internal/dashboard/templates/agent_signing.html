@@ -49,7 +49,8 @@
     <svg class="icon" aria-hidden="true"><use href="#icon-key"/></svg>
     <strong>No signing key</strong>
     <p>This agent's messages cannot be signed until it has one.</p>
-    <form method="post" action="{{$base}}/keys"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Generate key</button></form>
+    {{if $d.NoFrom}}<p>A key carries the gateway's From address, and none is set: set it on the <a href="/settings#upstream">Settings page</a> and restart, then generate the key.</p>
+    {{else}}<form method="post" action="{{$base}}/keys"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Generate key</button></form>{{end}}
   </div>
 </section>
 {{end}}

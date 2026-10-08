@@ -83,7 +83,8 @@ func serve(cfgPath string) error {
 	defer st.Close()
 
 	// Settings first: they complete cfg (upstream, default policy, ...).
-	if _, _, err := settings.Bootstrap(ctx, st, cfg, log); err != nil {
+	sm, _, err := settings.Bootstrap(ctx, st, cfg, log)
+	if err != nil {
 		return err
 	}
 	for _, w := range cfg.Warnings {
@@ -107,7 +108,10 @@ func serve(cfgPath string) error {
 	km := keys.NewManager(st, keysOptions(cfg))
 	if km.Enabled() {
 		n, err := km.EnsureAll(ctx)
-		if err != nil {
+		switch {
+		case errors.Is(err, keys.ErrNoFrom):
+			log.Warn("some agents have no signing key; they get one once upstream.from is set on the Settings page and the gateway restarted")
+		case err != nil:
 			return fmt.Errorf("checking signing keys: %w", err)
 		}
 		if n > 0 {
@@ -121,7 +125,7 @@ func serve(cfgPath string) error {
 		Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: sender,
 		Limiter: ratelimit.New(st), Audit: auditW, Log: log.With("component", "api"),
 	})
-	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: sender, Log: log.With("component", "dashboard")})
+	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: sender, Log: log.With("component", "dashboard")})
 	if err != nil {
 		return err
 	}

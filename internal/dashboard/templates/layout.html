@@ -43,6 +43,10 @@
 </header>
 {{end}}
 {{range .Flash}}<div class="flash {{.Kind}}" role="status">{{if eq .Kind "ok"}}<svg class="icon" aria-hidden="true"><use href="#icon-check-circle"/></svg>{{else}}<svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg>{{end}}<div class="flash-text">{{.Message}}</div><button type="button" class="flash-close ghost icon-only sm" data-dismiss><svg class="icon" aria-hidden="true"><use href="#icon-x"/></svg><span class="visually-hidden">Dismiss</span></button></div>{{end}}
+{{if .LoggedIn}}
+{{with .LoadProblems}}<div class="banner danger" role="alert"><svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg><div><strong>The saved settings have problems.</strong> email-me is running with them as they are; fix them on the <a href="/settings">Settings</a> page.<ul>{{range .}}<li>{{.}}</li>{{end}}</ul></div></div>{{end}}
+{{with .Pending}}<div class="banner warn" id="restart-banner"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div><strong>Restart to apply.</strong> Settings saved {{until $.SavedAt}} are not in effect yet: {{range $i, $k := .}}{{if $i}}, {{end}}<code>{{$k}}</code>{{end}}. <a href="/settings#restart">Restart</a> to apply them.</div></div>{{end}}
+{{end}}
 {{template "content" .}}
 </main>
 </body>

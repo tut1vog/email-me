@@ -27,6 +27,9 @@ var (
 	ErrNoKey = errors.New("agent has no active signing key")
 	// ErrExpired means the agent's active key has expired and must be rotated.
 	ErrExpired = errors.New("agent signing key has expired; rotate it from the dashboard")
+	// ErrNoFrom means no From address (upstream.from) is configured, so a new
+	// key would carry a user ID without an address.
+	ErrNoFrom = errors.New("no From address is configured: set upstream.from on the Settings page and restart, then generate the key")
 )
 
 // Manager generates, stores and loads agent signing keys.
@@ -71,6 +74,9 @@ func (m *Manager) UserID(agentName string) string {
 
 // generate creates (but does not store) a new key for the agent.
 func (m *Manager) generate(agentName string) (*store.AgentKey, *openpgp.Entity, error) {
+	if m.email == "" {
+		return nil, nil, ErrNoFrom
+	}
 	now := m.now()
 	cfg := pgp.Config()
 	cfg.Algorithm = packet.PubKeyAlgoEdDSA // v4 Ed25519 for broad client support (GnuPG 2.2+, Thunderbird)
@@ -204,6 +210,8 @@ func (m *Manager) ActiveKey(ctx context.Context, agentID string) (*store.AgentKe
 
 // EnsureAll verifies the KEK against existing keys and creates keys for
 // agents that lack one (e.g. signing was enabled after they were created).
+// Without a From address it creates none and, once every existing key is
+// verified, returns ErrNoFrom if an agent was left without a key.
 func (m *Manager) EnsureAll(ctx context.Context) (created int, err error) {
 	if !m.Enabled() {
 		return 0, nil
@@ -212,9 +220,14 @@ func (m *Manager) EnsureAll(ctx context.Context) (created int, err error) {
 	if err != nil {
 		return 0, err
 	}
+	var missing error
 	for _, a := range agents {
 		k, err := m.store.ActiveKey(ctx, a.ID)
 		if errors.Is(err, store.ErrNotFound) {
+			if m.email == "" {
+				missing = ErrNoFrom
+				continue
+			}
 			if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
 				return created, fmt.Errorf("creating key for agent %s: %w", a.Name, err)
 			}
@@ -228,7 +241,7 @@ func (m *Manager) EnsureAll(ctx context.Context) (created int, err error) {
 			return created, fmt.Errorf("agent %s: %w", a.Name, err)
 		}
 	}
-	return created, nil
+	return created, missing
 }
 
 func (m *Manager) put(fpr string, e *openpgp.Entity) {
