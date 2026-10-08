@@ -1,154 +1,62 @@
+{{define "crumbs"}}<a href="/agents">Agents</a>{{end}}
+{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.ID}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
 {{define "content"}}
-{{$d := .Data}}{{$a := $d.Agent}}{{$f := $d.Form}}{{$e := $d.Effective}}{{$def := $d.Defaults}}
-<div class="heading">
-  <h1>{{$a.Name}} {{if not $a.Enabled}}<span class="tag">disabled</span>{{end}}</h1>
-  <a class="button danger" href="/agents/{{$a.ID}}/delete">Delete…</a>
-</div>
+{{$d := .Data}}{{$a := $d.Agent}}{{$e := $d.Effective}}{{$base := printf "/agents/%s" $a.ID}}
+{{template "agent_header" .}}
 
-{{if $d.Unknown}}<div class="banner warn">This policy references aliases that are not in config.yaml and are ignored: {{join $d.Unknown ", "}}.</div>{{end}}
+<div class="card-grid">
+<section class="card">
+  <div class="card-header"><h2>Details</h2></div>
+  <form method="post" action="{{$base}}">
+    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+    <div class="card-body">
+      <div class="field">
+        <label for="description">Description</label>
+        <input id="description" name="description" value="{{$a.Description}}" maxlength="200">
+      </div>
+      <div class="field">
+        <label class="check"><input type="checkbox" name="enabled" {{if $a.Enabled}}checked{{end}}> Enabled</label>
+        <p class="hint">Disabled agents get <code>403 agent_disabled</code>.</p>
+      </div>
+      <p class="hint">Created {{ts $a.CreatedAt}} · ID <code>{{$a.ID}}</code></p>
+    </div>
+    <div class="card-footer"><button type="submit">Save</button></div>
+  </form>
+</section>
 
 <section class="card">
-  <h2>Details</h2>
-  <form method="post" action="/agents/{{$a.ID}}" class="form">
-    <input type="hidden" name="csrf" value="{{$.CSRF}}">
-    <label for="description">Description</label>
-    <input id="description" name="description" value="{{$a.Description}}" maxlength="200">
-    <label class="check"><input type="checkbox" name="enabled" {{if $a.Enabled}}checked{{end}}> Enabled (disabled agents get <code>403 agent_disabled</code>)</label>
-    <p class="hint">Created {{ts $a.CreatedAt}} · ID <code>{{$a.ID}}</code></p>
-    <button type="submit">Save</button>
-  </form>
+  <div class="card-header"><h2>Status</h2></div>
+  <div class="card-body">
+    <dl class="grid">
+      <dt>Last 24 hours</dt>
+      <dd><span class="num">{{$d.Day.Sent}}</span> sent{{if $d.Day.Rejected}} · <span class="num">{{$d.Day.Rejected}}</span> rejected{{end}}{{if $d.Day.Failed}} · <span class="danger-text"><span class="num">{{$d.Day.Failed}}</span> failed</span>{{end}}</dd>
+      <dt>Last 7 days</dt>
+      <dd><span class="num">{{$d.Week.Sent}}</span> sent{{if $d.Week.Rejected}} · <span class="num">{{$d.Week.Rejected}}</span> rejected{{end}}{{if $d.Week.Failed}} · <span class="danger-text"><span class="num">{{$d.Week.Failed}}</span> failed</span>{{end}}
+        · <a href="/audit?agent={{$a.ID}}&amp;period=7d">Audit log</a></dd>
+      <dt>Tokens</dt>
+      <dd>{{$d.ActiveTokens}} active{{with $d.LastUsed}} · last used {{until .}}{{end}} · <a href="{{$base}}/tokens">Manage</a></dd>
+      <dt>Signing key</dt>
+      <dd>{{if not $d.SigningEnabled}}<span class="muted">signing not configured</span>
+        {{else}}{{with $d.Key}}<code>{{.Fingerprint}}</code> {{end}}{{template "key_state_tag" $d.KeyState}} · <a href="{{$base}}/signing">Manage</a>{{end}}</dd>
+    </dl>
+  </div>
 </section>
+</div>
 
-<section class="card" id="tokens">
-  <h2>Tokens</h2>
-  {{if $d.Tokens}}
-  <table>
-    <thead><tr><th>ID</th><th>Label</th><th>Created</th><th>Expires</th><th>Allowed from</th><th>Last used</th><th>Status</th><th></th></tr></thead>
-    <tbody>
-    {{range $d.Tokens}}
-      <tr>
-        <td><code>{{.ID}}</code></td>
-        <td>{{.Label}}</td>
-        <td>{{ts .CreatedAt}}</td>
-        <td>{{ts .ExpiresAt}}</td>
-        <td>{{if .AllowedCIDRs}}{{join .AllowedCIDRs ", "}}{{else}}<span class="muted">anywhere</span>{{end}}</td>
-        <td>{{ts .LastUsedAt}}{{with .LastUsedIP}} from <code>{{.}}</code>{{end}}</td>
-        <td>{{if .RevokedAt}}<span class="tag">revoked</span>{{else if .Active $d.Now}}<span class="tag ok">active</span>{{else}}<span class="tag">expired</span>{{end}}</td>
-        <td>{{if not .RevokedAt}}
-          <form method="post" action="/agents/{{$a.ID}}/tokens/{{.ID}}/revoke" data-confirm="Revoke token {{.ID}}? Agents using it will get 401 immediately.">
-            <input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="link danger">Revoke</button>
-          </form>{{end}}</td>
-      </tr>
-    {{end}}
-    </tbody>
-  </table>
-  {{else}}<p class="muted">No tokens yet.</p>{{end}}
-  <details {{if not $d.Tokens}}open{{end}}>
-    <summary>Issue a token</summary>
-    <form method="post" action="/agents/{{$a.ID}}/tokens" class="form inline-grid">
-      <input type="hidden" name="csrf" value="{{$.CSRF}}">
-      <label>Label <input name="label" maxlength="100" placeholder="build-02"></label>
-      <label>Expires in days <input name="expires_days" inputmode="numeric" placeholder="never"></label>
-      <label>Allowed source IPs/CIDRs <input name="cidrs" placeholder="any, e.g. 100.64.0.0/10, 10.0.0.5"></label>
-      <button type="submit">Issue token</button>
-    </form>
-    <p class="hint">The token is shown once. Several tokens per agent let you rotate without downtime.</p>
-  </details>
-</section>
-
-<section class="card" id="policy">
-  <h2>Policy</h2>
-  <p class="hint">Unchecked settings inherit the configured default (right column). The effective value is what the agent gets.</p>
-  <form method="post" action="/agents/{{$a.ID}}/policy">
-    <input type="hidden" name="csrf" value="{{$.CSRF}}">
-    <table class="policy">
-      <thead><tr><th>Setting</th><th>Override</th><th>Value</th><th>Default</th></tr></thead>
-      <tbody>
-        <tr><td>Recipients</td><td><input type="checkbox" name="ov_recipients" aria-label="Override recipients" {{if $f.OvRecipients}}checked{{end}}></td>
-          <td>{{range $d.Aliases}}<label class="check"><input type="checkbox" name="recipients" value="{{.}}" {{if has $f.Recipients .}}checked{{end}}> {{.}}</label>{{end}}</td>
-          <td>{{if $def.Recipients}}{{join $def.Recipients ", "}}{{else}}<span class="muted">none</span>{{end}}</td></tr>
-        <tr><td>Services</td><td><input type="checkbox" name="ov_services" aria-label="Override services" {{if $f.OvServices}}checked{{end}}></td>
-          <td>{{range $d.AllServices}}<label class="check"><input type="checkbox" name="services" value="{{.}}" {{if has $f.Services .}}checked{{end}}> {{.}}</label>{{end}}</td>
-          <td>{{join $def.Services ", "}}</td></tr>
-        <tr><td>Max message size</td><td><input type="checkbox" name="ov_max_bytes" aria-label="Override max message size" {{if $f.OvMaxBytes}}checked{{end}}></td>
-          <td><input name="max_bytes" value="{{$f.MaxBytes}}" size="10"></td><td>{{$def.MaxMessageBytes}} bytes</td></tr>
-        <tr><td>Max attachments</td><td><input type="checkbox" name="ov_max_att" aria-label="Override max attachments" {{if $f.OvMaxAtt}}checked{{end}}></td>
-          <td><input name="max_att" value="{{$f.MaxAtt}}" size="4" inputmode="numeric"></td><td>{{$def.MaxAttachments}}</td></tr>
-        <tr><td>Allowed attachment types</td><td><input type="checkbox" name="ov_types" aria-label="Override attachment types" {{if $f.OvTypes}}checked{{end}}></td>
-          <td><input name="types" value="{{$f.Types}}" placeholder="any, e.g. text/*, application/pdf"></td>
-          <td>{{if $def.AllowedAttachmentTypes}}{{join $def.AllowedAttachmentTypes ", "}}{{else}}<span class="muted">any</span>{{end}}</td></tr>
-        <tr><td>Rate limit</td><td><input type="checkbox" name="ov_rate" aria-label="Override rate limit" {{if $f.OvRate}}checked{{end}}></td>
-          <td><input name="per_hour" value="{{$f.PerHour}}" size="4" inputmode="numeric"> / hour · <input name="per_day" value="{{$f.PerDay}}" size="5" inputmode="numeric"> / day</td>
-          <td>{{$def.RateLimit.PerHour}}/hour · {{$def.RateLimit.PerDay}}/day</td></tr>
-        <tr><td>Subject prefix</td><td><input type="checkbox" name="ov_prefix" aria-label="Override subject prefix" {{if $f.OvPrefix}}checked{{end}}></td>
-          <td><input name="prefix" value="{{$f.Prefix}}"></td><td><code>{{$def.SubjectPrefix}}</code></td></tr>
-        <tr><td>Require encryption</td><td></td>
-          <td><select name="require_encryption">
-            <option value="inherit" {{if eq $f.ReqEnc "inherit"}}selected{{end}}>inherit</option>
-            <option value="true" {{if eq $f.ReqEnc "true"}}selected{{end}}>yes</option>
-            <option value="false" {{if eq $f.ReqEnc "false"}}selected{{end}}>no</option></select></td>
-          <td>{{if $def.RequireEncryption}}yes{{else}}no{{end}}</td></tr>
-        <tr><td>Require signing</td><td></td>
-          <td><select name="require_signing">
-            <option value="inherit" {{if eq $f.ReqSign "inherit"}}selected{{end}}>inherit</option>
-            <option value="true" {{if eq $f.ReqSign "true"}}selected{{end}}>yes</option>
-            <option value="false" {{if eq $f.ReqSign "false"}}selected{{end}}>no</option></select></td>
-          <td>{{if $def.RequireSigning}}yes{{else}}no{{end}}</td></tr>
-      </tbody>
-    </table>
-    <div class="note">
-      <strong>Encryption × signing.</strong> Signing and end-to-end (<code>e2e</code>) encryption cannot be combined: to sign, the gateway must read the content. With signing required, the gateway sees every message in plaintext, so use <code>encrypt: pgp</code> for sensitive content and <strong>TLS on every non-localhost path</strong> between agents and the gateway. Grant <code>e2e</code> only to agents whose content the gateway must never see, and set their <em>Require signing</em> to <em>no</em>; those messages are not signed.
-    </div>
-    <button type="submit">Save policy</button>
-  </form>
-  <h3>Effective policy</h3>
-  <dl class="grid">
-    <dt>Recipients</dt><dd>{{if $e.Recipients}}{{join $e.Recipients ", "}}{{else}}<span class="muted">none — this agent cannot send</span>{{end}}</dd>
-    <dt>Services</dt><dd>{{join $e.Services ", "}}</dd>
-    <dt>Limits</dt><dd>{{$e.MaxMessageBytes}} bytes · {{$e.MaxAttachments}} attachments · {{$e.RateLimit.PerHour}}/hour · {{$e.RateLimit.PerDay}}/day</dd>
-    <dt>Subject prefix</dt><dd><code>{{$e.SubjectPrefix}}</code></dd>
-    <dt>Require encryption</dt><dd>{{if $e.RequireEncryption}}yes{{else}}no{{end}}</dd>
-    <dt>Require signing</dt><dd>{{if $e.RequireSigning}}yes{{else}}no{{end}}</dd>
-  </dl>
-</section>
-
-<section class="card" id="signing">
-  <h2>Signing key</h2>
-  {{if not $d.SigningEnabled}}
-    <p class="muted">Signing is not configured on this gateway (<code>signing.key_encryption_key_file</code>).</p>
-  {{else}}
-    <p class="hint">Held by the gateway; the agent never sees it. User ID: <code>{{$d.UserID}}</code></p>
-    {{with $d.ActiveKey}}
-      {{if $d.KeyExpired}}<div class="banner danger">This key expired on {{ts .ExpiresAt}}. Signed sends fail until you rotate it.</div>
-      {{else if $d.KeyExpiring}}<div class="banner warn">This key expires on {{ts .ExpiresAt}}. Rotate it soon.</div>{{end}}
-      <dl class="grid">
-        <dt>Fingerprint</dt><dd><code>{{.Fingerprint}}</code></dd>
-        <dt>Created</dt><dd>{{ts .CreatedAt}}</dd>
-        <dt>Expires</dt><dd>{{ts .ExpiresAt}}</dd>
-      </dl>
-      <p>
-        <a class="button secondary" href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/public.asc">Download public key</a>
-      </p>
-      <p class="hint">Revocation certificates: <a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/revocation.asc">retired</a> (after rotation or deletion; signatures already made stay valid) · <a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/revocation-compromised.asc">compromised</a> (only if the key may have leaked, e.g. the database and KEK were exposed; invalidates every signature it made).</p>
-      <form method="post" action="/agents/{{$a.ID}}/keys/rotate" data-confirm="Generate a new signing key for {{$a.Name}}? The current key is retired and its private part discarded.">
-        <input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="secondary">Rotate key</button>
-      </form>
-    {{else}}
-      <p>This agent has no signing key.</p>
-      <form method="post" action="/agents/{{$a.ID}}/keys"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Generate key</button></form>
-    {{end}}
-    {{if $d.RetiredKeys}}
-      <h3>Retired keys</h3>
-      <table>
-        <thead><tr><th>Fingerprint</th><th>Created</th><th>Retired</th><th></th></tr></thead>
-        <tbody>
-        {{range $d.RetiredKeys}}
-          <tr><td><code>{{.Fingerprint}}</code></td><td>{{ts .CreatedAt}}</td><td>{{ts .RetiredAt}}</td>
-          <td><a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/public.asc">public key</a> · revocation certificate: <a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/revocation.asc">retired</a> or <a href="/agents/{{$a.ID}}/keys/{{.Fingerprint}}/revocation-compromised.asc">compromised</a></td></tr>
-        {{end}}
-        </tbody>
-      </table>
-    {{end}}
-  {{end}}
+<section class="card">
+  <div class="card-header">
+    <h2>Effective policy</h2>
+    <div class="card-actions"><a class="button secondary sm" href="{{$base}}/policy">Edit policy</a></div>
+  </div>
+  <div class="card-body">
+    <dl class="grid">
+      <dt>Recipients</dt><dd>{{if $e.Recipients}}{{join $e.Recipients ", "}}{{else}}<span class="muted">none — this agent cannot send</span>{{end}}</dd>
+      <dt>Services</dt><dd>{{join $e.Services ", "}}</dd>
+      <dt>Limits</dt><dd>{{bytesize $e.MaxMessageBytes}} · {{$e.MaxAttachments}} attachments{{if $e.AllowedAttachmentTypes}} ({{join $e.AllowedAttachmentTypes ", "}}){{end}} · {{$e.RateLimit.PerHour}}/hour · {{$e.RateLimit.PerDay}}/day</dd>
+      <dt>Subject prefix</dt><dd>{{if $e.SubjectPrefix}}<code>{{$e.SubjectPrefix}}</code>{{else}}<span class="muted">none</span>{{end}}</dd>
+      <dt>Require encryption</dt><dd>{{if $e.RequireEncryption}}yes{{else}}no{{end}}</dd>
+      <dt>Require signing</dt><dd>{{if $e.RequireSigning}}yes{{else}}no{{end}}</dd>
+    </dl>
+  </div>
 </section>
 {{end}}

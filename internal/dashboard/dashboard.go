@@ -21,6 +21,7 @@ import (
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/store"
+	"github.com/tut1vog/email-me/internal/units"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
 
@@ -75,16 +76,27 @@ func New(d Deps) (*Server, error) {
 		pages:      map[string]*template.Template{},
 		now:        time.Now,
 	}
-	pages, err := fs.Glob(templateFS, "templates/*.html")
+	all, err := fs.Glob(templateFS, "templates/*.html")
 	if err != nil {
 		return nil, err
 	}
+	// Files named _*.html are partials (icon sprite, shared fragments):
+	// parsed into every page, never rendered as pages themselves.
+	partials := []string{"templates/layout.html"}
+	var pages []string
+	for _, p := range all {
+		switch base := strings.TrimPrefix(p, "templates/"); {
+		case base == "layout.html":
+		case strings.HasPrefix(base, "_"):
+			partials = append(partials, p)
+		default:
+			pages = append(pages, p)
+		}
+	}
+	fm := s.funcs()
 	for _, p := range pages {
 		name := strings.TrimSuffix(strings.TrimPrefix(p, "templates/"), ".html")
-		if name == "layout" {
-			continue
-		}
-		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", p)
+		t, err := template.New("layout.html").Funcs(fm).ParseFS(templateFS, append(partials[:len(partials):len(partials)], p)...)
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", p, err)
 		}
@@ -107,7 +119,10 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /agents", s.agents)
 	authed("GET /agents/new", s.newAgentPage)
 	authed("POST /agents", s.createAgent)
-	authed("GET /agents/{id}", s.agentPage)
+	authed("GET /agents/{id}", s.agentOverview)
+	authed("GET /agents/{id}/tokens", s.agentTokens)
+	authed("GET /agents/{id}/policy", s.agentPolicy)
+	authed("GET /agents/{id}/signing", s.agentSigning)
 	authed("POST /agents/{id}", s.updateAgent)
 	authed("POST /agents/{id}/policy", s.updatePolicy)
 	authed("GET /agents/{id}/delete", s.deleteAgentPage)
@@ -319,7 +334,8 @@ func safeNext(next string) string {
 
 type page struct {
 	Title    string
-	Nav      string
+	Nav      string // page (template) name; agent tabs highlight by it
+	Section  string // sidebar section the page belongs to
 	CSRF     string
 	Flash    []auth.Flash
 	LoggedIn bool
@@ -332,7 +348,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name, title stri
 		http.Error(w, "unknown page", http.StatusInternalServerError)
 		return
 	}
-	p := page{Title: title, Nav: name, Data: data}
+	p := page{Title: title, Nav: name, Section: sectionOf(name), Data: data}
 	if sess := sessionFrom(r); sess != nil {
 		p.CSRF, p.Flash, p.LoggedIn = sess.CSRF, sess.PopFlash(), true
 	}
@@ -340,6 +356,23 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name, title stri
 	if err := t.Execute(w, p); err != nil {
 		s.Log.Error("rendering dashboard page", "page", name, "err", err)
 	}
+}
+
+// sectionOf maps a page template to the sidebar section it highlights.
+func sectionOf(name string) string {
+	switch name {
+	case "overview":
+		return "overview"
+	case "agents", "agent", "agent_tokens", "agent_policy", "agent_signing", "agent_new", "agent_delete", "token":
+		return "agents"
+	case "recipients":
+		return "recipients"
+	case "audit":
+		return "audit"
+	case "settings", "guide":
+		return "settings"
+	}
+	return ""
 }
 
 func (s *Server) flash(r *http.Request, kind, format string, args ...any) {
@@ -357,37 +390,111 @@ func (s *Server) fail(w http.ResponseWriter, what string, err error) {
 	http.Error(w, "internal error: "+what, http.StatusInternalServerError)
 }
 
-var funcs = template.FuncMap{
-	"ts": func(t any) string {
-		switch v := t.(type) {
-		case time.Time:
-			if v.IsZero() {
-				return "—"
+// funcs returns the template functions. until reads s.now at render time,
+// so tests that pin the clock get deterministic relative times.
+func (s *Server) funcs() template.FuncMap {
+	return template.FuncMap{
+		"ts":       ts,
+		"until":    func(t any) string { return relTime(t, s.now()) },
+		"bytesize": bytesize,
+		"short": func(s string) string {
+			if len(s) > 16 {
+				return s[len(s)-16:]
 			}
-			return v.UTC().Format("2006-01-02 15:04 UTC")
-		case *time.Time:
-			if v == nil {
-				return "—"
+			return s
+		},
+		"join": strings.Join,
+		"add":  func(a, b int) int { return a + b },
+		"sub":  func(a, b int) int { return a - b },
+		"has": func(list []string, v string) bool {
+			for _, x := range list {
+				if x == v {
+					return true
+				}
 			}
-			return v.UTC().Format("2006-01-02 15:04 UTC")
+			return false
+		},
+	}
+}
+
+func ts(t any) string {
+	switch v := t.(type) {
+	case time.Time:
+		if v.IsZero() {
+			return "—"
 		}
-		return "—"
-	},
-	"short": func(s string) string {
-		if len(s) > 16 {
-			return s[len(s)-16:]
+		return v.UTC().Format("2006-01-02 15:04 UTC")
+	case *time.Time:
+		if v == nil {
+			return "—"
 		}
-		return s
-	},
-	"join": strings.Join,
-	"add":  func(a, b int) int { return a + b },
-	"sub":  func(a, b int) int { return a - b },
-	"has": func(list []string, v string) bool {
-		for _, x := range list {
-			if x == v {
-				return true
-			}
+		return v.UTC().Format("2006-01-02 15:04 UTC")
+	}
+	return "—"
+}
+
+// bytesize formats a byte count the way config.yaml writes it ("10MiB").
+func bytesize(v any) string {
+	switch n := v.(type) {
+	case int64:
+		return units.ByteSize(n).String()
+	case int:
+		return units.ByteSize(n).String()
+	case units.ByteSize:
+		return n.String()
+	case *units.ByteSize:
+		if n == nil {
+			return ""
 		}
-		return false
-	},
+		return n.String()
+	}
+	return fmt.Sprint(v)
+}
+
+// relTime describes t relative to now: "in 12 days", "3 hours ago",
+// "just now". It returns "" for a zero time or nil pointer.
+func relTime(t any, now time.Time) string {
+	var at time.Time
+	switch v := t.(type) {
+	case time.Time:
+		at = v
+	case *time.Time:
+		if v == nil {
+			return ""
+		}
+		at = *v
+	default:
+		return ""
+	}
+	if at.IsZero() {
+		return ""
+	}
+	d := at.Sub(now)
+	future := d > 0
+	if !future {
+		d = -d
+	}
+	var n int
+	var unit string
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		n, unit = int(d/time.Minute), "minute"
+	case d < 48*time.Hour:
+		n, unit = int(d/time.Hour), "hour"
+	case d < 60*24*time.Hour:
+		n, unit = int(d/(24*time.Hour)), "day"
+	case d < 730*24*time.Hour:
+		n, unit = int(d/(30*24*time.Hour)), "month"
+	default:
+		n, unit = int(d/(365*24*time.Hour)), "year"
+	}
+	if n != 1 {
+		unit += "s"
+	}
+	if future {
+		return fmt.Sprintf("in %d %s", n, unit)
+	}
+	return fmt.Sprintf("%d %s ago", n, unit)
 }

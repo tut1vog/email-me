@@ -1,22 +1,33 @@
+{{define "actions"}}<a class="button" href="/agents/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>New agent</a>{{end}}
 {{define "content"}}
-<div class="heading"><h1>Agents</h1><a class="button" href="/agents/new">New agent</a></div>
 {{if .Data.Rows}}
-<table class="card">
-  <thead><tr><th>Name</th><th>Description</th><th>Recipients</th><th>Active tokens</th><th>Signing</th><th>Status</th></tr></thead>
-  <tbody>
-  {{range .Data.Rows}}
-    <tr>
-      <td><a href="/agents/{{.Agent.ID}}">{{.Agent.Name}}</a></td>
-      <td>{{.Agent.Description}}</td>
-      <td>{{if .Effective.Recipients}}{{join .Effective.Recipients ", "}}{{else}}<span class="muted">none</span>{{end}}</td>
-      <td>{{.ActiveTokens}}</td>
-      <td>{{if .KeyFpr}}<code title="{{.KeyFpr}}">…{{short .KeyFpr}}</code>{{if .Effective.RequireSigning}} <span class="tag">required</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
-      <td>{{if .Agent.Enabled}}<span class="tag ok">enabled</span>{{else}}<span class="tag">disabled</span>{{end}}</td>
-    </tr>
-  {{end}}
-  </tbody>
-</table>
+<section class="card">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Name</th><th>Description</th><th>Recipients</th><th class="num">Active tokens</th><th>Signing</th><th>Status</th></tr></thead>
+    <tbody>
+    {{range .Data.Rows}}
+      <tr>
+        <td><a href="/agents/{{.Agent.ID}}"><strong>{{.Agent.Name}}</strong></a></td>
+        <td class="text-2">{{.Agent.Description}}</td>
+        <td>{{if .Effective.Recipients}}{{join .Effective.Recipients ", "}}{{else}}<span class="muted">none</span>{{end}}</td>
+        <td class="num">{{.ActiveTokens}}</td>
+        <td>{{if .KeyFpr}}<code class="fpr" title="{{.KeyFpr}}">{{short .KeyFpr}}</code>{{if .Effective.RequireSigning}} <span class="tag info nodot">required</span>{{end}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>{{if .Agent.Enabled}}<span class="tag ok">enabled</span>{{else}}<span class="tag">disabled</span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+</section>
 {{else}}
-<p class="card">No agents yet. <a href="/agents/new">Create one</a>.</p>
+<section class="card">
+  <div class="empty">
+    <svg class="icon" aria-hidden="true"><use href="#icon-bot"/></svg>
+    <strong>No agents yet</strong>
+    <p>An agent is one AI client with its own tokens, recipients and policy.</p>
+    <a class="button" href="/agents/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>New agent</a>
+  </div>
+</section>
 {{end}}
 {{end}}

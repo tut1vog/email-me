@@ -1,8 +1,7 @@
+{{define "actions"}}{{$d := .Data}}<a class="button secondary" href="/audit.csv?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Export CSV</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}
-<div class="heading"><h1>Audit log</h1><a class="button secondary" href="/audit.csv?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}">Export CSV</a></div>
-<p class="hint">Metadata only — message bodies and attachments are never stored{{if not $d.LogSubject}}, and subjects are not logged (<code>audit.log_subject: false</code>){{end}}.</p>
-<form method="get" action="/audit" class="filters">
+<form method="get" action="/audit" class="filters" data-autosubmit>
   <label>Agent <select name="agent"><option value="">all</option>
     {{range $d.Agents}}<option value="{{.ID}}" {{if eq .ID $d.Filter.AgentID}}selected{{end}}>{{.Name}}</option>{{end}}</select></label>
   <label>Status <select name="status">
@@ -15,35 +14,51 @@
     <option value="7d" {{if eq $d.Period "7d"}}selected{{end}}>7 days</option>
     <option value="30d" {{if eq $d.Period "30d"}}selected{{end}}>30 days</option>
     <option value="all" {{if eq $d.Period "all"}}selected{{end}}>all</option></select></label>
-  <button type="submit" class="secondary">Filter</button>
+  <button type="submit" class="secondary js-hide">Filter</button>
 </form>
 {{if $d.Rows}}
-<table class="card audit">
-  <thead><tr><th>Time</th><th>Agent</th><th>To</th><th>Size</th><th>Services</th><th>Enc</th><th>Signed</th><th>Transport</th><th>Status</th>{{if $d.LogSubject}}<th>Subject</th>{{end}}<th>Source</th></tr></thead>
-  <tbody>
-  {{range $d.Rows}}
-    <tr>
-      <td>{{ts .TS}}</td>
-      <td>{{with index $d.Names .AgentID}}{{.}}{{else}}<code>{{.AgentID}}</code>{{end}}</td>
-      <td>{{join .Recipients ", "}}</td>
-      <td>{{.SizeBytes}}{{if .AttachmentCount}} ({{.AttachmentCount}} att.){{end}}</td>
-      <td>{{join .Services ", "}}</td>
-      <td>{{if .Encrypted}}yes{{end}}</td>
-      <td>{{if .Signed}}<span title="{{.SigningKeyFpr}}">yes</span>{{end}}</td>
-      <td>{{if eq .Transport "insecure"}}<span class="tag danger">insecure</span>{{else}}{{.Transport}}{{end}}</td>
-      <td>{{if eq .Status "sent"}}<span class="tag ok">sent</span>{{else if eq .Status "failed"}}<span class="tag danger">failed</span>{{else}}<span class="tag">rejected</span>{{end}}
-        {{with .ErrorCode}}<code>{{.}}</code>{{end}}{{if .UpstreamCode}} ({{.UpstreamCode}}){{end}}</td>
-      {{if $d.LogSubject}}<td>{{.Subject}}</td>{{end}}
-      <td><code>{{.SourceIP}}</code> <span class="muted">{{.TokenID}}</span></td>
-    </tr>
-  {{end}}
-  </tbody>
-</table>
-<p class="pager">
-  {{if gt $d.Page 1}}<a href="/audit?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{sub $d.Page 1}}">← Newer</a>{{end}}
-  {{if $d.More}}<a href="/audit?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{add $d.Page 1}}">Older →</a>{{end}}
-</p>
-{{else}}
-<p class="card muted">No matching entries.</p>
+<section class="card">
+  <div class="table-wrap">
+  <table class="compact">
+    <thead><tr><th>Time</th><th>Agent</th><th>To</th><th>Message</th><th>Security</th><th>Status</th><th>Source</th></tr></thead>
+    <tbody>
+    {{range $d.Rows}}
+      <tr>
+        <td class="nowrap">{{ts .TS}}</td>
+        <td>{{with index $d.Names .AgentID}}{{.}}{{else}}<code>{{.AgentID}}</code>{{end}}</td>
+        <td>{{join .Recipients ", "}}</td>
+        <td>{{if $d.LogSubject}}{{with .Subject}}<span>{{.}}</span>{{else}}<span class="muted">(no subject)</span>{{end}}{{end}}
+          {{- if .SizeBytes}}<span class="sub">{{bytesize .SizeBytes}}{{if .AttachmentCount}} · {{.AttachmentCount}} att{{end}}</span>{{end}}
+          {{- with .Services}}<span class="sub">{{join . ", "}}</span>{{end}}</td>
+        <td><span class="row">{{if .Encrypted}}<span class="tag ok">enc</span>{{end}}{{if .Signed}}<span class="tag info" title="{{.SigningKeyFpr}}">signed</span>{{end}}{{if eq .Transport "insecure"}}<span class="tag danger">insecure</span>{{end}}</span>
+          {{- if and .Transport (ne .Transport "insecure")}}<span class="sub">{{.Transport}}</span>{{end}}</td>
+        <td>{{if eq .Status "sent"}}<span class="tag ok">sent</span>{{else if eq .Status "failed"}}<span class="tag danger">failed</span>{{else}}<span class="tag warn">rejected</span>{{end}}
+          {{- with .ErrorCode}}<span class="sub"><code>{{.}}</code></span>{{end}}
+          {{- if .UpstreamCode}}<span class="sub">SMTP {{.UpstreamCode}}</span>{{end}}</td>
+        <td>{{with .SourceIP}}<span class="mono">{{.}}</span>{{end}}{{with .TokenID}}<span class="sub"><code>{{.}}</code></span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+</section>
+{{if or (gt $d.Page 1) $d.More}}
+<nav class="pager" aria-label="Pages">
+  <span class="pager-info">Page {{$d.Page}}</span>
+  <span class="row">
+  {{- if gt $d.Page 1}}<a class="button secondary sm" href="/audit?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{sub $d.Page 1}}">← Newer</a>{{end}}
+  {{- if $d.More}}<a class="button secondary sm" href="/audit?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{add $d.Page 1}}">Older →</a>{{end -}}
+  </span>
+</nav>
 {{end}}
+{{else}}
+<section class="card">
+  <div class="empty">
+    <svg class="icon" aria-hidden="true"><use href="#icon-list"/></svg>
+    <strong>No matching entries</strong>
+    <p>Try a longer period or another status.</p>
+  </div>
+</section>
+{{end}}
+<p class="small muted">Metadata only: message bodies and attachments are never stored{{if not $d.LogSubject}}, and subjects are not logged (<code>audit.log_subject: false</code>){{end}}.</p>
 {{end}}

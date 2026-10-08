@@ -116,6 +116,8 @@ func (d *dash) form(kv ...string) url.Values {
 	return v
 }
 
+var agentLocRe = regexp.MustCompile(`^/agents/(ag_[^/]+)`)
+
 func (d *dash) createAgent(name string, recipients ...string) *store.Agent {
 	d.t.Helper()
 	f := d.form("name", name, "description", "test agent")
@@ -123,10 +125,11 @@ func (d *dash) createAgent(name string, recipients ...string) *store.Agent {
 		f.Add("recipients", r)
 	}
 	p := d.post("/agents", f)
-	if p.status != http.StatusSeeOther || !strings.HasPrefix(p.header.Get("Location"), "/agents/ag_") {
+	m := agentLocRe.FindStringSubmatch(p.header.Get("Location"))
+	if p.status != http.StatusSeeOther || m == nil {
 		d.t.Fatalf("create agent: %d %s", p.status, p.header.Get("Location"))
 	}
-	a, err := d.st.GetAgent(context.Background(), strings.TrimPrefix(p.header.Get("Location"), "/agents/"))
+	a, err := d.st.GetAgent(context.Background(), m[1])
 	if err != nil {
 		d.t.Fatal(err)
 	}

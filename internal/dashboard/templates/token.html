@@ -1,24 +1,51 @@
+{{define "crumbs"}}<a href="/agents">Agents</a><a href="/agents/{{.Data.Agent.ID}}/tokens">{{.Data.Agent.Name}}</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}
-<h1>Token for {{$d.Agent.Name}}</h1>
-<div class="banner warn"><strong>Copy this token now.</strong> It is shown only once; email-me stores only a hash of it.</div>
+<section class="copy-panel">
+  <div class="copy-panel-head"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><strong>Copy this token now.</strong> <span>It is shown only once; email-me stores only a hash of it.</span></div>
+  <label for="token" class="visually-hidden">Token {{$d.TokenID}}</label>
+  <div class="copy-row">
+    <input id="token" readonly value="{{$d.Token}}">
+    <button type="button" data-copy="token"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span class="copy-label">Copy</span></button>
+  </div>
+  <p class="hint">Token ID <code>{{$d.TokenID}}</code></p>
+</section>
+
 <section class="card">
-  <label for="token">Token (ID <code>{{$d.TokenID}}</code>)</label>
-  <div class="copy-row"><input id="token" readonly value="{{$d.Token}}"><button type="button" data-copy="token">Copy</button></div>
-
-  <h2>Give the agent</h2>
-  <p>Set two environment variables where the agent runs:</p>
-  <pre id="env">EMAIL_ME_URL={{$d.BaseURL}}
+  <div class="card-header"><h2>1. Set the environment</h2></div>
+  <div class="card-body">
+    <p class="hint">Where the agent runs:</p>
+    <div class="copy-block">
+      <pre id="env">EMAIL_ME_URL={{$d.BaseURL}}
 EMAIL_ME_TOKEN={{$d.Token}}</pre>
-  <p><button type="button" data-copy="env" class="secondary">Copy</button></p>
+      <button type="button" class="secondary sm" data-copy="env"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span class="copy-label">Copy</span></button>
+    </div>
+  </div>
+</section>
 
-  <p>And add this to the agent's instructions or system prompt:</p>
-  <pre id="snippet">{{$d.Snippet}}</pre>
-  <p><button type="button" data-copy="snippet" class="secondary">Copy</button></p>
+<section class="card">
+  <div class="card-header"><h2>2. Tell the agent</h2></div>
+  <div class="card-body">
+    <p class="hint">Add to its instructions or system prompt:</p>
+    <div class="copy-block">
+      <pre id="snippet">{{$d.Snippet}}</pre>
+      <button type="button" class="secondary sm" data-copy="snippet"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span class="copy-label">Copy</span></button>
+    </div>
+  </div>
+</section>
 
-  <h2>Try it</h2>
-  <pre id="curl">curl -s -H "Authorization: Bearer $EMAIL_ME_TOKEN" $EMAIL_ME_URL/v1/capabilities</pre>
-  <p class="hint">If agents reach the gateway from another host, make sure that path uses TLS or an encrypted tunnel: signing requires the gateway to see message content.</p>
-  <p><a class="button" href="/agents/{{$d.Agent.ID}}#tokens">Done</a></p>
+<section class="card">
+  <div class="card-header"><h2>3. Try it</h2></div>
+  <div class="card-body">
+    <div class="copy-block">
+      <pre id="curl">curl -s -H "Authorization: Bearer $EMAIL_ME_TOKEN" $EMAIL_ME_URL/v1/capabilities</pre>
+      <button type="button" class="secondary sm" data-copy="curl"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span class="copy-label">Copy</span></button>
+    </div>
+    <details class="help">
+      <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Agent on another host?</summary>
+      <p>Make sure that path uses TLS or an encrypted tunnel: signing requires the gateway to see message content.</p>
+    </details>
+  </div>
+  <div class="card-footer"><a class="button" href="/agents/{{$d.Agent.ID}}/tokens"><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Done</a></div>
 </section>
 {{end}}

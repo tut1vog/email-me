@@ -1,59 +1,106 @@
 {{define "content"}}
-{{$d := .Data}}
-<h1>Overview</h1>
+{{$d := .Data}}{{$t := $d.Totals}}
 
 {{if $d.Insecure}}
 <div class="banner danger" role="alert">
-  <strong>Plain HTTP from a non-local network in the last 7 days.</strong>
-  Tokens and message content for these agents crossed the network unencrypted:
-  <ul>
-  {{range $d.Insecure}}<li><a href="/agents/{{.ID}}">{{.Name}}</a>{{if .RequireSigning}} <span class="tag danger">signing required — content was necessarily plaintext on this hop</span>{{end}}</li>{{end}}
-  </ul>
-  Use TLS (<code>api.tls</code> or a TLS reverse proxy with <code>trusted_proxies</code>), or an encrypted tunnel (Tailscale, WireGuard, SSH) with <code>api.external_transport_encryption: true</code>.
+  <svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg>
+  <div>
+    <strong>Plain HTTP from a non-local network in the last 7 days.</strong>
+    <p>Tokens and message content crossed the network unencrypted for
+    {{range $i, $a := $d.Insecure}}{{if $i}}, {{end}}<a href="/agents/{{$a.ID}}">{{$a.Name}}</a>{{if $a.RequireSigning}} (signing required, so content was plaintext on this hop){{end}}{{end}}.</p>
+    <details class="help">
+      <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>How to fix</summary>
+      <p>Use TLS (<code>api.tls</code> or a TLS reverse proxy with <code>trusted_proxies</code>), or an encrypted tunnel (Tailscale, WireGuard, SSH) with <code>api.external_transport_encryption: true</code>.</p>
+    </details>
+  </div>
 </div>
 {{end}}
 
-{{range $d.Notices}}<div class="banner {{.Kind}}">{{.Text}}</div>{{end}}
+<section class="stats" aria-label="Summary">
+  <a class="stat" href="/agents">
+    <span class="stat-label">Agents enabled</span>
+    <span class="stat-value">{{$t.Enabled}} <span class="unit">/ {{$t.Agents}}</span></span>
+    <span class="stat-meta">{{if eq $t.Enabled $t.Agents}}all enabled{{else}}{{sub $t.Agents $t.Enabled}} disabled{{end}}</span>
+  </a>
+  <a class="stat" href="/agents">
+    <span class="stat-label">Active tokens</span>
+    <span class="stat-value">{{$t.ActiveTokens}}</span>
+    <span class="stat-meta">across all agents</span>
+  </a>
+  <a class="stat" href="/audit?period=24h&amp;status=sent">
+    <span class="stat-label">Sent, last 24 h</span>
+    <span class="stat-value">{{$t.Day.Sent}}</span>
+    <span class="stat-meta">{{$t.Week.Sent}} in 7 days</span>
+  </a>
+  <a class="stat" href="/audit?period=24h&amp;status=failed">
+    <span class="stat-label">Failed, last 24 h</span>
+    <span class="stat-value{{if $t.Day.Failed}} danger{{end}}">{{$t.Day.Failed}}</span>
+    <span class="stat-meta">{{$t.Day.Rejected}} rejected</span>
+  </a>
+  <div class="stat">
+    <span class="stat-label">Upstream</span>
+    <span class="stat-value stat-status">{{with $d.SMTP}}{{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger" title="{{.Err}}">failed</span>{{end}}{{else}}<span class="tag">not checked</span>{{end}}</span>
+    <div class="stat-meta">
+      <span title="{{$d.Upstream}}">{{with $d.SMTP}}checked {{until .At}}{{else}}{{$d.Upstream}}{{end}}</span>
+      <form method="post" action="/settings/test-smtp">
+        <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/">
+        <button type="submit" class="secondary sm">Test</button>
+      </form>
+    </div>
+  </div>
+</section>
+
+{{if $d.Notices}}
+<div class="section-head"><h2>Needs attention ({{len $d.Notices}})</h2></div>
+<ul class="attention">
+{{range $d.Notices}}
+  <li class="attn {{.Kind}}">
+    {{if eq .Kind "danger"}}<svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg>{{else if eq .Kind "warn"}}<svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg>{{else}}<svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg>{{end}}
+    <div class="attn-body"><strong>{{.Title}}</strong> <span class="attn-text">{{.Text}}</span></div>
+    {{with .Link}}<a class="button secondary sm" href="{{.}}">Fix</a>{{end}}
+  </li>
+{{end}}
+</ul>
+{{else if not $d.Insecure}}
+<div class="section-head"><h2>Needs attention</h2></div>
+<ul class="attention">
+  <li class="attn ok">
+    <svg class="icon" aria-hidden="true"><use href="#icon-check-circle"/></svg>
+    <div class="attn-body"><strong>All clear</strong> <span class="attn-text">Keys, recipients and configuration look fine.</span></div>
+  </li>
+</ul>
+{{end}}
 
 {{if $d.FirstRun}}
-<section class="card first-run">
-  <h2>Welcome to email-me</h2>
-  <p>No agents yet. To let an AI agent email you:</p>
-  <ol>
-    <li><a href="/agents/new">Create an agent</a> and grant it one or more recipient aliases.</li>
-    <li>Issue a token for it and give the agent the token and the onboarding snippet.</li>
-    <li>The agent reads the guide at the API's base URL and starts sending.</li>
-  </ol>
-  <p><a class="button" href="/agents/new">Create your first agent</a></p>
+<section class="card">
+  <div class="card-header"><h2>Welcome to email-me</h2></div>
+  <div class="card-body">
+    <p>Create an agent, grant it recipient aliases and issue it a token.
+    The agent reads the guide at the API's base URL and starts sending.</p>
+    <a class="button" href="/agents/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>Create your first agent</a>
+  </div>
 </section>
 {{else}}
 <section class="card">
-  <h2>Activity</h2>
+  <div class="card-header"><h2>Activity</h2></div>
+  <div class="table-wrap">
   <table>
-    <thead><tr><th>Agent</th><th colspan="3">Last 24 hours</th><th colspan="3">Last 7 days</th></tr>
-    <tr class="sub"><th></th><th>sent</th><th>rejected</th><th>failed</th><th>sent</th><th>rejected</th><th>failed</th></tr></thead>
+    <thead><tr>
+      <th>Agent</th>
+      <th class="num">24h sent</th><th class="num">24h rejected</th><th class="num">24h failed</th>
+      <th class="num">7d sent</th><th class="num">7d rejected</th><th class="num">7d failed</th>
+    </tr></thead>
     <tbody>
     {{range $d.Rows}}
-      <tr>
+      <tr{{if not .Agent.Enabled}} class="muted"{{end}}>
         <td><a href="/agents/{{.Agent.ID}}">{{.Agent.Name}}</a>{{if not .Agent.Enabled}} <span class="tag">disabled</span>{{end}}</td>
-        <td>{{.Day.Sent}}</td><td>{{.Day.Rejected}}</td><td class="{{if .Day.Failed}}bad{{end}}">{{.Day.Failed}}</td>
-        <td>{{.Week.Sent}}</td><td>{{.Week.Rejected}}</td><td class="{{if .Week.Failed}}bad{{end}}">{{.Week.Failed}}</td>
+        <td class="num">{{.Day.Sent}}</td><td class="num">{{.Day.Rejected}}</td><td class="num{{if .Day.Failed}} bad{{end}}">{{.Day.Failed}}</td>
+        <td class="num">{{.Week.Sent}}</td><td class="num">{{.Week.Rejected}}</td><td class="num{{if .Week.Failed}} bad{{end}}">{{.Week.Failed}}</td>
       </tr>
     {{end}}
     </tbody>
   </table>
+  </div>
 </section>
 {{end}}
-
-<section class="card">
-  <h2>Upstream SMTP</h2>
-  <p><code>{{$d.Upstream}}</code> —
-  {{with $d.SMTP}}
-    {{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger">failed</span> {{.Err}}{{end}} (checked {{ts .At}})
-  {{else}}not checked yet{{end}}</p>
-  <form method="post" action="/settings/test-smtp">
-    <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/">
-    <button type="submit" class="secondary">Test connection</button>
-  </form>
-</section>
 {{end}}

@@ -1,0 +1,78 @@
+{{define "crumbs"}}<a href="/agents">Agents</a>{{end}}
+{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.ID}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
+{{define "content"}}
+{{$d := .Data}}{{$a := $d.Agent}}{{$base := printf "/agents/%s" $a.ID}}
+{{template "agent_header" .}}
+
+{{if not $d.SigningEnabled}}
+<section class="card">
+  <div class="empty">
+    <svg class="icon" aria-hidden="true"><use href="#icon-key"/></svg>
+    <strong>Signing is not configured</strong>
+    <p>Set <code>signing.key_encryption_key_file</code> in config.yaml to give every agent its own signing key.</p>
+  </div>
+</section>
+{{else}}
+{{with $d.Key}}
+{{if $d.KeyExpired}}<div class="banner danger"><svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg><div>This key expired on {{ts .ExpiresAt}}. Signed sends fail until you rotate it.</div></div>
+{{else if $d.KeyExpiring}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div>This key expires {{until .ExpiresAt}} ({{ts .ExpiresAt}}). Rotate it soon.</div></div>{{end}}
+<section class="card">
+  <div class="card-header">
+    <h2>Signing key</h2>
+    <div class="card-actions"><a class="button secondary sm" href="{{$base}}/keys/{{.Fingerprint}}/public.asc"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Public key</a></div>
+  </div>
+  <div class="card-body">
+    <p class="hint">Held by the gateway; the agent never sees it.</p>
+    <dl class="grid">
+      <dt>Fingerprint</dt><dd><code>{{.Fingerprint}}</code></dd>
+      <dt>User ID</dt><dd><code>{{$d.UserID}}</code></dd>
+      <dt>Created</dt><dd>{{ts .CreatedAt}}</dd>
+      <dt>Expires</dt><dd>{{ts .ExpiresAt}} <span class="muted">({{until .ExpiresAt}})</span></dd>
+      <dt>Revocation certificates</dt>
+      <dd><a href="{{$base}}/keys/{{.Fingerprint}}/revocation.asc">retired</a> · <a href="{{$base}}/keys/{{.Fingerprint}}/revocation-compromised.asc">compromised</a>
+        <details class="help">
+          <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Which one?</summary>
+          <p><strong>Retired</strong> after rotation or deletion: signatures already made stay valid. <strong>Compromised</strong> only if the key may have leaked, e.g. the database and KEK were exposed: it invalidates every signature the key made.</p>
+        </details>
+      </dd>
+    </dl>
+  </div>
+  <form method="post" action="{{$base}}/keys/rotate" class="card-footer" data-confirm="Generate a new signing key for {{$a.Name}}? The current key is retired and its private part discarded.">
+    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+    <span class="hint spacer">Rotating retires this key and generates a new one.</span>
+    <button type="submit"{{if not (or $d.KeyExpired $d.KeyExpiring)}} class="secondary"{{end}}>Rotate key</button>
+  </form>
+</section>
+{{else}}
+<section class="card">
+  <div class="empty">
+    <svg class="icon" aria-hidden="true"><use href="#icon-key"/></svg>
+    <strong>No signing key</strong>
+    <p>This agent's messages cannot be signed until it has one.</p>
+    <form method="post" action="{{$base}}/keys"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Generate key</button></form>
+  </div>
+</section>
+{{end}}
+
+{{if $d.RetiredKeys}}
+<section class="card">
+  <div class="card-header"><h2>Retired keys</h2></div>
+  <div class="card-body flush"><div class="table-wrap">
+  <table>
+    <thead><tr><th>Fingerprint</th><th>Created</th><th>Retired</th><th>Downloads</th></tr></thead>
+    <tbody>
+    {{range $d.RetiredKeys}}
+      <tr>
+        <td><code class="fpr" title="{{.Fingerprint}}">{{.Fingerprint}}</code></td>
+        <td class="nowrap">{{ts .CreatedAt}}</td>
+        <td class="nowrap">{{ts .RetiredAt}}</td>
+        <td><a href="{{$base}}/keys/{{.Fingerprint}}/public.asc">public key</a> · revocation certificate: <a href="{{$base}}/keys/{{.Fingerprint}}/revocation.asc">retired</a> or <a href="{{$base}}/keys/{{.Fingerprint}}/revocation-compromised.asc">compromised</a></td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div></div>
+</section>
+{{end}}
+{{end}}
+{{end}}

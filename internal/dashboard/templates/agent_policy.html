@@ -1,0 +1,119 @@
+{{define "crumbs"}}<a href="/agents">Agents</a>{{end}}
+{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.ID}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
+{{define "content"}}
+{{$d := .Data}}{{$a := $d.Agent}}{{$f := $d.Form}}{{$def := $d.Defaults}}
+{{template "agent_header" .}}
+
+{{if $d.Unknown}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div>This policy references aliases that are not in config.yaml and are ignored: {{join $d.Unknown ", "}}. Saving the policy removes them.</div></div>{{end}}
+
+<form method="post" action="/agents/{{$a.ID}}/policy" class="card">
+  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+  <div class="card-header">
+    <div><h2>Policy</h2><p>Settings left on Default follow config.yaml.</p></div>
+  </div>
+  <div class="card-body">
+
+    <div class="policy-row">
+      <div class="policy-name">Recipients<p class="hint">Aliases this agent may email.</p></div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_recipients" {{if $f.OvRecipients}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{if $def.Recipients}}{{join $def.Recipients ", "}}{{else}}none{{end}}</span>
+        <div class="policy-field"><div class="choices">
+          {{range $d.Aliases}}<label class="check"><input type="checkbox" name="recipients" value="{{.}}" {{if has $f.Recipients .}}checked{{end}}> {{.}}{{with (index $d.Recipients .).Description}} <span class="muted">{{.}}</span>{{end}}</label>{{end}}
+        </div></div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name">Services<p class="hint">Optional features the agent may request.</p></div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_services" {{if $f.OvServices}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{if $def.Services}}{{join $def.Services ", "}}{{else}}none{{end}}</span>
+        <div class="policy-field"><div class="choices">
+          {{range $d.AllServices}}<label class="check"><input type="checkbox" name="services" value="{{.}}" {{if has $f.Services .}}checked{{end}}> {{.}}</label>{{end}}
+        </div></div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name">Max message size<p class="hint">Whole message, attachments included.</p></div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_max_bytes" {{if $f.OvMaxBytes}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{bytesize $def.MaxMessageBytes}}</span>
+        <div class="policy-field"><input name="max_bytes" value="{{$f.MaxBytes}}" size="10" aria-label="Max message size" placeholder="e.g. 10MiB"></div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name">Max attachments</div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_max_att" {{if $f.OvMaxAtt}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{$def.MaxAttachments}}</span>
+        <div class="policy-field"><input name="max_att" value="{{$f.MaxAtt}}" size="4" inputmode="numeric" aria-label="Max attachments"></div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name">Attachment types<p class="hint">MIME types, comma-separated; empty allows any.</p></div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_types" {{if $f.OvTypes}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{if $def.AllowedAttachmentTypes}}{{join $def.AllowedAttachmentTypes ", "}}{{else}}any{{end}}</span>
+        <div class="policy-field"><input class="wide" name="types" value="{{$f.Types}}" aria-label="Allowed attachment types" placeholder="any, e.g. text/*, application/pdf"></div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name">Rate limit</div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_rate" {{if $f.OvRate}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{$def.RateLimit.PerHour}}/hour · {{$def.RateLimit.PerDay}}/day</span>
+        <div class="policy-field"><input name="per_hour" value="{{$f.PerHour}}" size="4" inputmode="numeric" aria-label="Per hour"> / hour · <input name="per_day" value="{{$f.PerDay}}" size="5" inputmode="numeric" aria-label="Per day"> / day</div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name">Subject prefix</div>
+      <div class="policy-ctl">
+        <label class="switch"><input type="checkbox" name="ov_prefix" {{if $f.OvPrefix}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
+        <span class="policy-default">Default: {{if $def.SubjectPrefix}}<code>{{$def.SubjectPrefix}}</code>{{else}}none{{end}}</span>
+        <div class="policy-field"><input class="wide" name="prefix" value="{{$f.Prefix}}" aria-label="Subject prefix"></div>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name"><label for="require_encryption">Require encryption</label><p class="hint">Refuse sends that are not PGP-encrypted.</p></div>
+      <div class="policy-ctl">
+        <select id="require_encryption" name="require_encryption">
+          <option value="inherit" {{if eq $f.ReqEnc "inherit"}}selected{{end}}>Default</option>
+          <option value="true" {{if eq $f.ReqEnc "true"}}selected{{end}}>yes</option>
+          <option value="false" {{if eq $f.ReqEnc "false"}}selected{{end}}>no</option>
+        </select>
+        <span class="policy-default">Default: {{if $def.RequireEncryption}}yes{{else}}no{{end}}</span>
+      </div>
+    </div>
+
+    <div class="policy-row">
+      <div class="policy-name"><label for="require_signing">Require signing</label><p class="hint">Refuse sends the gateway cannot sign.</p></div>
+      <div class="policy-ctl">
+        <select id="require_signing" name="require_signing">
+          <option value="inherit" {{if eq $f.ReqSign "inherit"}}selected{{end}}>Default</option>
+          <option value="true" {{if eq $f.ReqSign "true"}}selected{{end}}>yes</option>
+          <option value="false" {{if eq $f.ReqSign "false"}}selected{{end}}>no</option>
+        </select>
+        <span class="policy-default">Default: {{if $def.RequireSigning}}yes{{else}}no{{end}}</span>
+        <div class="policy-note">Signing and <code>e2e</code> encryption cannot be combined: to sign, the gateway must read the content.
+          <details class="help">
+            <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Encryption × signing</summary>
+            <p>With signing required, the gateway sees every message in plaintext, so use <code>encrypt: pgp</code> for sensitive content and <strong>TLS on every non-localhost path</strong> between agents and the gateway. Grant <code>e2e</code> only to agents whose content the gateway must never see, and set their <em>Require signing</em> to <em>no</em>; those messages are not signed.</p>
+          </details>
+        </div>
+      </div>
+    </div>
+
+  </div>
+  <div class="card-footer">
+    <a class="button ghost" href="/agents/{{$a.ID}}/policy">Cancel</a>
+    <button type="submit">Save policy</button>
+  </div>
+</form>
+{{end}}

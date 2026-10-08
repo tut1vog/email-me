@@ -1,0 +1,15 @@
+{{define "agent_header"}}{{$d := .Data}}{{$a := $d.Agent}}{{$base := printf "/agents/%s" $a.ID}}
+<div class="chips">
+  {{if $a.Enabled}}<span class="tag ok">enabled</span>{{else}}<span class="tag">disabled</span>{{end}}
+  <span class="tag {{if $d.ActiveTokens}}info{{else}}warn{{end}}">{{$d.ActiveTokens}} active token{{if ne $d.ActiveTokens 1}}s{{end}}</span>
+  {{template "key_state_tag" $d.KeyState}}
+</div>
+<nav class="tabs" aria-label="Agent sections">
+  <a href="{{$base}}" {{if eq .Nav "agent"}}aria-current="page"{{end}}>Overview</a>
+  <a href="{{$base}}/tokens" {{if eq .Nav "agent_tokens"}}aria-current="page"{{end}}>Tokens <span class="count">{{$d.ActiveTokens}}</span></a>
+  <a href="{{$base}}/policy" {{if eq .Nav "agent_policy"}}aria-current="page"{{end}}>Policy{{if $d.Unknown}} <span class="dot warn" title="References unknown aliases"></span><span class="visually-hidden">(needs attention)</span>{{end}}</a>
+  <a href="{{$base}}/signing" {{if eq .Nav "agent_signing"}}aria-current="page"{{end}}>Signing{{with $d.KeyState}}{{if eq . "expired"}} <span class="dot danger" title="Key expired"></span><span class="visually-hidden">(key expired)</span>{{else if eq . "expiring" "missing"}} <span class="dot warn" title="Key {{.}}"></span><span class="visually-hidden">(key {{.}})</span>{{end}}{{end}}</a>
+</nav>
+{{end}}
+
+{{define "key_state_tag"}}{{if eq . "ok"}}<span class="tag ok">signing key</span>{{else if eq . "expiring"}}<span class="tag warn">key expiring</span>{{else if eq . "expired"}}<span class="tag danger">key expired</span>{{else if eq . "missing"}}<span class="tag warn">no signing key</span>{{end}}{{end}}

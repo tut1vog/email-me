@@ -1,21 +1,30 @@
+{{define "crumbs"}}<a href="/agents">Agents</a>{{end}}
 {{define "content"}}
-<h1>New agent</h1>
-<form method="post" action="/agents" class="card form">
+<form method="post" action="/agents" class="card">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <label for="name">Name</label>
-  <input id="name" name="name" required pattern="[a-z0-9][a-z0-9_\-]{0,31}" maxlength="32" placeholder="bench-runner">
-  <p class="hint">Lowercase letters, digits, <code>-</code> and <code>_</code>. Shown in the From name, subject prefix and signing key, so it cannot be changed later.</p>
-
-  <label for="description">Description</label>
-  <input id="description" name="description" maxlength="200" placeholder="Nightly benchmark runner on build-02">
-
-  <fieldset>
-    <legend>Recipients this agent may email</legend>
-    {{range .Data.Aliases}}
-      <label class="check"><input type="checkbox" name="recipients" value="{{.}}"> <strong>{{.}}</strong> <span class="muted">{{(index $.Data.Recipients .).Description}}</span></label>
-    {{end}}
-    <p class="hint">Leave all unchecked to use the default ({{if .Data.Defaults.Recipients}}{{join .Data.Defaults.Recipients ", "}}{{else}}none — the agent could not send{{end}}). Everything else starts from the configured defaults; adjust it on the agent's page.</p>
-  </fieldset>
-  <button type="submit">Create agent</button>
+  <div class="card-body">
+    <div class="field">
+      <label for="name">Name</label>
+      <input id="name" name="name" required pattern="[a-z0-9][a-z0-9_\-]{0,31}" maxlength="32" placeholder="bench-runner" autocomplete="off">
+      <p class="hint">Lowercase letters, digits, <code>-</code> and <code>_</code>; cannot be changed later.</p>
+    </div>
+    <div class="field">
+      <label for="description">Description <span class="muted">(optional)</span></label>
+      <input id="description" name="description" maxlength="200" placeholder="Nightly benchmark runner on build-02">
+    </div>
+    <div class="field wide">
+      <span class="label">Recipients this agent may email</span>
+      <div class="choices stack">
+      {{range .Data.Aliases}}
+        <label class="check"><input type="checkbox" name="recipients" value="{{.}}"> <strong>{{.}}</strong>{{with (index $.Data.Recipients .).Description}} <span class="muted">{{.}}</span>{{end}}</label>
+      {{end}}
+      </div>
+      <p class="hint">None checked uses the default ({{if .Data.Defaults.Recipients}}{{join .Data.Defaults.Recipients ", "}}{{else}}none — the agent could not send{{end}}).</p>
+    </div>
+  </div>
+  <div class="card-footer">
+    <a class="button ghost" href="/agents">Cancel</a>
+    <button type="submit">Create agent</button>
+  </div>
 </form>
 {{end}}

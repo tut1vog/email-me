@@ -1,40 +1,71 @@
 {{define "content"}}
 {{$d := .Data}}
-<h1>Settings</h1>
-{{range $d.Warnings}}<div class="banner warn">{{.}}</div>{{end}}
+{{if $d.Warnings}}
+<ul class="attention">
+{{range $d.Warnings}}
+  <li class="attn warn">
+    <svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg>
+    <div class="attn-body"><strong>Configuration</strong> <span class="attn-text">{{.}}</span></div>
+  </li>
+{{end}}
+</ul>
+{{end}}
 
-<section class="card">
-  <h2>Upstream SMTP</h2>
-  {{with $d.SMTP}}<p>Last check {{ts .At}}: {{if .OK}}<span class="tag ok">ok</span>{{else}}<span class="tag danger">failed</span> {{.Err}}{{end}}</p>{{end}}
-  <form method="post" action="/settings/test-smtp" class="inline">
-    <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings">
-    <button type="submit" class="secondary">Test connection</button>
-  </form>
-  <form method="post" action="/settings/test-send" class="inline">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
-    <button type="submit" class="secondary">Send test</button>
-  </form>
+<section class="card" id="upstream">
+  <div class="card-header">
+    <div><h2>Upstream SMTP</h2><p><code>{{$d.Upstream}}</code></p></div>
+    <div class="card-actions">{{with $d.SMTP}}{{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger">failed</span>{{end}}{{else}}<span class="tag">not checked</span>{{end}}</div>
+  </div>
+  <div class="card-body">
+    <p class="small text-2">{{with $d.SMTP}}Last check {{ts .At}}{{if not .OK}}: {{.Err}}{{end}}.{{else}}Not checked since the dashboard started.{{end}}</p>
+    <form method="post" action="/settings/test-smtp" class="inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings">
+      <button type="submit" class="secondary">Test connection</button>
+    </form>
+    <form method="post" action="/settings/test-send" class="inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
+      <button type="submit" class="secondary">Send test</button>
+    </form>
+  </div>
 </section>
 
-<section class="card">
-  <h2>Agent onboarding</h2>
-  <p><a href="/settings/guide">Preview the agent guide</a> served at the API's <code>GET /</code>.</p>
+<div class="card-grid">
+<section class="card" id="onboarding">
+  <div class="card-header"><h2>Agent onboarding</h2></div>
+  <div class="card-body">
+    <p class="small text-2">Agents read their guide at the API's <code>GET /</code>.</p>
+    <a class="button secondary" href="/settings/guide">Preview the agent guide</a>
+  </div>
 </section>
 
-<section class="card">
-  <h2>Signing keys</h2>
+<section class="card" id="signing">
+  <div class="card-header"><h2>Signing keys</h2>{{if $d.SigningEnabled}}<span class="tag ok">enabled</span>{{else}}<span class="tag">off</span>{{end}}</div>
+  <div class="card-body">
   {{if $d.SigningEnabled}}
-    <p><a class="button secondary" href="/keys.asc">Download all agent public keys</a>{{if $d.MasterFpr}} (includes the master certification key <code>{{$d.MasterFpr}}</code>){{end}}</p>
-    <p class="hint">Import these into your mail client to verify signatures.{{if $d.MasterFpr}} In GnuPG you can instead trust the master key once; agent keys it certifies are then valid automatically. Thunderbird ignores certifications, so import agent keys there individually.{{end}}</p>
+    <p class="small text-2">Import agent public keys into your mail client to verify signatures.</p>
+    {{if $d.MasterFpr}}<dl class="grid"><dt>Master key</dt><dd><code>{{$d.MasterFpr}}</code></dd></dl>{{end}}
+    <a class="button secondary" href="/keys.asc"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Download all public keys</a>
+    {{if $d.MasterFpr}}
+    <details class="help">
+      <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>GnuPG and Thunderbird</summary>
+      <p>The bundle includes the master certification key. In GnuPG you can trust the master key once; agent keys it certifies are then valid automatically. Thunderbird ignores certifications, so import agent keys there individually.</p>
+    </details>
+    {{end}}
   {{else}}
     <p class="muted">Signing is not configured.</p>
   {{end}}
+  </div>
 </section>
+</div>
 
-<section class="card">
-  <h2>Effective configuration</h2>
-  <p class="hint">Secrets are read from files and never shown. Edit <code>config.yaml</code> and restart to change these.</p>
-  <pre class="config">{{$d.ConfigYAML}}</pre>
+<section class="card" id="config">
+  <div class="card-header"><div><h2>Effective configuration</h2><p>Read-only. Edit <code>config.yaml</code> and restart; secrets are read from files and never shown.</p></div></div>
+  <div class="card-body">
+    <details class="disclosure">
+      <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Show effective config</summary>
+      <pre class="config">{{$d.ConfigYAML}}</pre>
+    </details>
+  </div>
 </section>
 {{end}}

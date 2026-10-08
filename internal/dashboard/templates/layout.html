@@ -7,25 +7,42 @@
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/app.js" defer></script>
 </head>
-<body>
+<body class="{{if .LoggedIn}}app{{else}}auth{{end}}">
+<a class="skip-link" href="#main">Skip to content</a>
+{{template "icons" .}}
 {{if .LoggedIn}}
-<header class="top">
-  <a class="brand" href="/">email-me</a>
-  <nav>
-    <a href="/" {{if eq .Nav "overview"}}aria-current="page"{{end}}>Overview</a>
-    <a href="/agents" {{if or (eq .Nav "agents") (eq .Nav "agent") (eq .Nav "agent_new") (eq .Nav "token") (eq .Nav "agent_delete")}}aria-current="page"{{end}}>Agents</a>
-    <a href="/recipients" {{if eq .Nav "recipients"}}aria-current="page"{{end}}>Recipients</a>
-    <a href="/audit" {{if eq .Nav "audit"}}aria-current="page"{{end}}>Audit</a>
-    <a href="/settings" {{if or (eq .Nav "settings") (eq .Nav "guide")}}aria-current="page"{{end}}>Settings</a>
+<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show navigation" aria-controls="sidebar">
+<header class="topbar">
+  <label for="nav-toggle" class="nav-burger" aria-hidden="true" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-menu"/></svg></label>
+  <a class="brand" href="/"><svg class="icon" aria-hidden="true"><use href="#icon-mail"/></svg><span class="brand-name">email-me</span></a>
+</header>
+<aside class="sidebar" id="sidebar">
+  <a class="brand" href="/"><svg class="icon" aria-hidden="true"><use href="#icon-mail"/></svg><span class="brand-name">email-me</span></a>
+  <nav class="nav" aria-label="Main">
+    <a class="nav-item" href="/" title="Overview" {{if eq .Section "overview"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-gauge"/></svg><span>Overview</span></a>
+    <a class="nav-item" href="/agents" title="Agents" {{if eq .Section "agents"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-bot"/></svg><span>Agents</span></a>
+    <a class="nav-item" href="/recipients" title="Recipients" {{if eq .Section "recipients"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-at-sign"/></svg><span>Recipients</span></a>
+    <a class="nav-item" href="/audit" title="Audit log" {{if eq .Section "audit"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-list"/></svg><span>Audit log</span></a>
+    <a class="nav-item" href="/settings" title="Settings" {{if eq .Section "settings"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-sliders"/></svg><span>Settings</span></a>
   </nav>
   <form method="post" action="/logout" class="logout">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <button type="submit" class="link">Log out</button>
+    <button class="nav-item" type="submit" title="Log out"><svg class="icon" aria-hidden="true"><use href="#icon-log-out"/></svg><span>Log out</span></button>
   </form>
+</aside>
+<label for="nav-toggle" class="nav-scrim" aria-hidden="true"></label>
+{{end}}
+<main id="main" class="content">
+{{if .LoggedIn}}
+<header class="page-header">
+  <div class="page-heading">
+    <nav class="breadcrumb" aria-label="Breadcrumb">{{block "crumbs" .}}{{end}}</nav>
+    <h1 class="page-title">{{.Title}}</h1>
+  </div>
+  <div class="page-actions">{{block "actions" .}}{{end}}</div>
 </header>
 {{end}}
-<main>
-{{range .Flash}}<div class="flash {{.Kind}}" role="status">{{.Message}}</div>{{end}}
+{{range .Flash}}<div class="flash {{.Kind}}" role="status">{{if eq .Kind "ok"}}<svg class="icon" aria-hidden="true"><use href="#icon-check-circle"/></svg>{{else}}<svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg>{{end}}<div class="flash-text">{{.Message}}</div><button type="button" class="flash-close ghost icon-only sm" data-dismiss><svg class="icon" aria-hidden="true"><use href="#icon-x"/></svg><span class="visually-hidden">Dismiss</span></button></div>{{end}}
 {{template "content" .}}
 </main>
 </body>

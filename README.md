@@ -74,7 +74,7 @@ The defaults keep everything on localhost. To accept agents from other machines,
 - **Gateway-side encryption (`pgp`)**: add `pgp_public_key_file` to a recipient in `config.yaml`. The agent sets `options.encrypt: "pgp"`.
 - **End-to-end (`e2e`)**: the agent fetches the recipient's key from `/v1/recipients/{alias}/pgp-key`, encrypts a MIME entity itself, and sends the ciphertext. The gateway never sees plaintext, so it cannot sign; an agent needs `require_signing: false` in its policy to use `e2e`.
 - **Revocation**: every agent key comes with two revocation certificates. Publish the *retired* one after rotating or deleting an agent; signatures the key already made stay valid. Publish the *compromised* one only if the key may have leaked (for example, the database and the KEK were both exposed); it invalidates every signature the key made.
-- **Signatures**: each agent's key has the user ID `<agent> via email-me <your from address>`. Download public keys from the agent page, or all of them from Settings, and import them into your mail client. A signature proves the message was submitted through your gateway with that agent's token and was not modified afterwards.
+- **Signatures**: each agent's key has the user ID `<agent> via email-me <your from address>`. Download public keys from the agent's Signing tab, or all of them from Settings, and import them into your mail client. A signature proves the message was submitted through your gateway with that agent's token and was not modified afterwards.
 
 ## Operations
 
