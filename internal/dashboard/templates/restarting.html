@@ -1,0 +1,12 @@
+{{define "head"}}<meta http-equiv="refresh" content="8;url=/login?next=/settings">{{end}}
+{{define "content"}}
+<section class="login-card" data-restart-poll="/up" data-boot="{{.Data.Boot}}" data-next="/login?next=/settings">
+  <div class="brand"><svg class="icon" aria-hidden="true"><use href="#icon-mail"/></svg><span class="brand-name">email-me</span></div>
+  <p class="muted">Restarting</p>
+  <div class="banner info" role="status"><svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg><div>
+    <p><strong>email-me is restarting to apply the saved settings.</strong> Sends already in flight finish first, so this can take a little while.</p>
+    <p>Sessions do not survive a restart: you will need to log in again. This page moves on to the login page once email-me is back.</p>
+  </div></div>
+  <a class="button" href="/login?next=/settings">Log in again</a>
+</section>
+{{end}}

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,37 @@ type dash struct {
 	keys     *keys.Manager
 	ts       *httptest.Server
 	c        *http.Client
+	restart  *fakeRestart
+}
+
+// fakeRestart stands in for the process restart: it counts requests and
+// fails them with err (config.yaml not loading) when set.
+type fakeRestart struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (f *fakeRestart) request() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.calls++
+	return nil
+}
+
+func (f *fakeRestart) fail(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *fakeRestart) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 func newDash(t *testing.T, o testutil.Options) *dash {
@@ -59,7 +91,9 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 		ko.KEK, ko.Validity = cfg.Signing.KEK, cfg.Signing.KeyValidity.D()
 	}
 	km := keys.NewManager(st, ko)
-	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger()})
+	rs := &fakeRestart{}
+	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km,
+		Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger(), Restart: rs.request})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +101,7 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c}
+	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c, restart: rs}
 }
 
 type page struct {

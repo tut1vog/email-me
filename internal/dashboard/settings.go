@@ -3,6 +3,7 @@ package dashboard
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/tut1vog/email-me/internal/api/docs"
+	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/compose"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/pgp"
@@ -440,6 +442,39 @@ func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
 		s.flash(r, "ok", "Test message sent to %s.", alias)
 	}
 	s.redirect(w, r, "/settings#upstream")
+}
+
+// up serves the boot id of this start, unauthenticated: the restarting
+// page polls it to see the next start come up. It reveals nothing else.
+func (s *Server) up(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	io.WriteString(w, s.bootID)
+}
+
+// restart asks the process to restart, which applies the saved settings.
+// Sessions live in memory and do not survive it, so this one ends now and
+// the restarting page sends the operator to the login page once the next
+// start is up.
+func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
+	if s.Restart == nil {
+		s.flash(r, "error", "Restarting from the dashboard is not available.")
+		s.redirect(w, r, "/settings#restart")
+		return
+	}
+	if err := s.Restart(); err != nil {
+		msg := err.Error()
+		if ve := (*config.ValidationError)(nil); errors.As(err, &ve) {
+			msg = strings.Join(ve.Problems, "; ")
+		}
+		s.Log.Warn("restart refused: config.yaml does not load", "err", err)
+		s.flash(r, "error", "Not restarted: config.yaml no longer loads: %s.", msg)
+		s.redirect(w, r, "/settings#restart")
+		return
+	}
+	s.Log.Info("restart requested from the dashboard", "ip", clientIP(r), "pending", s.Settings.Pending())
+	s.endSession(w, r)
+	r = r.WithContext(context.WithValue(r.Context(), sessionKey, (*auth.Session)(nil)))
+	s.render(w, r, "restarting", "Restarting", map[string]any{"Boot": s.bootID})
 }
 
 func (s *Server) guidePreview(w http.ResponseWriter, r *http.Request) {

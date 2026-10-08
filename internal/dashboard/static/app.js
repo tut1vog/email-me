@@ -1,6 +1,7 @@
 // Conveniences only: copy buttons, confirmations, the policy editor's
-// Custom switches, audit filters that apply on change, dismissable flashes
-// and the mobile navigation drawer. Every form and link still works without
+// Custom switches, audit filters that apply on change, dismissable flashes,
+// the mobile navigation drawer and the restarting page's wait for the next
+// start. Every form and link still works without
 // JavaScript; CSS alone reveals policy fields (:has) and opens the drawer
 // (the #nav-toggle checkbox). Served from /static/ under script-src 'self':
 // no inline scripts or handlers anywhere, so everything is delegated here.
@@ -100,6 +101,25 @@ document.addEventListener("click", (ev) => {
   if (ev.target.closest(".sidebar a")) closeNav();
 });
 
+// Restarting page: poll the boot id every second and move on (to the
+// login page) once it changes. Errors are expected while the listeners are
+// down. Without JavaScript a meta refresh does the same, later.
+function pollRestart(el) {
+  const { restartPoll, boot, next } = el.dataset;
+  const again = () => setTimeout(check, 1000);
+  function check() {
+    fetch(restartPoll, { cache: "no-store" })
+      .then((res) => (res.ok ? res.text() : boot))
+      .then((id) => {
+        if (id.trim() !== boot) location.replace(next);
+        else again();
+      })
+      .catch(again);
+  }
+  again();
+}
+
 // Initial pass (the script is deferred, so the DOM is parsed).
 document.querySelectorAll(".policy-row").forEach((row) => syncPolicyRow(row, false));
 syncBurger();
+document.querySelectorAll("[data-restart-poll]").forEach(pollRestart);

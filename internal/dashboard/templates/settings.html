@@ -239,4 +239,16 @@
     </dl>
   </div>
 </section>
+
+<section class="card" id="restart">
+  <div class="card-header"><div><h2>Restart</h2><p>Applies the saved settings and re-reads config.yaml, without leaving the container.</p></div>{{with $d.Pending}}<span class="tag warn">{{len .}} pending</span>{{end}}</div>
+  <div class="card-body">
+    {{with $d.Pending}}<p class="small">Saved but not running yet: {{range $i, $k := .}}{{if $i}}, {{end}}<code>{{$k}}</code>{{end}}.</p>{{else}}<p class="small muted">The running settings match the saved ones.</p>{{end}}
+    <p class="small text-2">Sends already in flight finish first; the API and the dashboard are down for a moment. Everyone is logged out of the dashboard, and the idempotency cache and the last SMTP test result are forgotten. If config.yaml no longer loads, nothing restarts. Sending <code>SIGHUP</code> to the process (<code>docker kill -s HUP</code>) does the same.</p>
+  </div>
+  <form method="post" action="/settings/restart" class="card-footer" data-confirm="Restart email-me now? Sends in flight finish first, and you will need to log in again.">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit"{{if not $d.Pending}} class="secondary"{{end}}>Restart now</button>
+  </form>
+</section>
 {{end}}

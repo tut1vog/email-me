@@ -2,7 +2,9 @@ package dashboard_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -297,5 +299,64 @@ func TestSettingsPasswordNotices(t *testing.T) {
 	}
 	if b := lost.get("/settings").body; !strings.Contains(b, "<strong>cannot be decrypted</strong>") {
 		t.Error("the upstream card must say the password cannot be decrypted")
+	}
+}
+
+func TestRestartFromDashboard(t *testing.T) {
+	d := newDash(t, testutil.Options{})
+	up := d.get("/up")
+	boot := up.body
+	if up.status != 200 || !strings.HasPrefix(up.header.Get("Content-Type"), "text/plain") || len(boot) < 16 || strings.ContainsAny(boot, "<\n") {
+		t.Fatalf("GET /up without login: %d %q", up.status, boot)
+	}
+	if d.get("/up").body != boot {
+		t.Fatal("the boot id is fixed for a start")
+	}
+	if p := d.post("/settings/restart", url.Values{}); p.status == http.StatusOK || d.restart.count() != 0 {
+		t.Fatal("restarting needs a session")
+	}
+	d.login()
+	d.saved(d.post("/settings/audit", d.form("retention_days", "60")), "audit")
+	banner := d.get("/agents").body
+	if !strings.Contains(banner, `action="/settings/restart"`) || !strings.Contains(banner, "data-confirm=") {
+		t.Fatal("the restart banner offers Restart now, with a confirmation")
+	}
+	if s := d.get("/settings").body; !strings.Contains(s, `id="restart"`) || !strings.Contains(s, "<code>audit.retention_days</code>") {
+		t.Fatal("the restart card lists the pending keys")
+	}
+
+	// config.yaml no longer loads: nothing restarts and the session stays.
+	d.restart.fail(errors.New("parsing config: yaml: line 3: did not find expected key"))
+	p := d.post("/settings/restart", d.form())
+	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/settings#restart" || d.restart.count() != 0 {
+		t.Fatalf("refused restart: %d %s", p.status, p.header.Get("Location"))
+	}
+	if s := d.get("/settings"); s.status != 200 || !strings.Contains(s.body, "Not restarted: config.yaml no longer loads: parsing config") {
+		t.Fatal("a refused restart is reported and keeps the session")
+	}
+
+	d.restart.fail(nil)
+	csrf := d.csrf()
+	p = d.post("/settings/restart", url.Values{"csrf": {csrf}})
+	if p.status != 200 || d.restart.count() != 1 {
+		t.Fatalf("restart: %d, %d calls", p.status, d.restart.count())
+	}
+	for _, want := range []string{`data-restart-poll="/up"`, `data-boot="` + boot + `"`, `data-next="/login?next=/settings"`,
+		`<meta http-equiv="refresh" content="8;url=/login?next=/settings">`, `href="/login?next=/settings"`, "log in again", "in flight finish first", `class="auth"`} {
+		if !strings.Contains(p.body, want) {
+			t.Errorf("restarting page lacks %q", want)
+		}
+	}
+	if strings.Contains(p.body, csrf) || strings.Contains(p.body, `action="/logout"`) {
+		t.Error("the restarting page is rendered logged out")
+	}
+	if c := p.header.Get("Set-Cookie"); !strings.Contains(c, "email_me_session=;") || !strings.Contains(c, "Max-Age=0") {
+		t.Errorf("the session cookie must be cleared: %q", c)
+	}
+	if strings.Contains(p.body, "<script>") || inlineStyle.MatchString(p.body) || inlineHandler.MatchString(p.body) {
+		t.Error("restarting page must be CSP-safe")
+	}
+	if g := d.get("/settings"); g.status != http.StatusSeeOther {
+		t.Fatal("the session must end with the restart")
 	}
 }

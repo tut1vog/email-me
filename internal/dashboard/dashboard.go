@@ -19,6 +19,7 @@ import (
 
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/ids"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
@@ -46,6 +47,9 @@ type Deps struct {
 	Keys       *keys.Manager
 	Sender     upstream.Sender
 	Log        *slog.Logger
+	// Restart asks the process to restart and apply the saved settings. It
+	// returns an error, and nothing restarts, if config.yaml no longer loads.
+	Restart func() error
 }
 
 type Server struct {
@@ -54,6 +58,9 @@ type Server struct {
 	throttle *auth.LoginThrottle
 	pages    map[string]*template.Template
 	now      func() time.Time
+	// bootID identifies this start, so the restarting page can tell when
+	// the next one is up (GET /up).
+	bootID string
 
 	smtpMu    sync.Mutex
 	smtpCheck *smtpStatus
@@ -79,6 +86,7 @@ func New(d Deps) (*Server, error) {
 		argonSlots: make(chan struct{}, 2),
 		pages:      map[string]*template.Template{},
 		now:        time.Now,
+		bootID:     ids.Random(16),
 	}
 	all, err := fs.Glob(templateFS, "templates/*.html")
 	if err != nil {
@@ -116,6 +124,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(static)))
 	mux.HandleFunc("GET /login", s.loginPage)
 	mux.HandleFunc("POST /login", s.login)
+	mux.HandleFunc("GET /up", s.up)
 
 	authed := func(pattern string, h http.HandlerFunc) { mux.Handle(pattern, s.requireSession(h)) }
 	authed("POST /logout", s.logout)
@@ -156,6 +165,7 @@ func (s *Server) Handler() http.Handler {
 	authed("POST /settings/signing", s.saveSigning)
 	authed("POST /settings/test-smtp", s.testSMTP)
 	authed("POST /settings/test-smtp-saved", s.testSMTPSaved)
+	authed("POST /settings/restart", s.restart)
 	authed("POST /settings/test-send", s.testSend)
 	authed("GET /settings/guide", s.guidePreview)
 	authed("GET /keys.asc", s.keyBundle)
@@ -311,9 +321,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	s.endSession(w, r)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// endSession deletes the request's session and clears its cookie.
+func (s *Server) endSession(w http.ResponseWriter, r *http.Request) {
 	s.sessions.Delete(sessionFrom(r).ID)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 // verifyPassword runs argon2id (64 MiB per check) under a small semaphore so

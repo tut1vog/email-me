@@ -2,6 +2,9 @@
 //
 //	email-me serve [--config /config/config.yaml]   (default command)
 //	email-me healthcheck [--config ...]             (for Docker HEALTHCHECK)
+//
+// serve restarts in place on SIGHUP or from the dashboard, to apply saved
+// settings and edits to config.yaml.
 package main
 
 import (
@@ -67,15 +70,54 @@ func newLogger(c config.Log) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stderr, opts))
 }
 
+// errRestart ends a run that should be followed by the next one.
+var errRestart = errors.New("restart requested")
+
+// runHooks lets tests observe and drive the serve loop.
+type runHooks struct {
+	// started is called with the bound addresses once both listeners are up.
+	started func(apiAddr, dashAddr string)
+	// hup delivers SIGHUP. serve subscribes once, for the process lifetime,
+	// so a SIGHUP between two runs is not fatal.
+	hup <-chan os.Signal
+	// grace is how long a dashboard-requested restart waits before it stops
+	// the listeners, so the restarting page's assets still load.
+	grace time.Duration
+}
+
+// serve runs the gateway until SIGINT or SIGTERM. A restart (the
+// dashboard's Restart button or SIGHUP) ends one run and starts the next in
+// the same process, reloading config.yaml and the saved settings; if the
+// next run cannot start, serve returns its error.
 func serve(cfgPath string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	return loop(ctx, cfgPath, runHooks{hup: hup, grace: time.Second})
+}
+
+func loop(ctx context.Context, cfgPath string, hooks runHooks) error {
+	for {
+		if err := run(ctx, cfgPath, hooks); !errors.Is(err, errRestart) {
+			return err
+		}
+	}
+}
+
+// run is one start of the gateway. It returns nil when ctx ends,
+// errRestart when a restart was requested, or the error that stopped it.
+func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
 	}
 	log := newLogger(cfg.Log)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// runCtx ends with this run: it stops the retention job.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	st, err := store.Open(filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
 		return fmt.Errorf("opening state database in %s: %w", cfg.DataDir, err)
@@ -83,7 +125,7 @@ func serve(cfgPath string) error {
 	defer st.Close()
 
 	// Settings first: they complete cfg (upstream, default policy, ...).
-	sm, _, err := settings.Bootstrap(ctx, st, cfg, log)
+	sm, _, err := settings.Bootstrap(runCtx, st, cfg, log)
 	if err != nil {
 		return err
 	}
@@ -91,7 +133,7 @@ func serve(cfgPath string) error {
 		log.Warn(w)
 	}
 
-	reg, seeded, err := recipients.Bootstrap(ctx, st, cfg)
+	reg, seeded, err := recipients.Bootstrap(runCtx, st, cfg)
 	if err != nil {
 		return err
 	}
@@ -107,7 +149,7 @@ func serve(cfgPath string) error {
 
 	km := keys.NewManager(st, keysOptions(cfg))
 	if km.Enabled() {
-		n, err := km.EnsureAll(ctx)
+		n, err := km.EnsureAll(runCtx)
 		switch {
 		case errors.Is(err, keys.ErrNoFrom):
 			log.Warn("some agents have no signing key; they get one once upstream.from is set on the Settings page and the gateway restarted")
@@ -119,21 +161,33 @@ func serve(cfgPath string) error {
 		}
 	}
 
+	// A restart is refused while config.yaml does not load, so a typo in
+	// the file cannot take the gateway down.
+	restart := make(chan struct{}, 1)
+	requestRestart := func() error {
+		if _, err := config.Load(cfgPath); err != nil {
+			return err
+		}
+		select {
+		case restart <- struct{}{}:
+		default: // one is already on its way
+		}
+		return nil
+	}
+
 	sender := upstream.NewSMTP(cfg.Upstream.SMTP)
 	auditW := audit.NewWriter(st, cfg.Audit.LogSubject, log)
 	apiSrv := api.New(api.Deps{
 		Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: sender,
 		Limiter: ratelimit.New(st), Audit: auditW, Log: log.With("component", "api"),
 	})
-	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: sender, Log: log.With("component", "dashboard")})
+	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: sender,
+		Log: log.With("component", "dashboard"), Restart: requestRestart})
 	if err != nil {
 		return err
 	}
 
-	go audit.RunRetention(ctx, st, time.Duration(cfg.Audit.RetentionDays)*24*time.Hour, log)
-
 	apiHTTP := &http.Server{
-		Addr:              cfg.API.Listen,
 		Handler:           apiSrv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       2 * time.Minute,
@@ -146,7 +200,6 @@ func serve(cfgPath string) error {
 		apiHTTP.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*cfg.API.Certificate}, MinVersion: tls.VersionTLS12}
 	}
 	dashHTTP := &http.Server{
-		Addr:              cfg.Dashboard.Listen,
 		Handler:           dash.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -156,40 +209,87 @@ func serve(cfgPath string) error {
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 
+	// Bind both before serving, so a port that cannot be (re)bound fails
+	// the run at once.
+	apiLn, err := net.Listen("tcp", cfg.API.Listen)
+	if err != nil {
+		return fmt.Errorf("API server: %w", err)
+	}
+	dashLn, err := net.Listen("tcp", cfg.Dashboard.Listen)
+	if err != nil {
+		apiLn.Close()
+		return fmt.Errorf("dashboard server: %w", err)
+	}
+
+	retention := make(chan struct{})
+	go func() {
+		defer close(retention)
+		audit.RunRetention(runCtx, st, time.Duration(cfg.Audit.RetentionDays)*24*time.Hour, log)
+	}()
+
 	errc := make(chan error, 2)
 	go func() {
-		log.Info("API listening", "addr", cfg.API.Listen, "tls", apiHTTP.TLSConfig != nil, "docs", cfg.API.Docs)
+		log.Info("API listening", "addr", apiLn.Addr().String(), "tls", apiHTTP.TLSConfig != nil, "docs", cfg.API.Docs)
 		var err error
 		if apiHTTP.TLSConfig != nil {
-			err = apiHTTP.ListenAndServeTLS("", "")
+			err = apiHTTP.ServeTLS(apiLn, "", "")
 		} else {
-			err = apiHTTP.ListenAndServe()
+			err = apiHTTP.Serve(apiLn)
 		}
 		errc <- fmt.Errorf("API server: %w", err)
 	}()
 	go func() {
-		log.Info("dashboard listening", "addr", cfg.Dashboard.Listen)
-		errc <- fmt.Errorf("dashboard server: %w", dashHTTP.ListenAndServe())
+		log.Info("dashboard listening", "addr", dashLn.Addr().String())
+		errc <- fmt.Errorf("dashboard server: %w", dashHTTP.Serve(dashLn))
 	}()
 	upstreamAddr := "not configured"
 	if cfg.Upstream.SMTP.Host != "" {
 		upstreamAddr = cfg.Upstream.SMTP.Addr()
 	}
 	log.Info("email-me started", "signing", km.Enabled(), "recipients", reg.Len(), "upstream", upstreamAddr)
+	if hooks.started != nil {
+		hooks.started(apiLn.Addr().String(), dashLn.Addr().String())
+	}
 
-	select {
-	case <-ctx.Done():
-		log.Info("shutting down")
-	case err := <-errc:
-		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+	var result error
+wait:
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("shutting down")
+			break wait
+		case <-restart:
+			log.Info("restarting to apply saved settings", "pending", sm.Pending())
+			// Let the restarting page load its stylesheet and script first.
+			time.Sleep(hooks.grace)
+			result = errRestart
+			break wait
+		case <-hooks.hup:
+			if _, err := config.Load(cfgPath); err != nil {
+				log.Error("SIGHUP: not restarting: config.yaml no longer loads", "err", err)
+				continue
+			}
+			log.Info("SIGHUP: restarting", "pending", sm.Pending())
+			result = errRestart
+			break wait
+		case err := <-errc: // a listener failed: stop the other and exit
+			result = err
+			break wait
 		}
 	}
+	// API first, so in-flight sends finish; then the dashboard, then the
+	// retention job; the store closes last (deferred).
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Upstream.SMTP.Timeout.D()+10*time.Second)
 	defer cancel()
-	apiHTTP.Shutdown(shutdownCtx) // lets in-flight sends finish
-	dashHTTP.Shutdown(shutdownCtx)
-	return nil
+	if err := apiHTTP.Shutdown(shutdownCtx); err != nil {
+		apiHTTP.Close()
+	}
+	if err := dashHTTP.Shutdown(shutdownCtx); err != nil {
+		dashHTTP.Close()
+	}
+	cancelRun()
+	<-retention
+	return result
 }
 
 func keysOptions(cfg *config.Config) keys.Options {
