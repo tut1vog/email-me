@@ -28,6 +28,7 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/ratelimit"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
@@ -71,15 +72,7 @@ func serve(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	problems, warnings := cfg.ValidateSeed()
-	if len(problems) > 0 {
-		return &config.ValidationError{Problems: problems}
-	}
-	cfg.Warnings = append(cfg.Warnings, warnings...)
 	log := newLogger(cfg.Log)
-	for _, w := range cfg.Warnings {
-		log.Warn(w)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -88,6 +81,14 @@ func serve(cfgPath string) error {
 		return fmt.Errorf("opening state database in %s: %w", cfg.DataDir, err)
 	}
 	defer st.Close()
+
+	// Settings first: they complete cfg (upstream, default policy, ...).
+	if _, _, err := settings.Bootstrap(ctx, st, cfg, log); err != nil {
+		return err
+	}
+	for _, w := range cfg.Warnings {
+		log.Warn(w)
+	}
 
 	reg, seeded, err := recipients.Bootstrap(ctx, st, cfg)
 	if err != nil {
@@ -166,7 +167,11 @@ func serve(cfgPath string) error {
 		log.Info("dashboard listening", "addr", cfg.Dashboard.Listen)
 		errc <- fmt.Errorf("dashboard server: %w", dashHTTP.ListenAndServe())
 	}()
-	log.Info("email-me started", "signing", km.Enabled(), "recipients", reg.Len(), "upstream", cfg.Upstream.SMTP.Addr())
+	upstreamAddr := "not configured"
+	if cfg.Upstream.SMTP.Host != "" {
+		upstreamAddr = cfg.Upstream.SMTP.Addr()
+	}
+	log.Info("email-me started", "signing", km.Enabled(), "recipients", reg.Len(), "upstream", upstreamAddr)
 
 	select {
 	case <-ctx.Done():

@@ -97,8 +97,11 @@ func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, log *sl
 		if row, err = st.GetSettings(ctx); err != nil {
 			return nil, false, fmt.Errorf("loading settings: %w", err)
 		}
-		if seeded {
+		switch {
+		case seeded && fileManaged:
 			log.Info("imported settings from config.yaml into the state database; manage them on the dashboard's Settings page from now on")
+		case seeded:
+			log.Info("stored default settings in the state database; manage them on the dashboard's Settings page")
 		}
 	case err != nil:
 		return nil, false, fmt.Errorf("loading settings: %w", err)
