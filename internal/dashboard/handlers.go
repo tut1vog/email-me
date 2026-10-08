@@ -21,6 +21,7 @@ import (
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/units"
 )
@@ -123,7 +124,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	addCounts(&tot.Week, week)
 	var rows []agentStats
 	for _, a := range agents {
-		row := agentStats{Agent: a, Signing: s.Config.Effective(a.Policy).RequireSigning}
+		row := agentStats{Agent: a, Signing: s.Recipients.Effective(a.Policy).RequireSigning}
 		if c := day[a.ID]; c != nil {
 			row.Day = *c
 		}
@@ -146,13 +147,14 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		slices.SortStableFunc(notices, func(a, b notice) int { return noticeRank[a.Kind] - noticeRank[b.Kind] })
 	}
 	s.render(w, r, "overview", "Overview", map[string]any{
-		"FirstRun": len(agents) == 0,
-		"Rows":     rows,
-		"Totals":   tot,
-		"Notices":  notices,
-		"Insecure": insecure,
-		"SMTP":     smtp,
-		"Upstream": s.Config.Upstream.SMTP.Addr(),
+		"FirstRun":     len(agents) == 0,
+		"NoRecipients": s.Recipients.Len() == 0,
+		"Rows":         rows,
+		"Totals":       tot,
+		"Notices":      notices,
+		"Insecure":     insecure,
+		"SMTP":         smtp,
+		"Upstream":     s.Config.Upstream.SMTP.Addr(),
 	})
 }
 
@@ -173,31 +175,40 @@ func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, 
 			Link: "/settings#signing"})
 	}
 	now := s.now()
-	for _, alias := range s.Config.Aliases() {
-		rc := s.Config.Recipients[alias]
-		if rc.PublicKey == nil {
+	if s.Recipients.Len() == 0 {
+		out = append(out, notice{Kind: "danger", Title: "No recipients",
+			Text: "Agents have nobody to email. Add a recipient, such as your own address.", Link: "/recipients/new"})
+	}
+	if u := s.Recipients.UnknownAliases(s.Config.Defaults.Policy); len(u) > 0 {
+		out = append(out, notice{Kind: "warn", Title: "Default policy",
+			Text: "defaults.policy.recipients in config.yaml names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
+			Link: "/recipients"})
+	}
+	for _, rc := range s.Recipients.All() {
+		if rc.Key == nil {
 			continue
 		}
-		exp := pgp.KeyExpiry(rc.PublicKey)
-		title := "Recipient " + alias
+		exp := rc.KeyExpiry()
+		title := "Recipient " + rc.Alias
+		link := "/recipients/" + rc.Alias
 		switch {
 		case !rc.KeyUsable(now):
 			msg := "PGP key expired or revoked: encrypted sends fail"
 			if rc.RequireEncryption {
 				msg += ", and it requires encryption, so nothing is delivered"
 			}
-			out = append(out, notice{Kind: "danger", Title: title, Text: msg + ". Update pgp_public_key_file and restart.", Link: "/recipients"})
+			out = append(out, notice{Kind: "danger", Title: title, Text: msg + ". Replace or remove the key.", Link: link})
 		case !exp.IsZero() && exp.Sub(now) < expiryWarning:
-			out = append(out, notice{Kind: "warn", Title: title, Text: "PGP key expires on " + exp.Format("2006-01-02") + ".", Link: "/recipients"})
+			out = append(out, notice{Kind: "warn", Title: title, Text: "PGP key expires on " + exp.Format("2006-01-02") + ".", Link: link})
 		}
 	}
 	byID := map[string]*store.Agent{}
 	for _, a := range agents {
 		byID[a.ID] = a
 		title := "Agent " + a.Name
-		if u := s.Config.UnknownAliases(a.Policy); len(u) > 0 {
+		if u := s.Recipients.UnknownAliases(a.Policy); len(u) > 0 {
 			out = append(out, notice{Kind: "warn", Title: title,
-				Text: "Policy names aliases missing from config.yaml (ignored): " + strings.Join(u, ", ") + ".",
+				Text: "Policy names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
 				Link: "/agents/" + a.ID + "/policy"})
 		}
 		if !s.Keys.Enabled() {
@@ -228,7 +239,7 @@ func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, 
 		ia := insecureAgent{ID: id, Name: id}
 		if a := byID[id]; a != nil {
 			ia.Name = a.Name
-			ia.RequireSigning = s.Config.Effective(a.Policy).RequireSigning
+			ia.RequireSigning = s.Recipients.Effective(a.Policy).RequireSigning
 		}
 		insecure = append(insecure, ia)
 	}
@@ -258,7 +269,7 @@ func (s *Server) agents(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, "listing tokens", err)
 			return
 		}
-		row := agentRow{Agent: a, Effective: s.Config.Effective(a.Policy), ActiveTokens: n}
+		row := agentRow{Agent: a, Effective: s.Recipients.Effective(a.Policy), ActiveTokens: n}
 		if k, err := s.Store.ActiveKey(ctx, a.ID); err == nil {
 			row.KeyFpr = k.Fingerprint
 		}
@@ -269,8 +280,7 @@ func (s *Server) agents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) newAgentPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "agent_new", "New agent", map[string]any{
-		"Aliases":    s.Config.Aliases(),
-		"Recipients": s.Config.Recipients,
+		"Recipients": s.Recipients.All(),
 		"Defaults":   s.Config.DefaultPolicy,
 	})
 }
@@ -286,7 +296,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	var p policy.Policy
 	if rcpts := r.PostForm["recipients"]; len(rcpts) > 0 {
 		for _, a := range rcpts {
-			if _, ok := s.Config.Recipients[a]; !ok {
+			if _, ok := s.Recipients.Get(a); !ok {
 				s.flash(r, "error", "Unknown recipient alias %q.", a)
 				s.redirect(w, r, "/agents/new")
 				return
@@ -433,7 +443,7 @@ func (s *Server) loadShell(w http.ResponseWriter, r *http.Request) *agentShell {
 	}
 	sh.Data = map[string]any{
 		"Agent":          a,
-		"Unknown":        s.Config.UnknownAliases(a.Policy),
+		"Unknown":        s.Recipients.UnknownAliases(a.Policy),
 		"SigningEnabled": s.Keys.Enabled(),
 		"ActiveTokens":   active,
 		"Key":            sh.Key,
@@ -468,7 +478,7 @@ func (s *Server) agentOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sh.Data["Day"], sh.Data["Week"] = counts[0], counts[1]
-	sh.Data["Effective"] = s.Config.Effective(sh.Agent.Policy)
+	sh.Data["Effective"] = s.Recipients.Effective(sh.Agent.Policy)
 	sh.Data["LastUsed"] = last
 	s.render(w, r, "agent", sh.Agent.Name, sh.Data)
 }
@@ -496,12 +506,11 @@ func (s *Server) agentPolicy(w http.ResponseWriter, r *http.Request) {
 	if sh == nil {
 		return
 	}
-	eff := s.Config.Effective(sh.Agent.Policy)
+	eff := s.Recipients.Effective(sh.Agent.Policy)
 	sh.Data["Form"] = formFromPolicy(sh.Agent.Policy, eff)
 	sh.Data["Defaults"] = s.Config.DefaultPolicy
 	sh.Data["Effective"] = eff
-	sh.Data["Aliases"] = s.Config.Aliases()
-	sh.Data["Recipients"] = s.Config.Recipients
+	sh.Data["Recipients"] = s.Recipients.All()
 	sh.Data["AllServices"] = policy.AllServices
 	s.render(w, r, "agent_policy", sh.Agent.Name, sh.Data)
 }
@@ -620,11 +629,11 @@ func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	p, errs := s.parsePolicyForm(r)
 	errs = append(errs, p.Validate()...)
-	if u := s.Config.UnknownAliases(p); len(u) > 0 {
+	if u := s.Recipients.UnknownAliases(p); len(u) > 0 {
 		errs = append(errs, "Unknown recipient aliases: "+strings.Join(u, ", "))
 	}
 	if len(errs) == 0 {
-		errs = append(errs, s.Config.Effective(p).ValidateEffective(s.Keys.Enabled())...)
+		errs = append(errs, s.Recipients.Effective(p).ValidateEffective(s.Keys.Enabled())...)
 	}
 	if len(errs) > 0 {
 		s.flash(r, "error", "Policy not saved: %s", strings.Join(errs, "; "))
@@ -844,24 +853,195 @@ func short16(fpr string) string {
 // ---- recipients -----------------------------------------------------------
 
 type recipientRow struct {
-	Alias     string
-	R         *config.Recipient
+	R         *recipients.Recipient
 	KeyFpr    string
 	KeyExpiry time.Time
+	KeyState  string // "" (no key), ok, expiring or expired
+}
+
+// recipientKeyState summarises a recipient's PGP key like keyState does for
+// signing keys: "" without a key, else expired (or revoked), expiring or ok.
+func recipientKeyState(rc *recipients.Recipient, now time.Time) string {
+	exp := rc.KeyExpiry()
+	switch {
+	case rc.Key == nil:
+		return ""
+	case !rc.KeyUsable(now):
+		return "expired"
+	case !exp.IsZero() && exp.Sub(now) < expiryWarning:
+		return "expiring"
+	}
+	return "ok"
+}
+
+// keyExpiryNote is appended to a flash when a just-saved key expires soon.
+func keyExpiryNote(rc *recipients.Recipient, now time.Time) string {
+	if recipientKeyState(rc, now) != "expiring" {
+		return ""
+	}
+	return " Its PGP key expires on " + rc.KeyExpiry().Format("2006-01-02") + "; replace it before then."
 }
 
 func (s *Server) recipients(w http.ResponseWriter, r *http.Request) {
+	now := s.now()
 	var rows []recipientRow
-	for _, alias := range s.Config.Aliases() {
-		rc := s.Config.Recipients[alias]
-		row := recipientRow{Alias: alias, R: rc}
-		if rc.PublicKey != nil {
-			row.KeyFpr = pgp.Fingerprint(rc.PublicKey)
-			row.KeyExpiry = pgp.KeyExpiry(rc.PublicKey)
-		}
-		rows = append(rows, row)
+	for _, rc := range s.Recipients.All() {
+		rows = append(rows, recipientRow{R: rc, KeyFpr: rc.Fingerprint(), KeyExpiry: rc.KeyExpiry(), KeyState: recipientKeyState(rc, now)})
 	}
 	s.render(w, r, "recipients", "Recipients", map[string]any{"Rows": rows})
+}
+
+// loadRecipient returns the recipient named in the path, or nil after
+// writing a 404.
+func (s *Server) loadRecipient(w http.ResponseWriter, r *http.Request) *recipients.Recipient {
+	alias := r.PathValue("alias")
+	if !config.AliasPattern.MatchString(alias) {
+		http.NotFound(w, r)
+		return nil
+	}
+	rc, ok := s.Recipients.Get(alias)
+	if !ok {
+		http.NotFound(w, r)
+		return nil
+	}
+	return rc
+}
+
+func (s *Server) newRecipientPage(w http.ResponseWriter, r *http.Request) {
+	s.render(w, r, "recipient_new", "New recipient", map[string]any{"Form": recipients.Input{}})
+}
+
+func (s *Server) createRecipient(w http.ResponseWriter, r *http.Request) {
+	f := r.PostForm
+	in := recipients.Input{
+		Alias:             strings.TrimSpace(f.Get("alias")),
+		Address:           strings.TrimSpace(f.Get("address")),
+		Description:       strings.TrimSpace(f.Get("description")),
+		PublicKeyArmor:    strings.TrimSpace(f.Get("pgp_public_key")),
+		RequireEncryption: f.Get("require_encryption") == "on",
+	}
+	rc, err := s.Recipients.Create(r.Context(), in)
+	var ve *recipients.ValidationError
+	switch {
+	case errors.As(err, &ve):
+		s.flash(r, "error", "Recipient not saved: %s.", strings.Join(ve.Problems, "; "))
+	case errors.Is(err, store.ErrConflict):
+		s.flash(r, "error", "A recipient named %q already exists.", in.Alias)
+	case err != nil:
+		s.fail(w, "creating recipient", err)
+		return
+	default:
+		s.Log.Info("recipient created", "alias", rc.Alias, "key", rc.Fingerprint())
+		s.flash(r, "ok", "Recipient %s created. Grant it to agents in their policy.%s", rc.Alias, keyExpiryNote(rc, s.now()))
+		s.redirect(w, r, "/recipients/"+rc.Alias)
+		return
+	}
+	// Re-render rather than redirect, so the operator does not lose a pasted key.
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	s.render(w, r, "recipient_new", "New recipient", map[string]any{"Form": in})
+}
+
+func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
+	rc := s.loadRecipient(w, r)
+	if rc == nil {
+		return
+	}
+	now := s.now()
+	state, exp := recipientKeyState(rc, now), rc.KeyExpiry()
+	s.render(w, r, "recipient", rc.Alias, map[string]any{
+		"Recipient":  rc,
+		"KeyFpr":     rc.Fingerprint(),
+		"KeyExpiry":  exp,
+		"KeyUsable":  state == "ok" || state == "expiring",
+		"KeyExpired": !exp.IsZero() && !now.Before(exp),
+		"Expiring":   state == "expiring",
+	})
+}
+
+func (s *Server) updateRecipient(w http.ResponseWriter, r *http.Request) {
+	rc := s.loadRecipient(w, r)
+	if rc == nil {
+		return
+	}
+	f := r.PostForm
+	back := "/recipients/" + rc.Alias
+	armor := strings.TrimSpace(f.Get("pgp_public_key"))
+	remove := f.Get("remove_key") == "on"
+	if remove && armor != "" {
+		s.flash(r, "error", "Recipient not saved: either paste a new PGP key or remove the current one, not both.")
+		s.redirect(w, r, back)
+		return
+	}
+	in := recipients.Input{
+		Address:           strings.TrimSpace(f.Get("address")),
+		Description:       strings.TrimSpace(f.Get("description")),
+		PublicKeyArmor:    armor,
+		KeepKey:           armor == "" && !remove,
+		RequireEncryption: f.Get("require_encryption") == "on",
+	}
+	updated, err := s.Recipients.Update(r.Context(), rc.Alias, in)
+	var ve *recipients.ValidationError
+	switch {
+	case errors.As(err, &ve):
+		s.flash(r, "error", "Recipient not saved: %s.", strings.Join(ve.Problems, "; "))
+		s.redirect(w, r, back)
+		return
+	case errors.Is(err, store.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case err != nil:
+		s.fail(w, "updating recipient", err)
+		return
+	}
+	msg := "Recipient saved."
+	switch {
+	case armor != "":
+		msg = "Recipient saved with the new PGP key." + keyExpiryNote(updated, s.now())
+	case remove && rc.Key != nil:
+		msg = "Recipient saved; its PGP key was removed."
+	}
+	s.Log.Info("recipient updated", "alias", rc.Alias, "key", updated.Fingerprint())
+	s.flash(r, "ok", "%s", msg)
+	s.redirect(w, r, back)
+}
+
+func (s *Server) deleteRecipientPage(w http.ResponseWriter, r *http.Request) {
+	rc := s.loadRecipient(w, r)
+	if rc == nil {
+		return
+	}
+	agents, err := s.Store.ListAgents(r.Context())
+	if err != nil {
+		s.fail(w, "listing agents", err)
+		return
+	}
+	s.render(w, r, "recipient_delete", "Delete "+rc.Alias, map[string]any{
+		"Recipient":  rc,
+		"Agents":     recipients.ReferencingAgents(agents, rc.Alias),
+		"InDefaults": slices.Contains(s.Config.DefaultPolicy.Recipients, rc.Alias),
+	})
+}
+
+func (s *Server) deleteRecipient(w http.ResponseWriter, r *http.Request) {
+	rc := s.loadRecipient(w, r)
+	if rc == nil {
+		return
+	}
+	if r.PostForm.Get("confirm") != rc.Alias {
+		s.flash(r, "error", "Type the alias to confirm deletion.")
+		s.redirect(w, r, "/recipients/"+rc.Alias+"/delete")
+		return
+	}
+	if err := s.Recipients.Delete(r.Context(), rc.Alias); errors.Is(err, store.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	} else if err != nil {
+		s.fail(w, "deleting recipient", err)
+		return
+	}
+	s.Log.Info("recipient deleted", "alias", rc.Alias)
+	s.flash(r, "ok", "Recipient %s deleted. Agents can no longer send to it.", rc.Alias)
+	s.redirect(w, r, "/recipients")
 }
 
 // ---- audit ----------------------------------------------------------------
@@ -987,7 +1167,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		"ConfigYAML":     string(y),
 		"SMTP":           smtp,
 		"Upstream":       s.Config.Upstream.SMTP.Addr(),
-		"Aliases":        s.Config.Aliases(),
+		"Aliases":        s.Recipients.Aliases(),
 		"SigningEnabled": s.Keys.Enabled(),
 		"MasterFpr":      master,
 		"Warnings":       s.Config.Warnings,
@@ -1013,7 +1193,7 @@ func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
 	alias := r.PostForm.Get("alias")
-	rc, ok := s.Config.Recipients[alias]
+	rc, ok := s.Recipients.Get(alias)
 	if !ok {
 		s.flash(r, "error", "Unknown recipient alias %q.", alias)
 		s.redirect(w, r, "/settings")

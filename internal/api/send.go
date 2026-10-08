@@ -21,6 +21,7 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
@@ -337,12 +338,17 @@ func (s *Server) prepare(ctx context.Context, c *caller, req *sendRequest) (*pre
 	p.nAttach = len(atts)
 
 	// --- recipients -----------------------------------------------------
+	// Resolved once: later steps use this snapshot, so a recipient edited or
+	// deleted in the dashboard mid-request cannot change this send.
+	rcs := make([]*recipients.Recipient, 0, len(p.aliases))
 	for _, a := range p.aliases {
-		if _, ok := s.Config.Recipients[a]; !ok || !pol.AllowsRecipient(a) {
+		rc, ok := s.Recipients.Get(a)
+		if !ok || !pol.AllowsRecipient(a) {
 			return p, newErr(http.StatusForbidden, CodeRecipientNotAllow,
 				"Recipient alias %q is not permitted for this agent. Allowed: %s.", a, listOrNone(pol.Recipients)).
 				with("allowed", nonNil(pol.Recipients))
 		}
+		rcs = append(rcs, rc)
 	}
 
 	// --- services -------------------------------------------------------
@@ -413,9 +419,9 @@ func (s *Server) prepare(ctx context.Context, c *caller, req *sendRequest) (*pre
 
 	// --- encryption -----------------------------------------------------
 	var mustEncrypt []string
-	for _, a := range p.aliases {
-		if pol.RequireEncryption || s.Config.Recipients[a].RequireEncryption {
-			mustEncrypt = append(mustEncrypt, a)
+	for _, rc := range rcs {
+		if pol.RequireEncryption || rc.RequireEncryption {
+			mustEncrypt = append(mustEncrypt, rc.Alias)
 		}
 	}
 	if len(mustEncrypt) > 0 && enc == encNone {
@@ -427,9 +433,8 @@ func (s *Server) prepare(ctx context.Context, c *caller, req *sendRequest) (*pre
 	var e2eArmor string
 	switch enc {
 	case encPGP:
-		for _, a := range p.aliases {
-			rc := s.Config.Recipients[a]
-			k := rc.PublicKey
+		for _, rc := range rcs {
+			a, k := rc.Alias, rc.Key
 			if k == nil {
 				return p, newErr(http.StatusUnprocessableEntity, CodeValidation,
 					"Recipient %q has no PGP key configured, so options.encrypt \"pgp\" is unavailable for it (see encryption_available in GET /v1/capabilities).", a).
@@ -528,8 +533,8 @@ func (s *Server) prepare(ctx context.Context, c *caller, req *sendRequest) (*pre
 	case req.Body.PGPMessage != nil:
 		msg.E2E = e2eArmor // re-armored by the gateway; never the agent's raw text
 	}
-	for _, a := range p.aliases {
-		p.recipients = append(p.recipients, s.Config.Recipients[a].Address)
+	for _, rc := range rcs {
+		p.recipients = append(p.recipients, rc.Address)
 	}
 	msg.To = p.recipients
 	p.msg = msg
@@ -556,5 +561,3 @@ func listOrNone(s []string) string {
 	}
 	return strings.Join(s, ", ")
 }
-
-func fingerprintOf(r *config.Recipient) string { return pgp.Fingerprint(r.PublicKey) }

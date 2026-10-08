@@ -2,7 +2,7 @@
 # Secrets are never written here: every *_file points at a Docker secret.
 # The file is validated at startup and every problem is reported at once.
 
-data_dir: /data                     # holds state.db (agents, token hashes, keys, audit metadata)
+data_dir: /data                     # holds state.db (agents, token hashes, recipients, keys, audit metadata)
 
 api:
   listen: "0.0.0.0:8025"            # inside the container; compose publishes 127.0.0.1 only
@@ -31,11 +31,15 @@ upstream:
   from: you@gmail.com               # envelope and header From address
   from_name_template: "{agent} via email-me"
 
-recipients:                         # agents address these aliases; they never see the addresses
+# Recipients are the aliases agents address; they never see the addresses.
+# They live in state.db and are managed on the dashboard's Recipients page.
+# This section is only a seed: it is imported when state.db has no
+# recipients (first boot, or after deleting them all) and ignored otherwise.
+recipients:
   me:
     address: you@gmail.com
     description: "Personal inbox — general results and reports"
-    # pgp_public_key_file: /config/keys/me.asc   # enables encrypt: pgp and e2e for this alias
+    # pgp_public_key_file: /config/keys/me.asc   # read at seed time; enables encrypt: pgp and e2e
   # work:
   #   address: you@company.com
   #   description: "Work inbox — only work-related results"

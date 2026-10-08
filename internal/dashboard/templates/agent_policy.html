@@ -4,7 +4,7 @@
 {{$d := .Data}}{{$a := $d.Agent}}{{$f := $d.Form}}{{$def := $d.Defaults}}
 {{template "agent_header" .}}
 
-{{if $d.Unknown}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div>This policy references aliases that are not in config.yaml and are ignored: {{join $d.Unknown ", "}}. Saving the policy removes them.</div></div>{{end}}
+{{if $d.Unknown}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div>This policy references aliases that no longer exist and are ignored: {{join $d.Unknown ", "}}. Saving the policy removes them.</div></div>{{end}}
 
 <form method="post" action="/agents/{{$a.ID}}/policy" class="card">
   <input type="hidden" name="csrf" value="{{$.CSRF}}">
@@ -19,7 +19,7 @@
         <label class="switch"><input type="checkbox" name="ov_recipients" {{if $f.OvRecipients}}checked{{end}}><span class="switch-track" aria-hidden="true"></span><span class="switch-label">Custom</span></label>
         <span class="policy-default">Default: {{if $def.Recipients}}{{join $def.Recipients ", "}}{{else}}none{{end}}</span>
         <div class="policy-field"><div class="choices">
-          {{range $d.Aliases}}<label class="check"><input type="checkbox" name="recipients" value="{{.}}" {{if has $f.Recipients .}}checked{{end}}> {{.}}{{with (index $d.Recipients .).Description}} <span class="muted">{{.}}</span>{{end}}</label>{{end}}
+          {{range $d.Recipients}}<label class="check"><input type="checkbox" name="recipients" value="{{.Alias}}" {{if has $f.Recipients .Alias}}checked{{end}}> {{.Alias}}{{with .Description}} <span class="muted">{{.}}</span>{{end}}</label>{{else}}<span class="hint">No recipients yet. <a href="/recipients/new">Add one</a>.</span>{{end}}
         </div></div>
       </div>
     </div>

@@ -19,7 +19,7 @@ func TestLoadValidConfig(t *testing.T) {
 	if !c.SigningConfigured() || len(c.Signing.KEK) != 32 {
 		t.Fatal("signing should be configured")
 	}
-	if c.Recipients["me"].PublicKey == nil || c.Recipients["ops"].PublicKey != nil {
+	if !strings.Contains(c.Recipients["me"].PublicKeyArmor, "BEGIN PGP PUBLIC KEY BLOCK") || c.Recipients["ops"].PublicKeyArmor != "" {
 		t.Fatal("recipient keys loaded incorrectly")
 	}
 	if !auth.VerifyPassword(c.Dashboard.AdminPasswordHash, env.AdminPW) {
@@ -89,12 +89,26 @@ log:
 	joined := strings.Join(ve.Problems, "\n")
 	for _, want := range []string{
 		"api.listen", "api.docs", "trusted_proxies", "admin_password_file", "security none", "upstream.from",
-		`"Bad_Alias"`, "recipients.Bad_Alias.address", "recipients.ok.require_encryption", "unknown alias \"ghost\"",
+		`"Bad_Alias"`, "recipients.Bad_Alias.address", "recipients.ok.require_encryption",
 		"fax", "require_signing is true but signing is not configured", "retention_days", "log.level",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing problem %q in:\n%s", want, joined)
 		}
+	}
+}
+
+func TestRecipientsAreOptionalSeeds(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{DefaultsPolicy: "recipients: [ghost]"})
+	start := strings.Index(env.YAML, "recipients:\n")
+	end := strings.Index(env.YAML, "defaults:\n")
+	yaml := env.YAML[:start] + env.YAML[end:]
+	c, err := config.Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("no recipients and an unknown default alias must load: %v", err)
+	}
+	if len(c.Recipients) != 0 || (*c.Defaults.Policy.Recipients)[0] != "ghost" {
+		t.Fatalf("got %+v", c.Recipients)
 	}
 }
 
@@ -168,18 +182,6 @@ func TestArgon2HashInPasswordFile(t *testing.T) {
 	yaml = strings.Replace(env.YAML, filepath.Join(env.Dir, "admin_password"), short, 1)
 	if _, err := config.Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "at least 12") {
 		t.Fatalf("short password must be rejected: %v", err)
-	}
-}
-
-func TestEffectiveDropsUnknownAliases(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	rc := []string{"me", "ghost", "me"}
-	e := env.Config.Effective(policy.Policy{Recipients: &rc})
-	if strings.Join(e.Recipients, ",") != "me" {
-		t.Fatalf("got %v", e.Recipients)
-	}
-	if u := env.Config.UnknownAliases(policy.Policy{Recipients: &rc}); len(u) != 1 || u[0] != "ghost" {
-		t.Fatalf("unknown = %v", u)
 	}
 }
 

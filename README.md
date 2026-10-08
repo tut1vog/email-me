@@ -7,7 +7,7 @@ A self-hosted, send-only email gateway that lets AI agents running anywhere emai
 - **Nothing is stored**: message bodies, subjects and attachments live only in memory; the audit log holds metadata.
 - Messages are **signed with a per-agent OpenPGP key** held by the gateway (on by default), and can be **encrypted** to your key.
 - The API **explains itself**: an agent only needs a URL and a token. `GET /` returns a usage guide written for LLMs and links to `/openapi.json`. No SDK, MCP server or CLI is needed on the agent side.
-- A **dashboard** (the only management interface) manages agents, tokens, policies, keys and the audit log.
+- A **dashboard** (the only management interface) manages agents, tokens, policies, recipients, keys and the audit log.
 
 The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi.yaml`](internal/api/docs/openapi.yaml), served at `/openapi.json`; the guide agents read first is [`internal/api/docs/guide.md.tmpl`](internal/api/docs/guide.md.tmpl).
 
@@ -17,7 +17,7 @@ The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi
 
    ```sh
    mkdir -p config secrets
-   cp config.example.yaml config/config.yaml        # then edit upstream + recipients
+   cp config.example.yaml config/config.yaml        # then edit upstream (and the first recipient)
    printf '%s' 'your-smtp-app-password' > secrets/smtp_password
    printf '%s' 'a-long-dashboard-password' > secrets/admin_password
    openssl rand -hex 32 > secrets/signing_kek         # encrypts agent signing keys at rest
@@ -33,7 +33,7 @@ The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi
 
    Both ports are published on `127.0.0.1` only: the agent API on `8025`, the dashboard on `8026`.
 
-3. Open `http://email-me.localhost:8026` (Chrome and Firefox resolve `*.localhost` to your machine), log in with the admin password, create an agent, grant it one or more aliases, and issue a token. The token page shows everything to hand to the agent:
+3. Open `http://email-me.localhost:8026` (Chrome and Firefox resolve `*.localhost` to your machine) and log in with the admin password. On the **Recipients** page, check the recipient imported from `config.yaml` or add your address (optionally pasting your PGP public key). Then create an agent, grant it one or more aliases, and issue a token. The token page shows everything to hand to the agent:
 
    ```
    EMAIL_ME_URL=http://localhost:8025
@@ -71,7 +71,7 @@ The defaults keep everything on localhost. To accept agents from other machines,
 | `encrypt: pgp` | Plaintext unless TLS | Plaintext | Ciphertext, real subject hidden | Yes (default) |
 | `encrypt: e2e` | Ciphertext | Ciphertext | Ciphertext | No, impossible |
 
-- **Gateway-side encryption (`pgp`)**: add `pgp_public_key_file` to a recipient in `config.yaml`. The agent sets `options.encrypt: "pgp"`.
+- **Gateway-side encryption (`pgp`)**: paste the recipient's ASCII-armored public key (`gpg --export --armor --export-options export-minimal you@example.com`) on its page under **Recipients**. The agent sets `options.encrypt: "pgp"`.
 - **End-to-end (`e2e`)**: the agent fetches the recipient's key from `/v1/recipients/{alias}/pgp-key`, encrypts a MIME entity itself, and sends the ciphertext. The gateway never sees plaintext, so it cannot sign; an agent needs `require_signing: false` in its policy to use `e2e`.
 - **Revocation**: every agent key comes with two revocation certificates. Publish the *retired* one after rotating or deleting an agent; signatures the key already made stay valid. Publish the *compromised* one only if the key may have leaked (for example, the database and the KEK were both exposed); it invalidates every signature the key made.
 - **Signatures**: each agent's key has the user ID `<agent> via email-me <your from address>`. Download public keys from the agent's Signing tab, or all of them from Settings, and import them into your mail client. A signature proves the message was submitted through your gateway with that agent's token and was not modified afterwards.
@@ -79,8 +79,8 @@ The defaults keep everything on localhost. To accept agents from other machines,
 ## Operations
 
 - **Health**: the image has a Docker `HEALTHCHECK` (`email-me healthcheck`), and `GET /healthz` on the API.
-- **Config changes**: edit `config/config.yaml` and restart. The config is validated at startup and every problem is listed at once.
-- **State**: `state.db` in the `email-me-data` volume holds agents, token hashes, encrypted signing keys and audit metadata. Back it up together with `signing_kek`; without the KEK the signing keys cannot be decrypted.
+- **Config changes**: edit `config/config.yaml` and restart. The config is validated at startup and every problem is listed at once. Recipients are the exception: they are managed in the dashboard and take effect immediately. The `recipients:` section only seeds an empty database (first boot, or after every recipient was deleted); later edits to it are ignored.
+- **State**: `state.db` in the `email-me-data` volume holds agents, token hashes, recipients and their PGP public keys, encrypted signing keys and audit metadata. Back it up together with `signing_kek`; without the KEK the signing keys cannot be decrypted.
 - **Admin password as a hash**: `admin_password` may hold an argon2id PHC string instead of plaintext, e.g. `printf '%s' 'password' | argon2 "$(openssl rand -hex 16)" -id -t 3 -m 16 -p 2 -e`.
 
 ## Development
@@ -92,4 +92,4 @@ docker compose -f compose.dev.yml up --build   # email-me + Mailpit
 
 The dev stack delivers to Mailpit (`http://localhost:8027`); the dashboard password is `dev-password-change-me`. The secrets in `dev/` are throwaway values.
 
-Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/store` (SQLite), `internal/config`, `internal/policy`.
+Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/recipients` (recipient registry), `internal/store` (SQLite), `internal/config`, `internal/policy`.

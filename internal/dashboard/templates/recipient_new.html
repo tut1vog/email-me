@@ -1,0 +1,37 @@
+{{define "crumbs"}}<a href="/recipients">Recipients</a>{{end}}
+{{define "content"}}
+{{$f := .Data.Form}}
+<form method="post" action="/recipients" class="card">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <div class="card-body">
+    <div class="field">
+      <label for="alias">Alias</label>
+      <input id="alias" name="alias" value="{{$f.Alias}}" required pattern="[a-z0-9][a-z0-9_\-]{0,31}" maxlength="32" placeholder="me" autocomplete="off">
+      <p class="hint">What agents address. Lowercase letters, digits, <code>-</code> and <code>_</code>; cannot be changed later.</p>
+    </div>
+    <div class="field">
+      <label for="address">Address</label>
+      <input id="address" name="address" type="email" value="{{$f.Address}}" required placeholder="you@example.com" autocomplete="off">
+      <p class="hint">Agents never see it.</p>
+    </div>
+    <div class="field">
+      <label for="description">Description <span class="muted">(optional)</span></label>
+      <input id="description" name="description" value="{{$f.Description}}" maxlength="200" placeholder="Personal inbox — general results and reports">
+      <p class="hint">Shown to agents to help them pick an alias.</p>
+    </div>
+    <div class="field wide">
+      <label for="pgp_public_key">PGP public key <span class="muted">(optional)</span></label>
+      <textarea id="pgp_public_key" name="pgp_public_key" class="mono" rows="8" spellcheck="false" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----">{{$f.PublicKeyArmor}}</textarea>
+      <p class="hint">Enables <code>encrypt: pgp</code> and <code>e2e</code> for this alias. Export it with <code>gpg --export --armor --export-options export-minimal you@example.com</code>.</p>
+    </div>
+    <div class="field">
+      <label class="check"><input type="checkbox" name="require_encryption" {{if $f.RequireEncryption}}checked{{end}}> Require encryption</label>
+      <p class="hint">Refuse unencrypted messages to this alias. Needs a PGP key.</p>
+    </div>
+  </div>
+  <div class="card-footer">
+    <a class="button ghost" href="/recipients">Cancel</a>
+    <button type="submit">Create recipient</button>
+  </div>
+</form>
+{{end}}

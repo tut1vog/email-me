@@ -22,11 +22,15 @@
       <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings">
       <button type="submit" class="secondary">Test connection</button>
     </form>
+    {{if $d.Aliases}}
     <form method="post" action="/settings/test-send" class="inline">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
       <button type="submit" class="secondary">Send test</button>
     </form>
+    {{else}}
+    <p class="small muted"><a href="/recipients/new">Add a recipient</a> to send a test message.</p>
+    {{end}}
   </div>
 </section>
 
@@ -60,7 +64,7 @@
 </div>
 
 <section class="card" id="config">
-  <div class="card-header"><div><h2>Effective configuration</h2><p>Read-only. Edit <code>config.yaml</code> and restart; secrets are read from files and never shown.</p></div></div>
+  <div class="card-header"><div><h2>Effective configuration</h2><p>Read-only. Edit <code>config.yaml</code> and restart; secrets are read from files and never shown. Its <code>recipients</code> section only seeds an empty database: manage recipients on the <a href="/recipients">Recipients</a> page.</p></div></div>
   <div class="card-body">
     <details class="disclosure">
       <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Show effective config</summary>

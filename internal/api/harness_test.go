@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +25,7 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -44,6 +44,7 @@ type harness struct {
 	t      *testing.T
 	env    *testutil.Env
 	st     *store.Store
+	reg    *recipients.Registry
 	keys   *keys.Manager
 	ts     *httptest.Server
 	router routers.Router
@@ -85,11 +86,7 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	t.Helper()
 	env := testutil.NewEnv(t, o)
 	cfg := env.Config
-	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st, reg := testutil.Bootstrap(t, env)
 	ko := keys.Options{Email: cfg.Upstream.From}
 	if cfg.Signing != nil {
 		ko.KEK, ko.Validity, ko.Master = cfg.Signing.KEK, cfg.Signing.KeyValidity.D(), cfg.Signing.Master
@@ -98,7 +95,7 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := api.New(api.Deps{
-		Config: cfg, Store: st, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP),
+		Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP),
 		Limiter: ratelimit.New(st), Audit: audit.NewWriter(st, cfg.Audit.LogSubject, log), Log: log,
 	})
 	ts := httptest.NewServer(srv.Handler())
@@ -109,7 +106,7 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{t: t, env: env, st: st, keys: km, ts: ts, router: router, logs: logs, srv: srv}
+	return &harness{t: t, env: env, st: st, reg: reg, keys: km, ts: ts, router: router, logs: logs, srv: srv}
 }
 
 func ptr[T any](v T) *T { return &v }

@@ -1,9 +1,10 @@
-// Package testutil provides a fake SMTP server, throwaway OpenPGP keys and a
-// config builder for tests.
+// Package testutil provides a fake SMTP server, throwaway OpenPGP keys, a
+// config builder and a seeded state database for tests.
 package testutil
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -24,6 +25,8 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/store"
 )
 
 // Captured is a message received by the fake SMTP server.
@@ -213,7 +216,8 @@ type Env struct {
 }
 
 // NewEnv writes secret files and a config.yaml into a temp dir and loads it.
-// Recipients: "me" (with PGP key), "work" (with PGP key), "ops" (no key).
+// Recipient seeds: "me" (with PGP key), "work" (with PGP key), "ops" (no
+// key); Bootstrap inserts them into the state database.
 func NewEnv(t testing.TB, o Options) *Env {
 	t.Helper()
 	dir := t.TempDir()
@@ -284,6 +288,22 @@ func NewEnv(t testing.TB, o Options) *Env {
 	}
 	env.Config = cfg
 	return env
+}
+
+// Bootstrap opens the env's state database and loads its recipient
+// registry, seeding it from the config's recipients.
+func Bootstrap(t testing.TB, env *Env) (*store.Store, *recipients.Registry) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg, _, err := recipients.Bootstrap(context.Background(), st, env.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, reg
 }
 
 func quoteAll(ss []string) []string {

@@ -31,7 +31,67 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	s.Close()
+	defer s.Close()
+	var v int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 2 {
+		t.Fatalf("user_version = %d, %v", v, err)
+	}
+}
+
+func TestRecipientsCRUD(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if n, _ := s.CountRecipients(ctx); n != 0 {
+		t.Fatal(n)
+	}
+	r := &Recipient{Alias: "me", Address: "me@example.com", Description: "Personal", PublicKey: "armor", RequireEncryption: true}
+	if err := s.CreateRecipient(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRecipient(ctx, &Recipient{Alias: "me", Address: "x@example.com"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate alias: %v", err)
+	}
+	got, err := s.GetRecipient(ctx, "me")
+	if err != nil || got.Address != "me@example.com" || got.PublicKey != "armor" || !got.RequireEncryption || got.CreatedAt.IsZero() {
+		t.Fatalf("GetRecipient = %+v, %v", got, err)
+	}
+	if err := s.CreateRecipient(ctx, &Recipient{Alias: "aa", Address: "aa@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateRecipient(ctx, &Recipient{Alias: "me", Address: "new@example.com", Description: "d"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetRecipient(ctx, "me")
+	if got.Address != "new@example.com" || got.PublicKey != "" || got.RequireEncryption {
+		t.Fatalf("after update: %+v", got)
+	}
+	if err := s.UpdateRecipient(ctx, &Recipient{Alias: "ghost"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update missing: %v", err)
+	}
+	list, _ := s.ListRecipients(ctx)
+	if len(list) != 2 || list[0].Alias != "aa" || list[1].Alias != "me" {
+		t.Fatalf("ListRecipients must sort by alias: %+v", list)
+	}
+	if err := s.DeleteRecipient(ctx, "aa"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetRecipient(ctx, "aa"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("deleted recipient still there")
+	}
+	if err := s.DeleteRecipient(ctx, "aa"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing: %v", err)
+	}
+	// Seeding only fills an empty table.
+	if ok, err := s.SeedRecipients(ctx, []*Recipient{{Alias: "seed", Address: "s@example.com"}}); ok || err != nil {
+		t.Fatalf("seeded a non-empty table: %v %v", ok, err)
+	}
+	s.DeleteRecipient(ctx, "me")
+	if ok, err := s.SeedRecipients(ctx, []*Recipient{{Alias: "seed", Address: "s@example.com"}}); !ok || err != nil {
+		t.Fatalf("seed empty table: %v %v", ok, err)
+	}
+	if n, _ := s.CountRecipients(ctx); n != 1 {
+		t.Fatal(n)
+	}
 }
 
 func TestAgentsCRUD(t *testing.T) {

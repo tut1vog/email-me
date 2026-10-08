@@ -132,7 +132,7 @@ func TestPagesHaveNoInlineStyleOrScript(t *testing.T) {
 	d.login()
 	a := d.createAgent("bench", "me")
 	d.st.InsertAudit(context.Background(), &store.AuditEntry{AgentID: a.ID, Status: store.StatusSent, Transport: "insecure", Signed: true, TS: time.Now()})
-	for _, path := range []string{"/", "/agents", "/audit", "/settings", "/recipients", "/settings/guide"} {
+	for _, path := range []string{"/", "/agents", "/audit", "/settings", "/recipients", "/recipients/new", "/recipients/me", "/recipients/ops", "/recipients/me/delete", "/settings/guide"} {
 		p := d.get(path)
 		if p.status != 200 {
 			t.Fatalf("%s: %d", path, p.status)

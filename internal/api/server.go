@@ -20,18 +20,20 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
 
 type Deps struct {
-	Config  *config.Config
-	Store   *store.Store
-	Keys    *keys.Manager
-	Sender  upstream.Sender
-	Limiter *ratelimit.Limiter
-	Audit   *audit.Writer
-	Log     *slog.Logger
+	Config     *config.Config
+	Store      *store.Store
+	Recipients *recipients.Registry
+	Keys       *keys.Manager
+	Sender     upstream.Sender
+	Limiter    *ratelimit.Limiter
+	Audit      *audit.Writer
+	Log        *slog.Logger
 }
 
 type Server struct {
@@ -147,7 +149,7 @@ func (s *Server) authenticate(r *http.Request) (*caller, *apiError) {
 		return c, newErr(http.StatusForbidden, CodeSourceIPNotAllowed,
 			"Requests with this token are not allowed from %s. Ask your operator to allow this address.", c.ip)
 	}
-	c.policy = s.Config.Effective(a.Policy)
+	c.policy = s.Recipients.Effective(a.Policy)
 	if err := s.Store.TouchToken(r.Context(), t.ID, c.ip.String(), s.now()); err != nil {
 		s.Log.Warn("recording token use", "err", err, "token_id", t.ID)
 	}
@@ -265,7 +267,10 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	p := c.policy
 	var rcpts []recipientCap
 	for _, alias := range p.Recipients {
-		rc := s.Config.Recipients[alias]
+		rc, ok := s.Recipients.Get(alias)
+		if !ok {
+			continue // deleted since the policy was resolved
+		}
 		rcpts = append(rcpts, recipientCap{
 			Alias:               alias,
 			Description:         rc.Description,
@@ -320,14 +325,14 @@ func (s *Server) handleRecipientKey(w http.ResponseWriter, r *http.Request) {
 			"Fetching recipient keys requires the e2e service, which this agent does not have.").with("service", policy.SvcE2E))
 		return
 	}
-	if !c.policy.AllowsRecipient(alias) {
+	rc, ok := s.Recipients.Get(alias)
+	if !ok || !c.policy.AllowsRecipient(alias) {
 		writeError(w, newErr(http.StatusForbidden, CodeRecipientNotAllow,
 			"Recipient alias %q is not permitted for this agent. Allowed: %s.", alias, strings.Join(c.policy.Recipients, ", ")).
 			with("allowed", nonNil(c.policy.Recipients)))
 		return
 	}
-	rc := s.Config.Recipients[alias]
-	if rc.PublicKey == nil {
+	if rc.Key == nil {
 		writeError(w, newErr(http.StatusNotFound, CodeNotFound, "Recipient %q has no PGP public key configured, so it cannot receive encrypted mail.", alias))
 		return
 	}
@@ -337,8 +342,8 @@ func (s *Server) handleRecipientKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/pgp-keys")
-	w.Header().Set("X-Email-Me-Key-Fingerprint", fingerprintOf(rc))
-	w.Write([]byte(rc.PublicKeyArmor))
+	w.Header().Set("X-Email-Me-Key-Fingerprint", rc.Fingerprint())
+	w.Write([]byte(rc.PublicKey))
 }
 
 func (s *Server) internal(w http.ResponseWriter, what string, err error) {

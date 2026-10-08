@@ -27,6 +27,7 @@ import (
 	"github.com/tut1vog/email-me/internal/dashboard"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/ratelimit"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
@@ -75,15 +76,29 @@ func serve(cfgPath string) error {
 		log.Warn(w)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	st, err := store.Open(filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
 		return fmt.Errorf("opening state database in %s: %w", cfg.DataDir, err)
 	}
 	defer st.Close()
 
+	reg, seeded, err := recipients.Bootstrap(ctx, st, cfg)
+	if err != nil {
+		return err
+	}
+	if len(seeded) > 0 {
+		log.Info("imported recipients from config.yaml into the state database; manage them in the dashboard from now on", "aliases", seeded)
+	}
+	if reg.Len() == 0 {
+		log.Warn("no recipients: agents cannot send until you add one in the dashboard")
+	}
+	if u := reg.UnknownAliases(cfg.Defaults.Policy); len(u) > 0 {
+		log.Warn("defaults.policy.recipients names recipients that do not exist; they are ignored", "aliases", u)
+	}
+
 	km := keys.NewManager(st, keysOptions(cfg))
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	if km.Enabled() {
 		n, err := km.EnsureAll(ctx)
 		if err != nil {
@@ -97,10 +112,10 @@ func serve(cfgPath string) error {
 	sender := upstream.NewSMTP(cfg.Upstream.SMTP)
 	auditW := audit.NewWriter(st, cfg.Audit.LogSubject, log)
 	apiSrv := api.New(api.Deps{
-		Config: cfg, Store: st, Keys: km, Sender: sender,
+		Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: sender,
 		Limiter: ratelimit.New(st), Audit: auditW, Log: log.With("component", "api"),
 	})
-	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Keys: km, Sender: sender, Log: log.With("component", "dashboard")})
+	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: sender, Log: log.With("component", "dashboard")})
 	if err != nil {
 		return err
 	}
@@ -146,7 +161,7 @@ func serve(cfgPath string) error {
 		log.Info("dashboard listening", "addr", cfg.Dashboard.Listen)
 		errc <- fmt.Errorf("dashboard server: %w", dashHTTP.ListenAndServe())
 	}()
-	log.Info("email-me started", "signing", km.Enabled(), "recipients", len(cfg.Recipients), "upstream", cfg.Upstream.SMTP.Addr())
+	log.Info("email-me started", "signing", km.Enabled(), "recipients", reg.Len(), "upstream", cfg.Upstream.SMTP.Addr())
 
 	select {
 	case <-ctx.Done():

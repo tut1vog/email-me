@@ -27,6 +27,7 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/units"
 )
@@ -840,4 +841,70 @@ func TestExpiredRecipientKey(t *testing.T) {
 	if r := h.do("GET", "/v1/recipients/me/pgp-key", tok, nil); r.status != 503 {
 		t.Fatalf("expired key must not be served for e2e: %d", r.status)
 	}
+}
+
+func TestRecipientChangesApplyWithoutRestart(t *testing.T) {
+	h := newHarness(t, testutil.Options{})
+	ctx := context.Background()
+	_, tok := h.agent("a", policy.Policy{
+		Recipients: ptr([]string{"me", "ops", "pager"}), Services: ptr([]string{policy.SvcEncrypt, policy.SvcE2E}),
+	})
+	capsFor := func() map[string]map[string]any {
+		t.Helper()
+		out := map[string]map[string]any{}
+		for _, r := range h.do("GET", "/v1/capabilities", tok, nil).json(t)["recipients"].([]any) {
+			m := r.(map[string]any)
+			out[m["alias"].(string)] = m
+		}
+		return out
+	}
+	caps := capsFor()
+	if _, ok := caps["pager"]; ok || caps["ops"]["encryption_available"] != false || len(caps) != 2 {
+		t.Fatalf("before: %v", caps)
+	}
+
+	// Adding a key to ops: encryption becomes available and the new key is served.
+	key := testutil.NewKey(t, "Ops", "ops@example.net")
+	if _, err := h.reg.Update(ctx, "ops", recipients.Input{Address: "ops@example.net", Description: "Ops pager", PublicKeyArmor: testutil.ArmorPublic(t, key)}); err != nil {
+		t.Fatal(err)
+	}
+	if capsFor()["ops"]["encryption_available"] != true {
+		t.Fatal("new key must be advertised")
+	}
+	if r := h.do("GET", "/v1/recipients/ops/pgp-key", tok, nil); r.status != 200 || r.header.Get("X-Email-Me-Key-Fingerprint") != pgp.Fingerprint(key) {
+		t.Fatalf("new key must be served: %d %v", r.status, r.header)
+	}
+	enc := map[string]any{"to": []string{"ops"}, "subject": "s", "body": map[string]any{"text": "b"}, "options": map[string]any{"encrypt": "pgp"}}
+	if r := h.do("POST", "/v1/messages", tok, enc); r.status != 200 {
+		t.Fatalf("encrypted send to ops: %d %s", r.status, r.body)
+	}
+
+	// A recipient created while the agent's policy already names it becomes usable.
+	if _, err := h.reg.Create(ctx, recipients.Input{Alias: "pager", Address: "pager@example.net", Description: "Pager"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := capsFor()["pager"]; !ok {
+		t.Fatal("created recipient must be advertised")
+	}
+	if r := h.do("POST", "/v1/messages", tok, msgText("pager")); r.status != 200 || h.env.SMTP.Last(t).To[0] != "pager@example.net" {
+		t.Fatalf("send to new recipient: %d %s", r.status, r.body)
+	}
+
+	// Deleting ops: it disappears and sends to it are refused.
+	if err := h.reg.Delete(ctx, "ops"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := capsFor()["ops"]; ok {
+		t.Fatal("deleted recipient must not be advertised")
+	}
+	if r := h.do("POST", "/v1/messages", tok, msgText("ops")); r.status != 403 || r.code(t) != "recipient_not_allowed" {
+		t.Fatalf("send to deleted recipient: %d %s", r.status, r.body)
+	}
+	if r := h.do("GET", "/v1/recipients/ops/pgp-key", tok, nil); r.status != 403 || r.code(t) != "recipient_not_allowed" {
+		t.Fatalf("key of deleted recipient: %d", r.status)
+	}
+}
+
+func msgText(to string) map[string]any {
+	return map[string]any{"to": []string{to}, "subject": "s", "body": map[string]any{"text": "b"}}
 }

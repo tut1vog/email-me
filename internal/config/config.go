@@ -100,25 +100,17 @@ type SMTP struct {
 // Addr returns host:port.
 func (s SMTP) Addr() string { return net.JoinHostPort(s.Host, strconv.Itoa(s.Port)) }
 
+// Recipient is a recipients: entry. Entries are seeds: they are inserted
+// into the state database only when it has no recipients (first boot) and
+// ignored otherwise. Recipients are managed from the dashboard.
 type Recipient struct {
 	Address           string `yaml:"address"`
 	Description       string `yaml:"description"`
 	PGPPublicKeyFile  string `yaml:"pgp_public_key_file"`
 	RequireEncryption bool   `yaml:"require_encryption"`
 
-	PublicKey      *openpgp.Entity `yaml:"-"`
-	PublicKeyArmor string          `yaml:"-"`
-}
-
-// KeyUsable reports whether the recipient's PGP key can encrypt right now.
-// Keys are validated at startup but can expire (or be found revoked) while
-// the gateway runs.
-func (r *Recipient) KeyUsable(now time.Time) bool {
-	if r.PublicKey == nil || r.PublicKey.Revoked(now) {
-		return false
-	}
-	_, ok := r.PublicKey.EncryptionKey(now)
-	return ok
+	// PublicKeyArmor is the key file's key, re-armored canonically.
+	PublicKeyArmor string `yaml:"-"`
 }
 
 type Signing struct {
@@ -152,46 +144,9 @@ type Log struct {
 // SigningConfigured reports whether the sign service can work at all.
 func (c *Config) SigningConfigured() bool { return c.Signing != nil && len(c.Signing.KEK) == 32 }
 
-// Effective resolves an agent's partial policy against the configured
-// defaults, dropping aliases that no longer exist in the config.
-func (c *Config) Effective(p policy.Policy) policy.Effective {
-	e := p.Apply(c.DefaultPolicy)
-	kept := make([]string, 0, len(e.Recipients))
-	for _, a := range e.Recipients {
-		if _, ok := c.Recipients[a]; ok && !slices.Contains(kept, a) {
-			kept = append(kept, a)
-		}
-	}
-	e.Recipients = kept
-	return e
-}
-
-// UnknownAliases returns aliases a partial policy references that are not configured.
-func (c *Config) UnknownAliases(p policy.Policy) []string {
-	var out []string
-	if p.Recipients != nil {
-		for _, a := range *p.Recipients {
-			if _, ok := c.Recipients[a]; !ok {
-				out = append(out, a)
-			}
-		}
-	}
-	return out
-}
-
 // FromName renders the From display name for an agent.
 func (c *Config) FromName(agent string) string {
 	return strings.ReplaceAll(c.Upstream.FromNameTemplate, "{agent}", agent)
-}
-
-// Aliases returns recipient aliases sorted.
-func (c *Config) Aliases() []string {
-	out := make([]string, 0, len(c.Recipients))
-	for a := range c.Recipients {
-		out = append(out, a)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // Load reads, defaults and validates a config file and all referenced secrets.
@@ -415,11 +370,15 @@ func (c *Config) validateUpstream(v *validator) {
 	}
 }
 
+// validateRecipients checks the recipient seeds. None is fine: recipients
+// can be added from the dashboard.
 func (c *Config) validateRecipients(v *validator) {
-	if len(c.Recipients) == 0 {
-		v.add("at least one recipient must be configured under recipients")
+	aliases := make([]string, 0, len(c.Recipients))
+	for a := range c.Recipients {
+		aliases = append(aliases, a)
 	}
-	for _, alias := range c.Aliases() {
+	sort.Strings(aliases)
+	for _, alias := range aliases {
 		r := c.Recipients[alias]
 		if r == nil {
 			v.add("recipients.%s is empty", alias)
@@ -447,7 +406,7 @@ func (c *Config) validateRecipients(v *validator) {
 				v.add("recipients.%s.pgp_public_key_file: %v", alias, err)
 				continue
 			}
-			r.PublicKey, r.PublicKeyArmor = e, armored
+			r.PublicKeyArmor = armored
 		} else if r.RequireEncryption {
 			v.add("recipients.%s.require_encryption needs pgp_public_key_file (nothing could ever be delivered)", alias)
 		}
@@ -499,13 +458,6 @@ func (c *Config) validateDefaults(v *validator) {
 	p := c.Defaults.Policy
 	for _, e := range p.Validate() {
 		v.add("defaults.policy: %s", e)
-	}
-	if p.Recipients != nil {
-		for _, a := range *p.Recipients {
-			if _, ok := c.Recipients[a]; !ok {
-				v.add("defaults.policy.recipients: unknown alias %q", a)
-			}
-		}
 	}
 	signing := c.Signing != nil
 	if p.RequireSigning != nil && *p.RequireSigning && !signing {

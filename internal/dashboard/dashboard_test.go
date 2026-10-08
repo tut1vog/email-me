@@ -7,7 +7,6 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -16,6 +15,7 @@ import (
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/dashboard"
 	"github.com/tut1vog/email-me/internal/keys"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -25,6 +25,7 @@ type dash struct {
 	t    *testing.T
 	env  *testutil.Env
 	st   *store.Store
+	reg  *recipients.Registry
 	keys *keys.Manager
 	ts   *httptest.Server
 	c    *http.Client
@@ -34,17 +35,13 @@ func newDash(t *testing.T, o testutil.Options) *dash {
 	t.Helper()
 	env := testutil.NewEnv(t, o)
 	cfg := env.Config
-	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st, reg := testutil.Bootstrap(t, env)
 	ko := keys.Options{Email: cfg.Upstream.From}
 	if cfg.Signing != nil {
 		ko.KEK, ko.Validity = cfg.Signing.KEK, cfg.Signing.KeyValidity.D()
 	}
 	km := keys.NewManager(st, ko)
-	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger()})
+	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +49,7 @@ func newDash(t *testing.T, o testutil.Options) *dash {
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &dash{t: t, env: env, st: st, keys: km, ts: ts, c: c}
+	return &dash{t: t, env: env, st: st, reg: reg, keys: km, ts: ts, c: c}
 }
 
 type page struct {

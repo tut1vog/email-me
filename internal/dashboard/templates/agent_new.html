@@ -14,11 +14,15 @@
     </div>
     <div class="field wide">
       <span class="label">Recipients this agent may email</span>
+      {{if .Data.Recipients}}
       <div class="choices stack">
-      {{range .Data.Aliases}}
-        <label class="check"><input type="checkbox" name="recipients" value="{{.}}"> <strong>{{.}}</strong>{{with (index $.Data.Recipients .).Description}} <span class="muted">{{.}}</span>{{end}}</label>
+      {{range .Data.Recipients}}
+        <label class="check"><input type="checkbox" name="recipients" value="{{.Alias}}"> <strong>{{.Alias}}</strong>{{with .Description}} <span class="muted">{{.}}</span>{{end}}</label>
       {{end}}
       </div>
+      {{else}}
+      <p class="hint">No recipients yet. <a href="/recipients/new">Add one</a> first.</p>
+      {{end}}
       <p class="hint">None checked uses the default ({{if .Data.Defaults.Recipients}}{{join .Data.Defaults.Recipients ", "}}{{else}}none — the agent could not send{{end}}).</p>
     </div>
   </div>

@@ -25,6 +25,20 @@ func Config() *packet.Config {
 // ParsePublicKey parses a single armored (or binary) public key that must
 // have a usable encryption key.
 func ParsePublicKey(data []byte) (*openpgp.Entity, error) {
+	e, err := ReadPublicKey(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := CheckEncryptionKey(e, time.Now()); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// ReadPublicKey parses a single armored (or binary) key without checking
+// that it can encrypt. Use it for keys that were validated when stored and
+// may have expired since.
+func ReadPublicKey(data []byte) (*openpgp.Entity, error) {
 	el, err := readKeyRing(data)
 	if err != nil {
 		return nil, err
@@ -32,14 +46,18 @@ func ParsePublicKey(data []byte) (*openpgp.Entity, error) {
 	if len(el) != 1 {
 		return nil, fmt.Errorf("expected exactly one key, found %d", len(el))
 	}
-	e := el[0]
-	if e.Revoked(time.Now()) {
-		return nil, fmt.Errorf("key %s is revoked", Fingerprint(e))
+	return el[0], nil
+}
+
+// CheckEncryptionKey reports why e cannot encrypt at now, or nil if it can.
+func CheckEncryptionKey(e *openpgp.Entity, now time.Time) error {
+	if e.Revoked(now) {
+		return fmt.Errorf("key %s is revoked", Fingerprint(e))
 	}
-	if _, ok := e.EncryptionKey(time.Now()); !ok {
-		return nil, fmt.Errorf("key %s has no valid (unexpired) encryption key", Fingerprint(e))
+	if _, ok := e.EncryptionKey(now); !ok {
+		return fmt.Errorf("key %s has no valid (unexpired) encryption key", Fingerprint(e))
 	}
-	return e, nil
+	return nil
 }
 
 // ParsePrivateKey parses a single private key and decrypts it with passphrase

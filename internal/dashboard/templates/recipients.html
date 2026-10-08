@@ -1,4 +1,6 @@
+{{define "actions"}}<a class="button" href="/recipients/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>New recipient</a>{{end}}
 {{define "content"}}
+{{if .Data.Rows}}
 <section class="card">
   <div class="table-wrap">
   <table>
@@ -6,16 +8,26 @@
     <tbody>
     {{range .Data.Rows}}
       <tr>
-        <td><strong>{{.Alias}}</strong></td>
+        <td><a href="/recipients/{{.R.Alias}}"><strong>{{.R.Alias}}</strong></a></td>
         <td>{{.R.Address}}</td>
         <td class="text-2">{{.R.Description}}</td>
-        <td>{{if .R.RequireEncryption}}<span class="tag info">required</span>{{else if .KeyFpr}}<span class="tag ok">available</span>{{else}}<span class="tag">unavailable</span>{{end}}</td>
-        <td>{{if .KeyFpr}}<code class="fpr" title="{{.KeyFpr}}">{{short .KeyFpr}}</code>{{if not .KeyExpiry.IsZero}}<span class="sub">expires {{ts .KeyExpiry}}</span>{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
+        <td>{{if .R.RequireEncryption}}<span class="tag info">required</span>{{else if or (eq .KeyState "ok") (eq .KeyState "expiring")}}<span class="tag ok">available</span>{{else}}<span class="tag">unavailable</span>{{end}}</td>
+        <td>{{if .KeyFpr}}<code class="fpr" title="{{.KeyFpr}}">{{short .KeyFpr}}</code>{{if eq .KeyState "expired"}} <span class="tag danger">expired</span>{{else if eq .KeyState "expiring"}} <span class="tag warn">expiring</span>{{end}}{{if not .KeyExpiry.IsZero}}<span class="sub">expires {{ts .KeyExpiry}}</span>{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
       </tr>
     {{end}}
     </tbody>
   </table>
   </div>
 </section>
-<p class="small muted">Defined in <code>config.yaml</code>; agents only see alias and description.</p>
+<p class="small muted">Agents see only alias and description.</p>
+{{else}}
+<section class="card">
+  <div class="empty">
+    <svg class="icon" aria-hidden="true"><use href="#icon-at-sign"/></svg>
+    <strong>No recipients</strong>
+    <p>Add your own address first. Agents email aliases; they never see the address behind them.</p>
+    <a class="button" href="/recipients/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>New recipient</a>
+  </div>
+</section>
+{{end}}
 {{end}}

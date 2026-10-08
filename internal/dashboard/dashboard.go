@@ -1,5 +1,5 @@
 // Package dashboard serves the operator's management UI: agents, tokens,
-// policies, signing keys, audit log and settings. It is the only management
+// policies, signing keys, recipients, audit log and settings. It is the only management
 // interface; there is no management API or CLI.
 package dashboard
 
@@ -20,6 +20,7 @@ import (
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/keys"
+	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/units"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -37,11 +38,12 @@ const (
 )
 
 type Deps struct {
-	Config *config.Config
-	Store  *store.Store
-	Keys   *keys.Manager
-	Sender upstream.Sender
-	Log    *slog.Logger
+	Config     *config.Config
+	Store      *store.Store
+	Recipients *recipients.Registry
+	Keys       *keys.Manager
+	Sender     upstream.Sender
+	Log        *slog.Logger
 }
 
 type Server struct {
@@ -135,6 +137,12 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /agents/{id}/keys/{fpr}/revocation.asc", s.downloadRevocation)
 	authed("GET /agents/{id}/keys/{fpr}/revocation-compromised.asc", s.downloadRevocationCompromised)
 	authed("GET /recipients", s.recipients)
+	authed("GET /recipients/new", s.newRecipientPage)
+	authed("POST /recipients", s.createRecipient)
+	authed("GET /recipients/{alias}", s.recipientPage)
+	authed("POST /recipients/{alias}", s.updateRecipient)
+	authed("GET /recipients/{alias}/delete", s.deleteRecipientPage)
+	authed("POST /recipients/{alias}/delete", s.deleteRecipient)
 	authed("GET /audit", s.auditPage)
 	authed("GET /audit.csv", s.auditCSV)
 	authed("GET /settings", s.settings)
@@ -365,7 +373,7 @@ func sectionOf(name string) string {
 		return "overview"
 	case "agents", "agent", "agent_tokens", "agent_policy", "agent_signing", "agent_new", "agent_delete", "token":
 		return "agents"
-	case "recipients":
+	case "recipients", "recipient_new", "recipient", "recipient_delete":
 		return "recipients"
 	case "audit":
 		return "audit"

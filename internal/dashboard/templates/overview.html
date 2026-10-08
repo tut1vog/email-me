@@ -75,9 +75,13 @@
 <section class="card">
   <div class="card-header"><h2>Welcome to email-me</h2></div>
   <div class="card-body">
-    <p>Create an agent, grant it recipient aliases and issue it a token.
+    <p>Add a recipient (your address), create an agent, grant it the alias and issue it a token.
     The agent reads the guide at the API's base URL and starts sending.</p>
+    {{if $d.NoRecipients}}
+    <a class="button" href="/recipients/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>Add your first recipient</a>
+    {{else}}
     <a class="button" href="/agents/new"><svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg>Create your first agent</a>
+    {{end}}
   </div>
 </section>
 {{else}}
