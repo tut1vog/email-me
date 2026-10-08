@@ -26,6 +26,7 @@ import (
 
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 )
 
@@ -217,7 +218,9 @@ type Env struct {
 
 // NewEnv writes secret files and a config.yaml into a temp dir and loads it.
 // Recipient seeds: "me" (with PGP key), "work" (with PGP key), "ops" (no
-// key); Bootstrap inserts them into the state database.
+// key); Bootstrap inserts them into the state database. The managed
+// settings in env.Config are validated and complete only after
+// BootstrapSettings (or Bootstrap).
 func NewEnv(t testing.TB, o Options) *Env {
 	t.Helper()
 	dir := t.TempDir()
@@ -286,29 +289,44 @@ func NewEnv(t testing.TB, o Options) *Env {
 	if err != nil {
 		t.Fatalf("loading test config: %v\n%s", err, env.YAML)
 	}
-	problems, warnings := cfg.ValidateSeed()
-	if len(problems) > 0 {
-		t.Fatalf("test config: %v\n%s", problems, env.YAML)
-	}
-	cfg.Warnings = append(cfg.Warnings, warnings...)
 	env.Config = cfg
 	return env
 }
 
-// Bootstrap opens the env's state database and loads its recipient
-// registry, seeding it from the config's recipients.
+// Bootstrap opens the env's state database and loads its settings and
+// recipient registry, seeding both from the config, like serve does.
 func Bootstrap(t testing.TB, env *Env) (*store.Store, *recipients.Registry) {
+	t.Helper()
+	st := OpenStore(t, env)
+	BootstrapSettings(t, env, st)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, env.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, reg
+}
+
+// OpenStore opens the env's state database; it is closed when the test ends.
+func OpenStore(t testing.TB, env *Env) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	reg, _, err := recipients.Bootstrap(context.Background(), st, env.Config)
+	return st
+}
+
+// BootstrapSettings loads the managed settings from st into env.Config,
+// seeding st from the config on first use. Call it before
+// recipients.Bootstrap, which needs the default policy.
+func BootstrapSettings(t testing.TB, env *Env, st *store.Store) *settings.Manager {
+	t.Helper()
+	m, _, err := settings.Bootstrap(context.Background(), st, env.Config, DiscardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return st, reg
+	return m
 }
 
 func quoteAll(ss []string) []string {

@@ -16,26 +16,33 @@ import (
 	"github.com/tut1vog/email-me/internal/dashboard"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
 
 type dash struct {
-	t    *testing.T
-	env  *testutil.Env
-	st   *store.Store
-	reg  *recipients.Registry
-	keys *keys.Manager
-	ts   *httptest.Server
-	c    *http.Client
+	t        *testing.T
+	env      *testutil.Env
+	st       *store.Store
+	reg      *recipients.Registry
+	settings *settings.Manager
+	keys     *keys.Manager
+	ts       *httptest.Server
+	c        *http.Client
 }
 
 func newDash(t *testing.T, o testutil.Options) *dash {
 	t.Helper()
 	env := testutil.NewEnv(t, o)
 	cfg := env.Config
-	st, reg := testutil.Bootstrap(t, env)
+	st := testutil.OpenStore(t, env)
+	sm := testutil.BootstrapSettings(t, env, st)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ko := keys.Options{Email: cfg.Upstream.From}
 	if cfg.Signing != nil {
 		ko.KEK, ko.Validity = cfg.Signing.KEK, cfg.Signing.KeyValidity.D()
@@ -49,7 +56,7 @@ func newDash(t *testing.T, o testutil.Options) *dash {
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &dash{t: t, env: env, st: st, reg: reg, keys: km, ts: ts, c: c}
+	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c}
 }
 
 type page struct {

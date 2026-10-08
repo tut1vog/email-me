@@ -26,6 +26,7 @@ import (
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -41,15 +42,16 @@ func init() {
 }
 
 type harness struct {
-	t      *testing.T
-	env    *testutil.Env
-	st     *store.Store
-	reg    *recipients.Registry
-	keys   *keys.Manager
-	ts     *httptest.Server
-	router routers.Router
-	logs   *syncBuffer
-	srv    *api.Server
+	t        *testing.T
+	env      *testutil.Env
+	st       *store.Store
+	reg      *recipients.Registry
+	settings *settings.Manager
+	keys     *keys.Manager
+	ts       *httptest.Server
+	router   routers.Router
+	logs     *syncBuffer
+	srv      *api.Server
 }
 
 type syncBuffer struct {
@@ -86,7 +88,12 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	t.Helper()
 	env := testutil.NewEnv(t, o)
 	cfg := env.Config
-	st, reg := testutil.Bootstrap(t, env)
+	st := testutil.OpenStore(t, env)
+	sm := testutil.BootstrapSettings(t, env, st)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ko := keys.Options{Email: cfg.Upstream.From}
 	if cfg.Signing != nil {
 		ko.KEK, ko.Validity, ko.Master = cfg.Signing.KEK, cfg.Signing.KeyValidity.D(), cfg.Signing.Master
@@ -106,7 +113,7 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{t: t, env: env, st: st, reg: reg, keys: km, ts: ts, router: router, logs: logs, srv: srv}
+	return &harness{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, router: router, logs: logs, srv: srv}
 }
 
 func ptr[T any](v T) *T { return &v }
