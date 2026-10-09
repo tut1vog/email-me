@@ -4,6 +4,12 @@ All notable changes to email-me are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-10-09
+
+### Added
+
+- **`email-me update` installs the latest release** — it replaces the binary after checking its checksum and restarts the gateway on the new version if it is running, so the install script is needed only once.
+
 ## [0.1.1] - 2026-10-09
 
 ### Changed
