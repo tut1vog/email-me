@@ -2,10 +2,12 @@
 #
 #   git tag v1.2.3 && git push origin v1.2.3
 #
-# The CI checks (ci.yml) run first. Then the release gets a tarball per OS and architecture,
-# checksums.txt and install.sh, and ghcr.io gets a multi-platform image.
+# The CI checks (ci.yml) run first, and CHANGELOG.md must have a section for the
+# version: it becomes the release notes. Then the release gets a tarball per OS and
+# architecture, checksums.txt and install.sh, and ghcr.io gets a multi-platform image.
 # A tag with a suffix (v1.2.3-rc.1) is a prerelease: install.sh skips it
-# unless asked for by name, and the image's latest tag does not move.
+# unless asked for by name, the image's latest tag does not move, and its notes
+# are generated from the commits instead.
 name: Release
 
 on:
@@ -19,8 +21,25 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  notes:
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.changelog.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: changelog
+        run: |
+          case $GITHUB_REF_NAME in *-*) exit 0 ;; esac
+          notes=$(awk -v head="## [${GITHUB_REF_NAME#v}]" '
+            /^## \[/ { if (found) exit; found = index($0, head) == 1; next }
+            found' CHANGELOG.md)
+          if [ -z "$(printf %s "$notes" | tr -d '[:space:]')" ]; then
+            echo "::error::CHANGELOG.md has no section for $GITHUB_REF_NAME"; exit 1
+          fi
+          { echo 'notes<<EOF_NOTES'; printf '%s\n' "$notes"; echo EOF_NOTES; } >> "$GITHUB_OUTPUT"
+
   binaries:
-    needs: ci
+    needs: [ci, notes]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,14 +64,16 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ needs.notes.outputs.notes }}
         run: |
-          prerelease=
-          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes \
-            --title "$GITHUB_REF_NAME" $prerelease
+          case $GITHUB_REF_NAME in
+          *-*) set -- --prerelease --generate-notes ;;
+          *) printf '%s\n' "$NOTES" > notes.md; set -- --notes-file notes.md ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" "$@"
 
   image:
-    needs: ci
+    needs: [ci, notes]
     runs-on: ubuntu-latest
     permissions:
       contents: read
