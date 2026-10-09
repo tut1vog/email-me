@@ -476,14 +476,16 @@ a.brand:hover { color: var(--text); }
 /* Never overflow:hidden on .card itself: it would break sticky headers. */
 table.card { overflow: clip; }
 
-/* Two cards side by side on wide screens. */
+/* Two cards side by side on wide screens. Each card is a column, so a
+   body that is the card's own child stretches and footers line up. */
 .card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: var(--s-5);
   margin-bottom: var(--s-5);
 }
-.card-grid > .card { margin-bottom: 0; }
+.card-grid > .card { display: flex; flex-direction: column; margin-bottom: 0; }
+.card-grid > .card > .card-body { flex: 1; }
 
 /* ===== 7. Stat tiles ===== */
 
@@ -1022,24 +1024,30 @@ legend {
 .filters select,
 .filters input:not([type=checkbox], [type=radio]) { width: auto; min-width: 12ch; }
 
-/* Settings cards: short fields side by side, and a second part of a card
-   (the SMTP tests, the signing form) set off by a rule. */
+/* Settings cards: short fields in pairs, two to a row (one on narrow
+   screens), and a second part of a card (the SMTP tests, the signing
+   form) set off by a rule. */
 .field-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 0 var(--s-4);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 var(--s-5);
+  align-items: start;
   max-width: 760px;
 }
 .field-grid > .field { max-width: none; }
+@media (max-width: 640px) {
+  .field-grid { grid-template-columns: minmax(0, 1fr); }
+}
 .card-section { border-top: 1px solid var(--border); }
 
-/* A form laid out on one line (settings: test buttons). */
+/* A form laid out on one line (settings: test buttons, spaced by the .row
+   around them; the restart banner sets its own margin). */
 form.inline {
   display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--s-2);
-  margin: 6px var(--s-4) 6px 0;
+  margin: 0;
 }
 form.inline label {
   display: inline-flex;

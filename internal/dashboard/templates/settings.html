@@ -28,15 +28,15 @@
           <input id="smtp_host" name="host" value="{{$u.Host}}" placeholder="smtp.example.com" autocomplete="off" spellcheck="false">
         </div>
         <div class="field">
+          <label for="smtp_port">Port <span class="muted">(optional)</span></label>
+          <input id="smtp_port" name="port" value="{{$u.Port}}" inputmode="numeric" placeholder="default">
+          <p class="hint">Blank: 587 for starttls, 465 for tls, 25 for none.</p>
+        </div>
+        <div class="field">
           <label for="smtp_security">Security</label>
           <select id="smtp_security" name="security">
             {{range $d.Securities}}<option value="{{.}}" {{if eq . $u.Security}}selected{{end}}>{{.}}</option>{{end}}
           </select>
-        </div>
-        <div class="field">
-          <label for="smtp_port">Port <span class="muted">(optional)</span></label>
-          <input id="smtp_port" name="port" value="{{$u.Port}}" inputmode="numeric" placeholder="default">
-          <p class="hint">Blank: 587 for starttls, 465 for tls, 25 for none.</p>
         </div>
         <div class="field">
           <label for="smtp_timeout">Timeout</label>
@@ -73,19 +73,21 @@
   <div class="card-body card-section">
     {{if $d.Configured}}
     <p class="small text-2">{{with $d.SMTP}}Last check {{ts .At}}{{if not .OK}}: {{.Err}}{{end}}.{{else}}Not checked yet.{{end}}</p>
-    <form method="post" action="/settings/test-smtp" class="inline">
-      <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings#upstream">
-      <button type="submit" class="secondary">Test connection</button>
-    </form>
-    {{if $d.Aliases}}
-    <form method="post" action="/settings/test-send" class="inline">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
-      <button type="submit" class="secondary">Send test</button>
-    </form>
-    {{else}}
-    <p class="small muted"><a href="/recipients/new">Add a recipient</a> to send a test message.</p>
-    {{end}}
+    <div class="row">
+      <form method="post" action="/settings/test-smtp" class="inline">
+        <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings#upstream">
+        <button type="submit" class="secondary">Test connection</button>
+      </form>
+      {{if $d.Aliases}}
+      <form method="post" action="/settings/test-send" class="inline">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
+        <button type="submit" class="secondary">Send test</button>
+      </form>
+      {{else}}
+      <span class="small muted"><a href="/recipients/new">Add a recipient</a> to send a test message.</span>
+      {{end}}
+    </div>
     {{else}}
     <p class="small muted">Save a host and From address to send, and to test them.</p>
     {{end}}
