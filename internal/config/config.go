@@ -1,12 +1,12 @@
-// Package config loads and validates config.yaml and the files it
-// references. Validation collects every problem so the operator can fix them
-// in one pass.
+// Package config loads, validates and edits config.yaml, the operator's
+// source of truth: the bootstrap keys (listen addresses, TLS, the
+// key-encryption key, log), the managed settings, the recipients and the
+// agents. Validation collects every problem so the operator can fix them in
+// one pass. Files the configuration names are relative to its directory.
 //
-// Keys are of two kinds. Bootstrap keys (listen addresses, TLS, the
-// key-encryption key, log) are read from config.yaml on every start and validated by
-// Parse. Managed keys (see Settings) live in the state database and are
-// edited on the dashboard; their sections in config.yaml only seed an empty
-// database, and are validated then by ValidateSeed.
+// Bootstrap keys apply when the gateway starts. Everything else is also
+// edited on the dashboard, which writes the file and applies the change at
+// once (see Settings and Document).
 package config
 
 import (
@@ -17,19 +17,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/mail"
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
 
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
@@ -40,24 +45,33 @@ import (
 var AliasPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 type Config struct {
-	DataDir    string                `yaml:"data_dir"`
 	API        API                   `yaml:"api"`
 	Dashboard  Dashboard             `yaml:"dashboard"`
 	Upstream   Upstream              `yaml:"upstream"`
-	Recipients map[string]*Recipient `yaml:"recipients"`
 	KEK        KEK                   `yaml:"kek"`
 	Signing    Signing               `yaml:"signing"`
 	Defaults   Defaults              `yaml:"defaults"`
 	Audit      Audit                 `yaml:"audit"`
 	Log        Log                   `yaml:"log"`
+	Recipients map[string]*Recipient `yaml:"recipients"`
+	Agents     map[string]*Agent     `yaml:"agents"`
 
+	// Dir is the directory relative paths in the file resolve against: the
+	// file's own.
+	Dir string `yaml:"-"`
 	// DefaultPolicy is built-in defaults overlaid with defaults.policy.
 	DefaultPolicy policy.Effective `yaml:"-"`
-	// Warnings are non-fatal problems to log at startup and show on the dashboard.
+	// Warnings are non-fatal problems to log at startup and show on the
+	// dashboard: BootstrapWarnings and the managed configuration's.
 	Warnings []string `yaml:"-"`
+	// BootstrapWarnings are the bootstrap keys' warnings, which hold until
+	// the next start.
+	BootstrapWarnings []string `yaml:"-"`
 	// Fingerprint identifies the config.yaml that Load read (see
 	// FileFingerprint), so a later change to the file can be detected.
 	Fingerprint string `yaml:"-"`
+	// Raw is the file as read, which a Document edits.
+	Raw []byte `yaml:"-"`
 }
 
 type API struct {
@@ -81,8 +95,7 @@ type TLS struct {
 func (t TLS) Enabled() bool { return t.CertFile != "" || t.KeyFile != "" }
 
 type Dashboard struct {
-	Listen     string         `yaml:"listen"`
-	SessionTTL units.Duration `yaml:"session_ttl"`
+	Listen string `yaml:"listen"`
 }
 
 type Upstream struct {
@@ -91,9 +104,8 @@ type Upstream struct {
 	FromNameTemplate string `yaml:"from_name_template" json:"from_name_template"`
 }
 
-// SMTP is the upstream server. The password is never in config.yaml nor
-// part of the stored settings document: it is entered on the dashboard and
-// kept sealed in its own column.
+// SMTP is the upstream server. The password is never in config.yaml: it is
+// entered on the dashboard and kept sealed in the state database.
 type SMTP struct {
 	Host     string         `yaml:"host" json:"host"`
 	Port     int            `yaml:"port" json:"port"`
@@ -107,18 +119,54 @@ type SMTP struct {
 // Addr returns host:port.
 func (s SMTP) Addr() string { return net.JoinHostPort(s.Host, strconv.Itoa(s.Port)) }
 
-// Recipient is a recipients: entry. Entries are seeds: they are inserted
-// into the state database only when it has no recipients (first boot) and
-// ignored otherwise. Recipients are managed from the dashboard.
+// Recipient is a recipients: entry, an alias agents may address.
 type Recipient struct {
+	Alias             string `yaml:"-"` // the entry's key
 	Address           string `yaml:"address"`
-	Description       string `yaml:"description"`
-	PGPPublicKeyFile  string `yaml:"pgp_public_key_file"`
-	RequireEncryption bool   `yaml:"require_encryption"`
+	Description       string `yaml:"description,omitempty"`
+	PGPPublicKey      string `yaml:"pgp_public_key,omitempty"` // ASCII armor
+	RequireEncryption bool   `yaml:"require_encryption,omitempty"`
 
-	// PublicKeyArmor is the key file's key, re-armored canonically.
-	PublicKeyArmor string `yaml:"-"`
+	// Key is PGPPublicKey parsed, nil without one.
+	Key *openpgp.Entity `yaml:"-"`
 }
+
+// KeyUsable reports whether the recipient's PGP key can encrypt at now.
+// Keys are checked when added but can expire (or be found revoked) later.
+func (r *Recipient) KeyUsable(now time.Time) bool {
+	return r.Key != nil && pgp.CheckEncryptionKey(r.Key, now) == nil
+}
+
+// Fingerprint returns the key's fingerprint, or "" without a key.
+func (r *Recipient) Fingerprint() string {
+	if r.Key == nil {
+		return ""
+	}
+	return pgp.Fingerprint(r.Key)
+}
+
+// KeyExpiry returns when the key expires; zero without a key or expiry.
+func (r *Recipient) KeyExpiry() time.Time {
+	if r.Key == nil {
+		return time.Time{}
+	}
+	return pgp.KeyExpiry(r.Key)
+}
+
+// Agent is an agents: entry. Its name is its identity: tokens, signing keys
+// and audit rows in the state database refer to it by name.
+type Agent struct {
+	Name        string        `yaml:"-"` // the entry's key
+	Description string        `yaml:"description,omitempty"`
+	Disabled    bool          `yaml:"disabled,omitempty"`
+	Policy      policy.Policy `yaml:"policy,omitempty"`
+}
+
+// Enabled reports whether the agent may send.
+func (a *Agent) Enabled() bool { return !a.Disabled }
+
+// MaxDescription is the longest agent or recipient description, in characters.
+const MaxDescription = 200
 
 // KEK names the key-encryption key that protects every credential in the
 // state database. The previous key is set only while rotating it.
@@ -160,17 +208,18 @@ func (c *Config) FromName(agent string) string {
 	return strings.ReplaceAll(c.Upstream.FromNameTemplate, "{agent}", agent)
 }
 
-// Load reads, defaults and validates a config file and all referenced secrets.
+// Load reads, defaults and validates a config file and every file it
+// names, which are relative to its directory.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
-	c, err := Parse(data)
+	c, err := Parse(data, filepath.Dir(path))
 	if err != nil {
 		return nil, err
 	}
-	c.Fingerprint = fingerprint(data)
+	c.Fingerprint = Fingerprint(data)
 	return c, nil
 }
 
@@ -182,44 +231,58 @@ func FileFingerprint(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fingerprint(data), nil
+	return Fingerprint(data), nil
 }
 
-func fingerprint(data []byte) string {
+// Fingerprint identifies a config file's contents.
+func Fingerprint(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-// Parse is Load without the file read (the files it names are still read).
-// It validates the bootstrap keys only; managed keys are decoded (they may
-// seed the state database) but not defaulted or checked: see ValidateSeed
-// and ValidateManaged.
-func Parse(data []byte) (*Config, error) {
+// Parse is Load without the file read; dir is where relative paths
+// resolve. The files the configuration names are still read.
+func Parse(data []byte, dir string) (*Config, error) {
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
-	if err := dec.Decode(&c); err != nil {
+	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
+	c.Dir, c.Raw = dir, data
 	c.applyBootstrapDefaults()
 	v := &validator{}
 	c.validateBootstrap(v)
+	boot := len(v.warns)
+	c.ApplyManagedDefaults()
+	c.validateManaged(v)
 	if len(v.errs) > 0 {
 		return nil, &ValidationError{Problems: v.errs}
 	}
-	c.Warnings = append(c.Warnings, v.warns...)
+	c.BootstrapWarnings = v.warns[:boot:boot]
+	c.Warnings = v.warns
 	return &c, nil
 }
 
-// ValidateManaged applies defaults to the managed settings and validates
-// them, collecting every problem. It also sets the derived fields
-// (API.TrustedNets, DefaultPolicy) and normalizes values (public_url loses
-// its trailing slash). Warnings are returned, not added to c.Warnings.
+// ValidateManaged applies defaults to everything the dashboard edits (the
+// managed settings, recipients and agents) and validates it, collecting
+// every problem. It also sets the derived fields (API.TrustedNets,
+// DefaultPolicy, each recipient's Alias and Key, each agent's Name) and
+// normalizes values (public_url loses its trailing slash). Warnings are
+// returned, not added to c.Warnings.
 func (c *Config) ValidateManaged() (problems, warnings []string) {
 	c.ApplyManagedDefaults()
 	v := &validator{}
 	c.validateManaged(v)
 	return v.errs, v.warns
+}
+
+// Path resolves a path from the file against its directory.
+func (c *Config) Path(p string) string {
+	if p == "" || filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(c.Dir, p)
 }
 
 // ValidationError lists every problem found in the config.
@@ -240,14 +303,17 @@ func (v *validator) warn(format string, args ...any) {
 }
 
 func (c *Config) applyBootstrapDefaults() {
-	if c.DataDir == "" {
-		c.DataDir = "/data"
-	}
 	if c.API.Listen == "" {
-		c.API.Listen = "0.0.0.0:8025"
+		c.API.Listen = "127.0.0.1:8025"
 	}
 	if c.Dashboard.Listen == "" {
-		c.Dashboard.Listen = "0.0.0.0:8026"
+		c.Dashboard.Listen = "127.0.0.1:8026"
+	}
+	if c.KEK.File == "" {
+		c.KEK.File = "kek"
+	}
+	if c.KEK.PreviousFile == "" {
+		c.KEK.PreviousFile = "previous_kek"
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
@@ -258,9 +324,6 @@ func (c *Config) applyBootstrapDefaults() {
 func (c *Config) ApplyManagedDefaults() {
 	if c.API.Docs == "" {
 		c.API.Docs = "public"
-	}
-	if c.Dashboard.SessionTTL == 0 {
-		c.Dashboard.SessionTTL = units.Duration(12 * time.Hour)
 	}
 	if c.Upstream.SMTP.Security == "" {
 		c.Upstream.SMTP.Security = "starttls"
@@ -289,24 +352,19 @@ func (c *Config) ApplyManagedDefaults() {
 	}
 }
 
-// validateBootstrap checks the keys read from config.yaml on every start,
-// and the recipient seeds.
+// validateBootstrap checks the keys that apply at start only.
 func (c *Config) validateBootstrap(v *validator) {
 	c.validateListenTLS(v)
 	c.validateDashboard(v)
-	c.validateRecipients(v)
 	c.validateKEK(v)
 	if !slices.Contains([]string{"debug", "info", "warn", "error"}, c.Log.Level) {
 		v.add("log.level must be one of debug, info, warn, error")
 	}
 }
 
-// validateManaged checks the settings managed on the dashboard.
+// validateManaged checks what the dashboard edits.
 func (c *Config) validateManaged(v *validator) {
 	c.validateAPISettings(v)
-	if c.Dashboard.SessionTTL.D() < time.Minute {
-		v.add("dashboard.session_ttl must be at least 1m")
-	}
 	c.validateUpstream(v)
 	if d := c.Signing.KeyValidity.D(); d < 24*time.Hour || d > 50*365*24*time.Hour {
 		v.add("signing.key_validity must be between 1d and 50y")
@@ -315,6 +373,8 @@ func (c *Config) validateManaged(v *validator) {
 	if c.Audit.RetentionDays < 1 {
 		v.add("audit.retention_days must be at least 1")
 	}
+	c.validateRecipients(v)
+	c.validateAgents(v)
 }
 
 func (c *Config) validateListenTLS(v *validator) {
@@ -325,7 +385,7 @@ func (c *Config) validateListenTLS(v *validator) {
 	if a.TLS.Enabled() {
 		if a.TLS.CertFile == "" || a.TLS.KeyFile == "" {
 			v.add("api.tls: both cert_file and key_file are required")
-		} else if cert, err := tls.LoadX509KeyPair(a.TLS.CertFile, a.TLS.KeyFile); err != nil {
+		} else if cert, err := tls.LoadX509KeyPair(c.Path(a.TLS.CertFile), c.Path(a.TLS.KeyFile)); err != nil {
 			v.add("api.tls: %v", err)
 		} else {
 			a.Certificate = &cert
@@ -419,78 +479,118 @@ func (c *Config) validateUpstream(v *validator) {
 	}
 }
 
-// validateRecipients checks the recipient seeds. None is fine: recipients
-// can be added from the dashboard.
+// validateRecipients checks the recipients and parses their keys. None is
+// fine: recipients can be added on the dashboard. A key that has expired
+// since it was added is only a warning: sends that need it fail until it is
+// replaced.
 func (c *Config) validateRecipients(v *validator) {
-	aliases := make([]string, 0, len(c.Recipients))
-	for a := range c.Recipients {
-		aliases = append(aliases, a)
-	}
-	sort.Strings(aliases)
-	for _, alias := range aliases {
+	now := time.Now()
+	for _, alias := range sortedKeys(c.Recipients) {
 		r := c.Recipients[alias]
 		if r == nil {
 			v.add("recipients.%s is empty", alias)
 			continue
 		}
+		r.Alias, r.Key = alias, nil
 		if !AliasPattern.MatchString(alias) {
 			v.add("recipients: alias %q must match %s", alias, AliasPattern)
 		}
 		if a, err := mail.ParseAddress(r.Address); err != nil || a.Name != "" {
 			v.add("recipients.%s.address must be a bare email address", alias)
 		}
-		if r.PGPPublicKeyFile != "" {
-			data, err := os.ReadFile(r.PGPPublicKeyFile)
-			if err != nil {
-				v.add("recipients.%s.pgp_public_key_file: %v", alias, err)
-				continue
+		validateDescription(v, "recipients."+alias, r.Description)
+		if r.PGPPublicKey == "" {
+			if r.RequireEncryption {
+				v.add("recipients.%s.require_encryption needs pgp_public_key (nothing could ever be delivered)", alias)
 			}
-			e, err := pgp.ParsePublicKey(data)
-			if err != nil {
-				v.add("recipients.%s.pgp_public_key_file: %v", alias, err)
-				continue
+			continue
+		}
+		e, err := pgp.ReadPublicKey([]byte(r.PGPPublicKey))
+		switch {
+		case err != nil:
+			v.add("recipients.%s.pgp_public_key: %v", alias, err)
+		case e.PrivateKey != nil:
+			v.add("recipients.%s.pgp_public_key is a private key; use the public key (gpg --export --armor)", alias)
+		default:
+			r.Key = e
+			if err := pgp.CheckEncryptionKey(e, now); err != nil {
+				v.warn("recipient %s: %v; encrypted sends to it fail until the key is replaced", alias, err)
 			}
-			armored, err := pgp.ArmorPublic(e)
-			if err != nil {
-				v.add("recipients.%s.pgp_public_key_file: %v", alias, err)
-				continue
-			}
-			r.PublicKeyArmor = armored
-		} else if r.RequireEncryption {
-			v.add("recipients.%s.require_encryption needs pgp_public_key_file (nothing could ever be delivered)", alias)
 		}
 	}
 }
 
-// validateKEK reads the key-encryption keys. An empty kek.file means no
-// KEK, so compose can always mount the secret; a missing or empty
-// previous_file means none, so it can stay configured between rotations.
-// Signing is available exactly when a KEK is.
-func (c *Config) validateKEK(v *validator) {
-	k := &c.KEK
-	if k.File != "" {
-		if raw, err := os.ReadFile(k.File); err != nil {
-			v.add("kek.file: %v", err)
-		} else if len(bytes.TrimSpace(raw)) > 0 {
-			if k.Key, err = ParseKEK(raw); err != nil {
-				v.add("kek.file: %v", err)
-			}
+// validateAgents checks the agents and their policies. A policy alias that
+// names no recipient is only a warning: it is ignored.
+func (c *Config) validateAgents(v *validator) {
+	signing := c.SigningConfigured()
+	for _, name := range sortedKeys(c.Agents) {
+		a := c.Agents[name]
+		if a == nil {
+			// An agent with nothing set: every field has a default.
+			a = &Agent{}
+			c.Agents[name] = a
+		}
+		a.Name = name
+		if !AliasPattern.MatchString(name) {
+			v.add("agents: name %q must match %s", name, AliasPattern)
+		}
+		validateDescription(v, "agents."+name, a.Description)
+		for _, e := range a.Policy.Validate() {
+			v.add("agents.%s.policy: %s", name, e)
+		}
+		for _, e := range a.Policy.Apply(c.DefaultPolicy).ValidateEffective(signing) {
+			v.add("agents.%s.policy: %s", name, e)
+		}
+		if u := c.UnknownAliases(a.Policy); len(u) > 0 {
+			v.warn("agent %s: its policy names recipients that do not exist and are ignored: %s", name, strings.Join(u, ", "))
 		}
 	}
-	if k.PreviousFile != "" {
-		raw, err := os.ReadFile(k.PreviousFile)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-		case err != nil:
+}
+
+func validateDescription(v *validator, key, d string) {
+	if utf8.RuneCountInString(d) > MaxDescription {
+		v.add("%s.description must be at most %d characters", key, MaxDescription)
+	}
+	if strings.ContainsAny(d, "\r\n") {
+		v.add("%s.description must be a single line", key)
+	}
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// validateKEK reads the key-encryption keys. An empty kek.file means no
+// KEK, which turns signing off; a missing or empty previous_file means none,
+// so it can stay configured between rotations. Signing is available exactly
+// when a KEK is.
+func (c *Config) validateKEK(v *validator) {
+	k := &c.KEK
+	if raw, err := os.ReadFile(c.Path(k.File)); err != nil {
+		v.add("kek.file: %v", err)
+	} else if len(bytes.TrimSpace(raw)) > 0 {
+		if k.Key, err = ParseKEK(raw); err != nil {
+			v.add("kek.file: %v", err)
+		}
+	}
+	raw, err := os.ReadFile(c.Path(k.PreviousFile))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		v.add("kek.previous_file: %v", err)
+	case len(bytes.TrimSpace(raw)) > 0:
+		if k.Previous, err = ParseKEK(raw); err != nil {
 			v.add("kek.previous_file: %v", err)
-		case len(bytes.TrimSpace(raw)) > 0:
-			if k.Previous, err = ParseKEK(raw); err != nil {
-				v.add("kek.previous_file: %v", err)
-			}
 		}
 	}
 	if k.Previous != nil && k.Key == nil {
-		v.add("kek.previous_file is set but kek.file is not: a rotation needs the new KEK in kek.file")
+		v.add("kek.previous_file is set but kek.file is empty: a rotation needs the new KEK in kek.file")
 	}
 }
 
@@ -508,6 +608,85 @@ func (c *Config) validateDefaults(v *validator) {
 		v.add("defaults.policy: require_signing and the e2e service are mutually exclusive (the gateway cannot sign ciphertext it cannot read)")
 	}
 	c.DefaultPolicy = eff
+	if u := c.UnknownAliases(p); len(u) > 0 {
+		v.warn("defaults.policy.recipients names recipients that do not exist and are ignored: %s", strings.Join(u, ", "))
+	}
+}
+
+// Recipient returns the recipient with this alias.
+func (c *Config) Recipient(alias string) (*Recipient, bool) {
+	r, ok := c.Recipients[alias]
+	return r, ok && r != nil
+}
+
+// RecipientList returns every recipient, sorted by alias.
+func (c *Config) RecipientList() []*Recipient {
+	out := make([]*Recipient, 0, len(c.Recipients))
+	for _, a := range sortedKeys(c.Recipients) {
+		out = append(out, c.Recipients[a])
+	}
+	return out
+}
+
+// Aliases returns the recipient aliases, sorted.
+func (c *Config) Aliases() []string { return sortedKeys(c.Recipients) }
+
+// Agent returns the agent with this name.
+func (c *Config) Agent(name string) (*Agent, bool) {
+	a, ok := c.Agents[name]
+	return a, ok && a != nil
+}
+
+// AgentList returns every agent, sorted by name.
+func (c *Config) AgentList() []*Agent {
+	out := make([]*Agent, 0, len(c.Agents))
+	for _, n := range sortedKeys(c.Agents) {
+		out = append(out, c.Agents[n])
+	}
+	return out
+}
+
+// AgentNames returns the agent names, sorted.
+func (c *Config) AgentNames() []string { return sortedKeys(c.Agents) }
+
+// Effective resolves an agent's partial policy against the default policy,
+// dropping aliases that name no recipient.
+func (c *Config) Effective(p policy.Policy) policy.Effective {
+	e := p.Apply(c.DefaultPolicy)
+	kept := make([]string, 0, len(e.Recipients))
+	for _, a := range e.Recipients {
+		if _, ok := c.Recipient(a); ok && !slices.Contains(kept, a) {
+			kept = append(kept, a)
+		}
+	}
+	e.Recipients = kept
+	return e
+}
+
+// UnknownAliases returns the aliases a partial policy names that are not
+// recipients.
+func (c *Config) UnknownAliases(p policy.Policy) []string {
+	var out []string
+	if p.Recipients != nil {
+		for _, a := range *p.Recipients {
+			if _, ok := c.Recipient(a); !ok {
+				out = append(out, a)
+			}
+		}
+	}
+	return out
+}
+
+// ReferencingAgents returns the agents whose own policy names alias. Agents
+// that inherit the default recipients are not included.
+func (c *Config) ReferencingAgents(alias string) []*Agent {
+	var out []*Agent
+	for _, a := range c.AgentList() {
+		if a.Policy.Recipients != nil && slices.Contains(*a.Policy.Recipients, alias) {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // ParseKEK accepts 64 hex characters, base64 of 32 bytes, or 32 raw bytes.

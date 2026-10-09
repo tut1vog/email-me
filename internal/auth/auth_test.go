@@ -3,7 +3,6 @@ package auth
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestTokenRoundTrip(t *testing.T) {
@@ -39,37 +38,19 @@ func TestParseTokenRejectsMalformed(t *testing.T) {
 	}
 }
 
-func TestPasswordHash(t *testing.T) {
-	h, err := HashPassword("correct horse battery staple")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := parsePHC(h); !strings.HasPrefix(h, "$argon2id$") || err != nil {
-		t.Fatalf("bad hash %q", h)
-	}
-	if !VerifyPassword(h, "correct horse battery staple") {
-		t.Fatal("password must verify")
-	}
-	if VerifyPassword(h, "wrong") || VerifyPassword("garbage", "x") {
-		t.Fatal("wrong password must not verify")
-	}
-	h2, _ := HashPassword("correct horse battery staple")
-	if h == h2 {
-		t.Fatal("salts must differ")
-	}
-	for _, bad := range []string{"$argon2id$v=19$m=0,t=1,p=1$AAAA$AAAA", "$argon2i$v=19$m=1,t=1,p=1$AAAA$AAAA", "$argon2id$v=19$m=65536,t=3,p=2$@@$AA"} {
-		if _, err := parsePHC(bad); err == nil {
-			t.Errorf("parsePHC(%q) should fail", bad)
-		}
-	}
-}
-
 func TestSessions(t *testing.T) {
 	s := NewSessions()
-	now := time.Now()
-	s.now = func() time.Time { return now }
-	sess := s.Create(time.Hour)
-	long := s.Create(3 * time.Hour)
+	link := s.NewLink()
+	if _, ok := s.Redeem("nope"); ok {
+		t.Fatal("an unknown link must not log in")
+	}
+	sess, ok := s.Redeem(link)
+	if !ok {
+		t.Fatal("a fresh link must log in")
+	}
+	if _, ok := s.Redeem(link); ok {
+		t.Fatal("a link works once")
+	}
 	if got, ok := s.Get(sess.ID); !ok || got != sess {
 		t.Fatal("session must be found")
 	}
@@ -83,48 +64,17 @@ func TestSessions(t *testing.T) {
 	if f := sess.PopFlash(); len(f) != 0 {
 		t.Fatal("flash must be one-shot")
 	}
-	now = now.Add(2 * time.Hour)
+	s.Delete(sess.ID)
 	if _, ok := s.Get(sess.ID); ok {
-		t.Fatal("expired session must not be found")
-	}
-	if _, ok := s.Get(long.ID); !ok {
-		t.Fatal("each session keeps the lifetime it was created with")
-	}
-	sess2 := s.Create(time.Hour)
-	s.Delete(sess2.ID)
-	if _, ok := s.Get(sess2.ID); ok {
 		t.Fatal("deleted session must not be found")
 	}
-}
-
-func TestLoginThrottle(t *testing.T) {
-	th := NewLoginThrottle(3, time.Minute)
-	now := time.Now()
-	th.now = func() time.Time { return now }
-	for i := 0; i < 3; i++ {
-		if ok, _ := th.Allowed("1.2.3.4"); !ok {
-			t.Fatalf("attempt %d should be allowed", i)
-		}
-		th.Failure("1.2.3.4")
+	other, _ := s.Redeem(s.NewLink())
+	unspent := s.NewLink()
+	s.Clear()
+	if _, ok := s.Get(other.ID); ok {
+		t.Fatal("Clear must end every session")
 	}
-	if ok, _ := th.Allowed("1.2.3.4"); ok {
-		t.Fatal("should be locked after free failures are used")
-	}
-	if ok, _ := th.Allowed("5.6.7.8"); !ok {
-		t.Fatal("other IPs unaffected")
-	}
-	now = now.Add(2 * time.Second)
-	if ok, _ := th.Allowed("1.2.3.4"); !ok {
-		t.Fatal("lock should expire")
-	}
-	for i := 0; i < 20; i++ {
-		th.Failure("1.2.3.4")
-	}
-	if _, wait := th.Allowed("1.2.3.4"); wait > time.Minute {
-		t.Fatalf("backoff must be capped, got %v", wait)
-	}
-	th.Success("1.2.3.4")
-	if ok, _ := th.Allowed("1.2.3.4"); !ok {
-		t.Fatal("success must reset")
+	if _, ok := s.Redeem(unspent); ok {
+		t.Fatal("Clear must void unspent links")
 	}
 }

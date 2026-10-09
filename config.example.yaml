@@ -1,88 +1,109 @@
-# email-me configuration. Copy to ./config/config.yaml and edit.
-# No secret is written here. The one this file names is the key-encryption
-# key (kek.file, a Docker secret); every other credential lives in state.db
-# and is set on the dashboard. The file is validated at startup and every
-# problem is reported at once.
+# email-me configuration: ~/.config/email-me/config.yaml
 #
-# Two kinds of keys:
-# - Bootstrap keys (data_dir, listen addresses, api.tls, kek, log)
-#   are read from this file at every start, including restarts from the
-#   dashboard or SIGHUP. The dashboard notices when this file changes and
-#   offers the restart.
-# - Keys marked "seed" are imported into state.db on the first start and
-#   managed on the dashboard's Settings page from then on, applied on save;
-#   later edits here are ignored. Leave them out to start with defaults: a fresh install may
-#   even omit upstream: and set the SMTP server on the dashboard.
-
-data_dir: /data                     # holds state.db (agents, token hashes, recipients, keys, audit metadata)
+# `email-me start` writes this file on its first run, next to a fresh
+# key-encryption key (kek). The directory is the whole configuration: back
+# it up, kek included, since without kek the credentials stored in the
+# state database are lost.
+#
+# The dashboard (`email-me console`) edits everything here except the
+# bootstrap keys and saves it back to this file, keeping your comments.
+# Bootstrap keys (api.listen, api.tls, dashboard.listen, kek, log) apply when
+# email-me starts: edit them here, then run `email-me restart`. Hand edits
+# to anything else apply the same way. No secret is written here: the SMTP
+# password is entered on the dashboard and stored encrypted. Paths are
+# relative to this directory. The file is validated as a whole and every
+# problem is reported at once.
 
 api:
-  listen: "0.0.0.0:8025"            # inside the container; compose publishes 127.0.0.1 only
-  public_url: ""                    # seed: e.g. https://email-me.example.ts.net — used in the agent guide
-  docs: public                      # seed: public | authenticated — who may read /, /llms.txt, /openapi.json
-  tls:                              # optional built-in TLS for the agent API
-    cert_file: ""
-    key_file: ""
-  trusted_proxies: []               # seed: CIDRs of reverse proxies whose X-Forwarded-* headers are honored
-  external_transport_encryption: false   # seed: true = you assert agents reach the API over an encrypted
-                                         # tunnel (Tailscale/WireGuard/SSH); silences plain-HTTP warnings
+  # Host address of the agent API. Keep it local unless TLS or an encrypted
+  # tunnel is in front (see the README).
+  listen: 127.0.0.1:8025
+  # The URL agents use, for the agent guide, e.g. https://email-me.example.ts.net
+  public_url: ""
+  # Who may read /, /llms.txt and /openapi.json: public or authenticated.
+  docs: public
+  # CIDRs of reverse proxies whose X-Forwarded-* headers are honored.
+  trusted_proxies: []
+  # true: agents reach the API over an encrypted tunnel (Tailscale,
+  # WireGuard, SSH), which silences the plain-HTTP warnings.
+  external_transport_encryption: false
+  # Optional built-in TLS for the agent API:
+  # tls:
+  #   cert_file: tls/cert.pem
+  #   key_file: tls/key.pem
 
 dashboard:
-  listen: "0.0.0.0:8026"            # the first start logs a one-time setup password
-  session_ttl: 12h                  # seed
+  # Host address of the dashboard, open only while `email-me console` runs.
+  listen: 127.0.0.1:8026
 
-# seed: imported on first boot, then managed on the dashboard. The SMTP
-# password is never written here: enter it on the Settings page.
 upstream:
   smtp:
-    host: smtp.gmail.com
+    # The SMTP server mail goes out through, e.g. smtp.gmail.com. The
+    # password is entered on the dashboard's Settings page, never here.
+    host: ""
     port: 587
-    security: starttls              # starttls | tls | none (none only to localhost)
-    username: you@gmail.com
+    # starttls, tls, or none (none only to localhost).
+    security: starttls
+    username: ""
     timeout: 30s
-  from: you@gmail.com               # envelope and header From address
+  # Envelope and header From address, e.g. you@gmail.com.
+  from: ""
   from_name_template: "{agent} via email-me"
 
-# Recipients are the aliases agents address; they never see the addresses.
-# They live in state.db and are managed on the dashboard's Recipients page.
-# This section is only a seed: it is imported when state.db has no
-# recipients (first boot, or after deleting them all) and ignored otherwise.
-recipients:
-  me:
-    address: you@gmail.com
-    description: "Personal inbox — general results and reports"
-    # pgp_public_key_file: /config/keys/me.asc   # read at seed time; enables encrypt: pgp and e2e
-  # work:
-  #   address: you@company.com
-  #   description: "Work inbox — only work-related results"
-  #   pgp_public_key_file: /config/keys/work.asc
-  #   require_encryption: true
+kek:
+  # The key-encryption key: 32 random bytes as hex. An empty file means none,
+  # which stores the SMTP password unencrypted and turns signing off.
+  file: kek
+  # Only while rotating the KEK; ignored when absent.
+  previous_file: previous_kek
 
-kek:                                # key-encryption key: encrypts every credential in state.db
-  file: /run/secrets/kek            # openssl rand -hex 32 (compose: EMAIL_ME_KEK_FILE); an empty file = none,
-                                    # which also turns signing off
-  previous_file: /run/secrets/previous_kek   # only while rotating the KEK; ignored when absent or empty
+signing:
+  # Lifetime of newly generated agent signing keys.
+  key_validity: 2y
 
-signing:                            # per-agent signing keys held by the gateway; on by default with a KEK
-  key_validity: 2y                  # seed: lifetime of newly generated agent keys
-
-# seed: imported on first boot, then managed on the dashboard (Default policy).
 defaults:
-  policy:                           # applied to agents unless their policy overrides a field
-    recipients: []                  # grant aliases per agent in the dashboard
-    services: [markdown, attachments, thread, sign]
-    max_message_bytes: 10MiB        # decoded body + attachments
+  # Applied to every agent unless its own policy overrides a field.
+  # services, when omitted: markdown, attachments, thread, and sign with a KEK.
+  # require_signing, when omitted: true with a KEK, false without.
+  policy:
+    # Aliases are best granted per agent.
+    recipients: []
+    # Decoded body plus attachments.
+    max_message_bytes: 10MiB
     max_attachments: 10
-    allowed_attachment_types: []    # empty = any; e.g. ["text/*", "application/pdf", "image/*"]
-    rate_limit: { per_hour: 20, per_day: 100 }
+    # Empty allows any, e.g. ["text/*", "application/pdf", "image/*"].
+    allowed_attachment_types: []
+    rate_limit: {per_hour: 20, per_day: 100}
     subject_prefix: "[{agent}] "
     require_encryption: false
-    # require_signing: omitted = true when a KEK is configured, false otherwise
 
-# seed: imported on first boot, then managed on the dashboard.
 audit:
   retention_days: 30
-  log_subject: false                # subjects are content; off by default
+  # true also records subjects (never bodies).
+  log_subject: false
 
 log:
-  level: info                       # debug | info | warn | error
+  # debug, info, warn or error.
+  level: info
+
+# Recipients are the aliases agents address; agents never see the addresses.
+# Example:
+#   me:
+#     address: you@gmail.com
+#     description: Personal inbox — general results and reports
+#     # Optional: enables encryption (options.encrypt pgp and e2e).
+#     pgp_public_key: |
+#       -----BEGIN PGP PUBLIC KEY BLOCK-----
+#       ...
+#     require_encryption: false
+recipients: {}
+
+# Agents send through the API with tokens issued on the dashboard, which
+# refer to them by name: removing an agent here stops its tokens. Example:
+#   nightly-report:
+#     description: Nightly build summaries
+#     disabled: false
+#     # Overrides of defaults.policy.
+#     policy:
+#       recipients: [me]
+agents: {}

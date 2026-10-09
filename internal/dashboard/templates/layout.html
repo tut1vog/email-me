@@ -27,7 +27,6 @@
     <a class="nav-item" href="/settings" title="Settings" {{if eq .Section "settings"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-sliders"/></svg><span>Settings</span></a>
   </nav>
   <div class="sidebar-foot">
-    <a class="nav-item" href="/password" title="Password" {{if eq .Section "password"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-key"/></svg><span>Password</span></a>
     <form method="post" action="/logout">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button class="nav-item" type="submit" title="Log out"><svg class="icon" aria-hidden="true"><use href="#icon-log-out"/></svg><span>Log out</span></button>
@@ -48,9 +47,7 @@
 {{end}}
 {{range .Flash}}<div class="flash {{.Kind}}" role="status">{{if eq .Kind "ok"}}<svg class="icon" aria-hidden="true"><use href="#icon-check-circle"/></svg>{{else}}<svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg>{{end}}<div class="flash-text">{{.Message}}</div><button type="button" class="flash-close ghost icon-only sm" data-dismiss><svg class="icon" aria-hidden="true"><use href="#icon-x"/></svg><span class="visually-hidden">Dismiss</span></button></div>{{end}}
 {{if .LoggedIn}}
-{{with .LoadProblems}}<div class="banner danger" role="alert"><svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg><div><strong>The saved settings have problems.</strong> email-me is running with them as they are; fix them on the <a href="/settings">Settings</a> page.<ul>{{range .}}<li>{{.}}</li>{{end}}</ul></div></div>{{end}}
-{{if .ConfigChanged}}<div class="banner warn" id="restart-banner"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div><strong><code>config.yaml</code> changed on disk</strong> since email-me started. Restart to apply it. <a href="/settings#restart">What a restart does</a>.
-  <form method="post" action="/settings/restart" class="inline" data-confirm="Restart email-me now? Sends in flight finish first, and you will need to log in again."><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="sm">Restart now</button></form></div></div>{{end}}
+{{if .ConfigChanged}}<div class="banner warn" id="restart-banner"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div><strong><code>config.yaml</code> was edited</strong> since email-me started. Run <code>email-me restart</code> to apply the edit; until then, changes here are refused, since saving them would overwrite it.</div></div>{{end}}
 {{end}}
 {{template "content" .}}
 </main>

@@ -42,7 +42,7 @@ func (s *Server) apiBaseURL() string {
 // ---- overview -------------------------------------------------------------
 
 type agentStats struct {
-	Agent   *store.Agent
+	Agent   *config.Agent
 	Day     store.Counts
 	Week    store.Counts
 	Signing bool
@@ -90,17 +90,14 @@ func (s *Server) activeTokens(ctx context.Context, agentID string) (int, error) 
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	agents, err := s.Store.ListAgents(ctx)
-	if err != nil {
-		s.fail(w, "listing agents", err)
-		return
-	}
+	cfg := s.Config()
+	agents := cfg.AgentList()
 	tot := totals{Agents: len(agents)}
 	for _, a := range agents {
-		if a.Enabled {
+		if a.Enabled() {
 			tot.Enabled++
 		}
-		n, err := s.activeTokens(ctx, a.ID)
+		n, err := s.activeTokens(ctx, a.Name)
 		if err != nil {
 			s.fail(w, "listing tokens", err)
 			return
@@ -122,16 +119,15 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	addCounts(&tot.Week, week)
 	var rows []agentStats
 	for _, a := range agents {
-		row := agentStats{Agent: a, Signing: s.Recipients.Effective(a.Policy).RequireSigning}
-		if c := day[a.ID]; c != nil {
+		row := agentStats{Agent: a, Signing: cfg.Effective(a.Policy).RequireSigning}
+		if c := day[a.Name]; c != nil {
 			row.Day = *c
 		}
-		if c := week[a.ID]; c != nil {
+		if c := week[a.Name]; c != nil {
 			row.Week = *c
 		}
 		rows = append(rows, row)
 	}
-	cfg := s.Config()
 	notices, insecure, err := s.notices(ctx, cfg, agents)
 	if err != nil {
 		s.fail(w, "computing warnings", err)
@@ -145,7 +141,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, r, "overview", "Overview", map[string]any{
 		"FirstRun":     len(agents) == 0,
-		"NoRecipients": s.Recipients.Len() == 0,
+		"NoRecipients": len(cfg.Recipients) == 0,
 		"Rows":         rows,
 		"Totals":       tot,
 		"Notices":      notices,
@@ -157,23 +153,18 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 
 type insecureAgent struct {
 	Name           string
-	ID             string
 	RequireSigning bool
 }
 
 // notices is the Needs-attention list under cfg.
-func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*store.Agent) ([]notice, []insecureAgent, error) {
+func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*config.Agent) ([]notice, []insecureAgent, error) {
 	var out []notice
 	for _, w := range configWarnings(cfg) {
 		out = append(out, notice{Kind: "warn", Title: "Configuration", Text: w, Link: "/settings"})
 	}
-	for _, p := range s.Settings.LoadProblems() {
-		out = append(out, notice{Kind: "danger", Title: "Saved settings",
-			Text: p + ".", Link: "/settings"})
-	}
-	if s.configChanged() {
+	if s.Settings.Changed() {
 		out = append(out, notice{Kind: "warn", Title: "Restart to apply",
-			Text: "config.yaml changed on disk since email-me started. Restart to apply it.", Link: "/settings#restart"})
+			Text: "config.yaml was edited since email-me started. Run email-me restart to apply it; until then, changes here are refused.", Link: "/settings#bootstrap"})
 	}
 	if !upstreamConfigured(cfg) {
 		out = append(out, notice{Kind: "danger", Title: "Configure SMTP",
@@ -197,30 +188,22 @@ func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*stor
 	}
 	if cfg.KEK.Previous != nil {
 		out = append(out, notice{Kind: "info", Title: "Previous KEK",
-			Text: "kek.previous_file is still set. The keyring opens with kek.file, so remove the previous key and restart.",
+			Text: "The previous key-encryption key is still there. The keyring opens with kek.file, so delete it and run email-me restart.",
 			Link: "/settings#bootstrap"})
 	}
 	now := s.now()
-	if s.Recipients.Len() == 0 {
+	if len(cfg.Recipients) == 0 {
 		out = append(out, notice{Kind: "danger", Title: "No recipients",
 			Text: "Agents have nobody to email. Add a recipient, such as your own address.", Link: "/recipients/new"})
 	}
-	if u := s.Recipients.UnknownAliases(cfg.Defaults.Policy); len(u) > 0 {
+	if u := cfg.UnknownAliases(cfg.Defaults.Policy); len(u) > 0 {
 		out = append(out, notice{Kind: "warn", Title: "Default policy",
 			Text: "The default policy names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
 			Link: "/settings#policy"})
 	}
-	for _, rc := range s.Recipients.All() {
+	for _, rc := range cfg.RecipientList() {
 		title := "Recipient " + rc.Alias
 		link := "/recipients/" + rc.Alias
-		if rc.KeyErr != nil {
-			msg := "Its stored PGP key cannot be read: encrypted sends fail"
-			if rc.RequireEncryption {
-				msg += ", and it requires encryption, so nothing is delivered"
-			}
-			out = append(out, notice{Kind: "danger", Title: title, Text: msg + ". Replace or remove the key.", Link: link})
-			continue
-		}
 		if rc.Key == nil {
 			continue
 		}
@@ -236,20 +219,18 @@ func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*stor
 			out = append(out, notice{Kind: "warn", Title: title, Text: "PGP key expires on " + exp.Format("2006-01-02") + ".", Link: link})
 		}
 	}
-	byID := map[string]*store.Agent{}
 	for _, a := range agents {
-		byID[a.ID] = a
 		title := "Agent " + a.Name
-		if u := s.Recipients.UnknownAliases(a.Policy); len(u) > 0 {
+		if u := cfg.UnknownAliases(a.Policy); len(u) > 0 {
 			out = append(out, notice{Kind: "warn", Title: title,
 				Text: "Policy names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
-				Link: "/agents/" + a.ID + "/policy"})
+				Link: "/agents/" + a.Name + "/policy"})
 		}
 		if !s.Keys.Enabled() {
 			continue
 		}
-		signing := "/agents/" + a.ID + "/signing"
-		k, err := s.Keys.ActiveKey(ctx, a.ID)
+		signing := "/agents/" + a.Name + "/signing"
+		k, err := s.Keys.ActiveKey(ctx, a.Name)
 		switch {
 		case errors.Is(err, store.ErrNotFound) && cfg.Upstream.From == "":
 			out = append(out, notice{Kind: "warn", Title: title,
@@ -267,17 +248,27 @@ func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*stor
 				Text: fmt.Sprintf("Signing key expires on %s. Rotate it soon.", k.ExpiresAt.Format("2006-01-02")), Link: signing})
 		}
 	}
+	leftover, err := s.Store.AgentsWithData(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, name := range leftover {
+		if _, ok := cfg.Agent(name); !ok {
+			out = append(out, notice{Kind: "info", Title: "Agent " + name,
+				Text: "Not in config.yaml, but its tokens and signing keys are still stored. They are inert: adding the agent back to config.yaml revives them, and creating it here deletes them.",
+				Link: "/agents"})
+		}
+	}
 	slices.SortStableFunc(out, func(a, b notice) int { return noticeRank[a.Kind] - noticeRank[b.Kind] })
-	ids, err := s.Store.InsecureAgents(ctx, now.Add(-7*24*time.Hour))
+	names, err := s.Store.InsecureAgents(ctx, now.Add(-7*24*time.Hour))
 	if err != nil {
 		return nil, nil, err
 	}
 	var insecure []insecureAgent
-	for _, id := range ids {
-		ia := insecureAgent{ID: id, Name: id}
-		if a := byID[id]; a != nil {
-			ia.Name = a.Name
-			ia.RequireSigning = s.Recipients.Effective(a.Policy).RequireSigning
+	for _, name := range names {
+		ia := insecureAgent{Name: name}
+		if a, ok := cfg.Agent(name); ok {
+			ia.RequireSigning = cfg.Effective(a.Policy).RequireSigning
 		}
 		insecure = append(insecure, ia)
 	}
@@ -287,7 +278,7 @@ func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*stor
 // ---- agents ---------------------------------------------------------------
 
 type agentRow struct {
-	Agent        *store.Agent
+	Agent        *config.Agent
 	Effective    policy.Effective
 	ActiveTokens int
 	KeyFpr       string
@@ -295,20 +286,16 @@ type agentRow struct {
 
 func (s *Server) agents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	agents, err := s.Store.ListAgents(ctx)
-	if err != nil {
-		s.fail(w, "listing agents", err)
-		return
-	}
+	cfg := s.Config()
 	var rows []agentRow
-	for _, a := range agents {
-		n, err := s.activeTokens(ctx, a.ID)
+	for _, a := range cfg.AgentList() {
+		n, err := s.activeTokens(ctx, a.Name)
 		if err != nil {
 			s.fail(w, "listing tokens", err)
 			return
 		}
-		row := agentRow{Agent: a, Effective: s.Recipients.Effective(a.Policy), ActiveTokens: n}
-		if k, err := s.Store.ActiveKey(ctx, a.ID); err == nil {
+		row := agentRow{Agent: a, Effective: cfg.Effective(a.Policy), ActiveTokens: n}
+		if k, err := s.Store.ActiveKey(ctx, a.Name); err == nil {
 			row.KeyFpr = k.Fingerprint
 		}
 		rows = append(rows, row)
@@ -317,9 +304,10 @@ func (s *Server) agents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) newAgentPage(w http.ResponseWriter, r *http.Request) {
+	cfg := s.Config()
 	s.render(w, r, "agent_new", "New agent", map[string]any{
-		"Recipients": s.Recipients.All(),
-		"Defaults":   s.Config().DefaultPolicy,
+		"Recipients": cfg.RecipientList(),
+		"Defaults":   cfg.DefaultPolicy,
 	})
 }
 
@@ -334,7 +322,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	var p policy.Policy
 	if rcpts := r.PostForm["recipients"]; len(rcpts) > 0 {
 		for _, a := range rcpts {
-			if _, ok := s.Recipients.Get(a); !ok {
+			if _, ok := s.Config().Recipient(a); !ok {
 				s.flash(r, "error", "Unknown recipient alias %q.", a)
 				s.redirect(w, r, "/agents/new")
 				return
@@ -342,38 +330,66 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		p.Recipients = &rcpts
 	}
-	a, err := s.Store.CreateAgent(r.Context(), name, desc, p)
+	a := &config.Agent{Name: name, Description: desc, Policy: p}
+	var err error
+	if _, exists := s.Config().Agent(name); exists {
+		err = store.ErrConflict
+	} else {
+		// A new agent never inherits the tokens and keys of an earlier one
+		// of the same name that was removed from config.yaml by hand.
+		if err := s.Store.DeleteAgentData(r.Context(), name); err != nil {
+			s.fail(w, "deleting an earlier agent's tokens and keys", err)
+			return
+		}
+		_, err = s.Settings.PutAgent(r.Context(), a, true)
+	}
 	if errors.Is(err, store.ErrConflict) {
 		s.flash(r, "error", "An agent named %q already exists.", name)
 		s.redirect(w, r, "/agents/new")
 		return
 	}
-	if err != nil {
-		s.fail(w, "creating agent", err)
+	if s.changeFailed(w, r, err, "Agent", "/agents/new") {
 		return
 	}
 	if s.Keys.Enabled() {
-		if _, err := s.Keys.Create(r.Context(), a.ID, a.Name); err != nil {
+		if _, err := s.Keys.Create(r.Context(), a.Name); err != nil {
 			s.Log.Error("creating signing key", "agent", a.Name, "err", err)
 			s.flash(r, "error", "Agent created, but generating its signing key failed: %v", err)
 		}
 	}
 	s.Log.Info("agent created", "agent", a.Name)
 	s.flash(r, "ok", "Agent %s created. Issue a token to let it send.", a.Name)
-	s.redirect(w, r, "/agents/"+a.ID+"/tokens")
+	s.redirect(w, r, "/agents/"+a.Name+"/tokens")
 }
 
-func (s *Server) loadAgent(w http.ResponseWriter, r *http.Request) *store.Agent {
-	a, err := s.Store.GetAgent(r.Context(), r.PathValue("id"))
-	if errors.Is(err, store.ErrNotFound) {
+// loadAgent returns the agent named in the path, or nil after writing a 404.
+func (s *Server) loadAgent(w http.ResponseWriter, r *http.Request) *config.Agent {
+	a, ok := s.Config().Agent(r.PathValue("name"))
+	if !ok {
 		http.NotFound(w, r)
 		return nil
 	}
-	if err != nil {
-		s.fail(w, "loading agent", err)
-		return nil
-	}
 	return a
+}
+
+// changeFailed reports a configuration change that was refused, with the
+// reasons, and redirects to back; any other error is internal. It returns
+// false when err is nil.
+func (s *Server) changeFailed(w http.ResponseWriter, r *http.Request, err error, what, back string) bool {
+	var ve *config.ValidationError
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, settings.ErrFileChanged):
+		s.flash(r, "error", "%s not saved: %v.", what, err)
+	case errors.As(err, &ve):
+		s.flash(r, "error", "%s not saved: %s.", what, strings.Join(ve.Problems, "; "))
+	default:
+		s.fail(w, "saving "+strings.ToLower(what), err)
+		return true
+	}
+	s.redirect(w, r, back)
+	return true
 }
 
 type policyForm struct {
@@ -423,7 +439,7 @@ func formFromPolicy(p policy.Policy, eff policy.Effective) policyForm {
 // agentShell is what every agent tab needs: the agent, its tokens and keys,
 // and the data the shared header (chips and tab strip) renders.
 type agentShell struct {
-	Agent   *store.Agent
+	Agent   *config.Agent
 	Tokens  []*store.Token
 	Key     *store.AgentKey // active signing key, or nil
 	Retired []*store.AgentKey
@@ -454,12 +470,12 @@ func (s *Server) loadShell(w http.ResponseWriter, r *http.Request) *agentShell {
 		return nil
 	}
 	ctx := r.Context()
-	toks, err := s.Store.ListTokens(ctx, a.ID)
+	toks, err := s.Store.ListTokens(ctx, a.Name)
 	if err != nil {
 		s.fail(w, "listing tokens", err)
 		return nil
 	}
-	ks, err := s.Store.ListKeys(ctx, a.ID)
+	ks, err := s.Store.ListKeys(ctx, a.Name)
 	if err != nil {
 		s.fail(w, "listing keys", err)
 		return nil
@@ -481,7 +497,7 @@ func (s *Server) loadShell(w http.ResponseWriter, r *http.Request) *agentShell {
 	}
 	sh.Data = map[string]any{
 		"Agent":          a,
-		"Unknown":        s.Recipients.UnknownAliases(a.Policy),
+		"Unknown":        s.Config().UnknownAliases(a.Policy),
 		"SigningEnabled": s.Keys.Enabled(),
 		"ActiveTokens":   active,
 		"Key":            sh.Key,
@@ -505,7 +521,7 @@ func (s *Server) agentOverview(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, "loading stats", err)
 			return
 		}
-		if c := st[sh.Agent.ID]; c != nil {
+		if c := st[sh.Agent.Name]; c != nil {
 			counts[i] = *c
 		}
 	}
@@ -516,7 +532,7 @@ func (s *Server) agentOverview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sh.Data["Day"], sh.Data["Week"] = counts[0], counts[1]
-	sh.Data["Effective"] = s.Recipients.Effective(sh.Agent.Policy)
+	sh.Data["Effective"] = s.Config().Effective(sh.Agent.Policy)
 	sh.Data["LastUsed"] = last
 	s.render(w, r, "agent", sh.Agent.Name, sh.Data)
 }
@@ -544,11 +560,12 @@ func (s *Server) agentPolicy(w http.ResponseWriter, r *http.Request) {
 	if sh == nil {
 		return
 	}
-	eff := s.Recipients.Effective(sh.Agent.Policy)
+	cfg := s.Config()
+	eff := cfg.Effective(sh.Agent.Policy)
 	sh.Data["Form"] = formFromPolicy(sh.Agent.Policy, eff)
-	sh.Data["Defaults"] = s.Config().DefaultPolicy
+	sh.Data["Defaults"] = cfg.DefaultPolicy
 	sh.Data["Effective"] = eff
-	sh.Data["Recipients"] = s.Recipients.All()
+	sh.Data["Recipients"] = cfg.RecipientList()
 	sh.Data["AllServices"] = policy.AllServices
 	s.render(w, r, "agent_policy", sh.Agent.Name, sh.Data)
 }
@@ -571,15 +588,16 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	desc := strings.TrimSpace(r.PostForm.Get("description"))
-	enabled := r.PostForm.Get("enabled") == "on"
-	if err := s.Store.UpdateAgent(r.Context(), a.ID, desc, enabled); err != nil {
-		s.fail(w, "updating agent", err)
+	next := *a
+	next.Description = strings.TrimSpace(r.PostForm.Get("description"))
+	next.Disabled = r.PostForm.Get("enabled") != "on"
+	back := "/agents/" + a.Name
+	if _, err := s.Settings.PutAgent(r.Context(), &next, false); s.changeFailed(w, r, err, "Agent", back) {
 		return
 	}
-	s.Log.Info("agent updated", "agent", a.Name, "enabled", enabled)
+	s.Log.Info("agent updated", "agent", a.Name, "enabled", next.Enabled())
 	s.flash(r, "ok", "Agent saved.")
-	s.redirect(w, r, "/agents/"+a.ID)
+	s.redirect(w, r, back)
 }
 
 // parsePolicyForm turns the policy editor form into a partial policy.
@@ -666,26 +684,29 @@ func (s *Server) updatePolicy(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	back := "/agents/" + a.Name + "/policy"
+	cfg := s.Config()
 	p, errs := s.parsePolicyForm(r)
 	errs = append(errs, p.Validate()...)
-	if u := s.Recipients.UnknownAliases(p); len(u) > 0 {
+	if u := cfg.UnknownAliases(p); len(u) > 0 {
 		errs = append(errs, "Unknown recipient aliases: "+strings.Join(u, ", "))
 	}
 	if len(errs) == 0 {
-		errs = append(errs, s.Recipients.Effective(p).ValidateEffective(s.Keys.Enabled())...)
+		errs = append(errs, cfg.Effective(p).ValidateEffective(s.Keys.Enabled())...)
 	}
 	if len(errs) > 0 {
 		s.flash(r, "error", "Policy not saved: %s", strings.Join(errs, "; "))
-		s.redirect(w, r, "/agents/"+a.ID+"/policy")
+		s.redirect(w, r, back)
 		return
 	}
-	if err := s.Store.UpdateAgentPolicy(r.Context(), a.ID, p); err != nil {
-		s.fail(w, "saving policy", err)
+	next := *a
+	next.Policy = p
+	if _, err := s.Settings.PutAgent(r.Context(), &next, false); s.changeFailed(w, r, err, "Policy", back) {
 		return
 	}
 	s.Log.Info("agent policy updated", "agent", a.Name)
 	s.flash(r, "ok", "Policy saved.")
-	s.redirect(w, r, "/agents/"+a.ID+"/policy")
+	s.redirect(w, r, back)
 }
 
 func (s *Server) deleteAgentPage(w http.ResponseWriter, r *http.Request) {
@@ -693,7 +714,7 @@ func (s *Server) deleteAgentPage(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	ks, err := s.Store.ListKeys(r.Context(), a.ID)
+	ks, err := s.Store.ListKeys(r.Context(), a.Name)
 	if err != nil {
 		s.fail(w, "listing keys", err)
 		return
@@ -708,11 +729,10 @@ func (s *Server) deleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.PostForm.Get("confirm") != a.Name {
 		s.flash(r, "error", "Type the agent name to confirm deletion.")
-		s.redirect(w, r, "/agents/"+a.ID+"/delete")
+		s.redirect(w, r, "/agents/"+a.Name+"/delete")
 		return
 	}
-	if err := s.Store.DeleteAgent(r.Context(), a.ID); err != nil {
-		s.fail(w, "deleting agent", err)
+	if err := s.Settings.DeleteAgent(r.Context(), a.Name); s.changeFailed(w, r, err, "Deletion", "/agents/"+a.Name+"/delete") {
 		return
 	}
 	s.Log.Info("agent deleted", "agent", a.Name)
@@ -734,7 +754,7 @@ func (s *Server) issueToken(w http.ResponseWriter, r *http.Request) {
 		n, err := strconv.Atoi(d)
 		if err != nil || n < 1 || n > 3650 {
 			s.flash(r, "error", "Expiry must be a number of days between 1 and 3650, or empty for no expiry.")
-			s.redirect(w, r, "/agents/"+a.ID+"/tokens")
+			s.redirect(w, r, "/agents/"+a.Name+"/tokens")
 			return
 		}
 		t := s.now().Add(time.Duration(n) * 24 * time.Hour).UTC().Truncate(time.Second)
@@ -752,12 +772,12 @@ func (s *Server) issueToken(w http.ResponseWriter, r *http.Request) {
 			cidrs = append(cidrs, netip.PrefixFrom(ip, ip.BitLen()).String())
 		} else {
 			s.flash(r, "error", "%q is not an IP address or CIDR.", c)
-			s.redirect(w, r, "/agents/"+a.ID+"/tokens")
+			s.redirect(w, r, "/agents/"+a.Name+"/tokens")
 			return
 		}
 	}
 	token, id, hash := auth.NewToken()
-	t := &store.Token{ID: id, AgentID: a.ID, SecretHash: hash, Label: label, AllowedCIDRs: cidrs,
+	t := &store.Token{ID: id, Agent: a.Name, SecretHash: hash, Label: label, AllowedCIDRs: cidrs,
 		CreatedAt: s.now().UTC().Truncate(time.Second), ExpiresAt: expires}
 	if err := s.Store.CreateToken(r.Context(), t); err != nil {
 		s.fail(w, "creating token", err)
@@ -787,7 +807,7 @@ func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tid := r.PathValue("tid")
-	if err := s.Store.RevokeToken(r.Context(), a.ID, tid); errors.Is(err, store.ErrNotFound) {
+	if err := s.Store.RevokeToken(r.Context(), a.Name, tid); errors.Is(err, store.ErrNotFound) {
 		http.NotFound(w, r)
 		return
 	} else if err != nil {
@@ -796,7 +816,7 @@ func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Log.Info("token revoked", "agent", a.Name, "token_id", tid)
 	s.flash(r, "ok", "Token %s revoked.", tid)
-	s.redirect(w, r, "/agents/"+a.ID+"/tokens")
+	s.redirect(w, r, "/agents/"+a.Name+"/tokens")
 }
 
 // ---- keys -----------------------------------------------------------------
@@ -806,13 +826,13 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	if _, err := s.Keys.Create(r.Context(), a.ID, a.Name); err != nil {
+	if _, err := s.Keys.Create(r.Context(), a.Name); err != nil {
 		s.flash(r, "error", "Could not create signing key: %v", err)
 	} else {
 		s.Log.Info("signing key created", "agent", a.Name)
 		s.flash(r, "ok", "Signing key created. Download its public key and import it into your mail client.")
 	}
-	s.redirect(w, r, "/agents/"+a.ID+"/signing")
+	s.redirect(w, r, "/agents/"+a.Name+"/signing")
 }
 
 func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
@@ -820,23 +840,23 @@ func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	k, err := s.Keys.Rotate(r.Context(), a.ID, a.Name)
+	k, err := s.Keys.Rotate(r.Context(), a.Name)
 	if err != nil {
 		s.flash(r, "error", "Could not rotate signing key: %v", err)
 	} else {
 		s.Log.Info("signing key rotated", "agent", a.Name, "fingerprint", k.Fingerprint)
 		s.flash(r, "ok", "Signing key rotated. Import the new public key. If you distributed the old key, publish its retired-reason revocation certificate (under retired keys): signatures it already made stay valid.")
 	}
-	s.redirect(w, r, "/agents/"+a.ID+"/signing")
+	s.redirect(w, r, "/agents/"+a.Name+"/signing")
 }
 
-func (s *Server) agentKey(w http.ResponseWriter, r *http.Request) (*store.Agent, *store.AgentKey) {
+func (s *Server) agentKey(w http.ResponseWriter, r *http.Request) (*config.Agent, *store.AgentKey) {
 	a := s.loadAgent(w, r)
 	if a == nil {
 		return nil, nil
 	}
 	k, err := s.Store.GetKey(r.Context(), r.PathValue("fpr"))
-	if err != nil || k.AgentID != a.ID {
+	if err != nil || k.Agent != a.Name {
 		http.NotFound(w, r)
 		return nil, nil
 	}
@@ -892,20 +912,17 @@ func short16(fpr string) string {
 // ---- recipients -----------------------------------------------------------
 
 type recipientRow struct {
-	R         *recipients.Recipient
+	R         *config.Recipient
 	KeyFpr    string
 	KeyExpiry time.Time
 	KeyState  string // "" (no key), ok, expiring or expired
 }
 
 // recipientKeyState summarises a recipient's PGP key like keyState does for
-// signing keys: "" without a key, else damaged (unreadable), expired (or
-// revoked), expiring or ok.
-func recipientKeyState(rc *recipients.Recipient, now time.Time) string {
+// signing keys: "" without a key, else expired (or revoked), expiring or ok.
+func recipientKeyState(rc *config.Recipient, now time.Time) string {
 	exp := rc.KeyExpiry()
 	switch {
-	case rc.KeyErr != nil:
-		return "damaged"
 	case rc.Key == nil:
 		return ""
 	case !rc.KeyUsable(now):
@@ -917,7 +934,7 @@ func recipientKeyState(rc *recipients.Recipient, now time.Time) string {
 }
 
 // keyExpiryNote is appended to a flash when a just-saved key expires soon.
-func keyExpiryNote(rc *recipients.Recipient, now time.Time) string {
+func keyExpiryNote(rc *config.Recipient, now time.Time) string {
 	if recipientKeyState(rc, now) != "expiring" {
 		return ""
 	}
@@ -927,7 +944,7 @@ func keyExpiryNote(rc *recipients.Recipient, now time.Time) string {
 func (s *Server) recipients(w http.ResponseWriter, r *http.Request) {
 	now := s.now()
 	var rows []recipientRow
-	for _, rc := range s.Recipients.All() {
+	for _, rc := range s.Config().RecipientList() {
 		rows = append(rows, recipientRow{R: rc, KeyFpr: rc.Fingerprint(), KeyExpiry: rc.KeyExpiry(), KeyState: recipientKeyState(rc, now)})
 	}
 	s.render(w, r, "recipients", "Recipients", map[string]any{"Rows": rows})
@@ -935,13 +952,8 @@ func (s *Server) recipients(w http.ResponseWriter, r *http.Request) {
 
 // loadRecipient returns the recipient named in the path, or nil after
 // writing a 404.
-func (s *Server) loadRecipient(w http.ResponseWriter, r *http.Request) *recipients.Recipient {
-	alias := r.PathValue("alias")
-	if !config.AliasPattern.MatchString(alias) {
-		http.NotFound(w, r)
-		return nil
-	}
-	rc, ok := s.Recipients.Get(alias)
+func (s *Server) loadRecipient(w http.ResponseWriter, r *http.Request) *config.Recipient {
+	rc, ok := s.Config().Recipient(r.PathValue("alias"))
 	if !ok {
 		http.NotFound(w, r)
 		return nil
@@ -962,17 +974,26 @@ func (s *Server) createRecipient(w http.ResponseWriter, r *http.Request) {
 		PublicKeyArmor:    strings.TrimSpace(f.Get("pgp_public_key")),
 		RequireEncryption: f.Get("require_encryption") == "on",
 	}
-	rc, err := s.Recipients.Create(r.Context(), in)
+	rc, err := recipients.Validate(in, nil, s.now())
+	if err == nil {
+		_, err = s.Settings.PutRecipient(r.Context(), rc, true)
+	}
 	var ve *recipients.ValidationError
+	var cve *config.ValidationError
 	switch {
 	case errors.As(err, &ve):
 		s.flash(r, "error", "Recipient not saved: %s.", strings.Join(ve.Problems, "; "))
+	case errors.As(err, &cve):
+		s.flash(r, "error", "Recipient not saved: %s.", strings.Join(cve.Problems, "; "))
 	case errors.Is(err, store.ErrConflict):
 		s.flash(r, "error", "A recipient named %q already exists.", in.Alias)
+	case errors.Is(err, settings.ErrFileChanged):
+		s.flash(r, "error", "Recipient not saved: %v.", err)
 	case err != nil:
 		s.fail(w, "creating recipient", err)
 		return
 	default:
+		rc, _ = s.Config().Recipient(rc.Alias)
 		s.Log.Info("recipient created", "alias", rc.Alias, "key", rc.Fingerprint())
 		s.flash(r, "ok", "Recipient %s created. Grant it to agents in their policy.%s", rc.Alias, keyExpiryNote(rc, s.now()))
 		s.redirect(w, r, "/recipients/"+rc.Alias)
@@ -994,8 +1015,6 @@ func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
 		"KeyFpr":     rc.Fingerprint(),
 		"KeyExpiry":  exp,
 		"KeyUsable":  state == "ok" || state == "expiring",
-		"KeyDamaged": state == "damaged",
-		"KeyErr":     rc.KeyErr,
 		"KeyExpired": !exp.IsZero() && !now.Before(exp),
 		"Expiring":   state == "expiring",
 	})
@@ -1016,31 +1035,34 @@ func (s *Server) updateRecipient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in := recipients.Input{
+		Alias:             rc.Alias,
 		Address:           strings.TrimSpace(f.Get("address")),
 		Description:       strings.TrimSpace(f.Get("description")),
 		PublicKeyArmor:    armor,
 		KeepKey:           armor == "" && !remove,
 		RequireEncryption: f.Get("require_encryption") == "on",
 	}
-	updated, err := s.Recipients.Update(r.Context(), rc.Alias, in)
+	next, err := recipients.Validate(in, rc, s.now())
 	var ve *recipients.ValidationError
-	switch {
-	case errors.As(err, &ve):
+	if errors.As(err, &ve) {
 		s.flash(r, "error", "Recipient not saved: %s.", strings.Join(ve.Problems, "; "))
 		s.redirect(w, r, back)
 		return
-	case errors.Is(err, store.ErrNotFound):
+	}
+	_, err = s.Settings.PutRecipient(r.Context(), next, false)
+	if errors.Is(err, store.ErrNotFound) {
 		http.NotFound(w, r)
 		return
-	case err != nil:
-		s.fail(w, "updating recipient", err)
+	}
+	if s.changeFailed(w, r, err, "Recipient", back) {
 		return
 	}
+	updated, _ := s.Config().Recipient(rc.Alias)
 	msg := "Recipient saved."
 	switch {
 	case armor != "":
 		msg = "Recipient saved with the new PGP key." + keyExpiryNote(updated, s.now())
-	case remove && rc.PublicKey != "":
+	case remove && rc.PGPPublicKey != "":
 		msg = "Recipient saved; its PGP key was removed."
 	}
 	s.Log.Info("recipient updated", "alias", rc.Alias, "key", updated.Fingerprint())
@@ -1053,15 +1075,11 @@ func (s *Server) deleteRecipientPage(w http.ResponseWriter, r *http.Request) {
 	if rc == nil {
 		return
 	}
-	agents, err := s.Store.ListAgents(r.Context())
-	if err != nil {
-		s.fail(w, "listing agents", err)
-		return
-	}
+	cfg := s.Config()
 	s.render(w, r, "recipient_delete", "Delete "+rc.Alias, map[string]any{
 		"Recipient":  rc,
-		"Agents":     recipients.ReferencingAgents(agents, rc.Alias),
-		"InDefaults": slices.Contains(s.Config().DefaultPolicy.Recipients, rc.Alias),
+		"Agents":     cfg.ReferencingAgents(rc.Alias),
+		"InDefaults": slices.Contains(cfg.DefaultPolicy.Recipients, rc.Alias),
 	})
 }
 
@@ -1075,11 +1093,12 @@ func (s *Server) deleteRecipient(w http.ResponseWriter, r *http.Request) {
 		s.redirect(w, r, "/recipients/"+rc.Alias+"/delete")
 		return
 	}
-	if err := s.Recipients.Delete(r.Context(), rc.Alias); errors.Is(err, store.ErrNotFound) {
+	err := s.Settings.DeleteRecipient(r.Context(), rc.Alias)
+	if errors.Is(err, store.ErrNotFound) {
 		http.NotFound(w, r)
 		return
-	} else if err != nil {
-		s.fail(w, "deleting recipient", err)
+	}
+	if s.changeFailed(w, r, err, "Deletion", "/recipients/"+rc.Alias+"/delete") {
 		return
 	}
 	s.Log.Info("recipient deleted", "alias", rc.Alias)
@@ -1093,7 +1112,7 @@ const auditPageSize = 100
 
 func (s *Server) auditFilter(r *http.Request) (store.AuditFilter, string) {
 	q := r.URL.Query()
-	f := store.AuditFilter{AgentID: q.Get("agent"), Status: q.Get("status")}
+	f := store.AuditFilter{Agent: q.Get("agent"), Status: q.Get("status")}
 	if !slices.Contains([]string{"", store.StatusSent, store.StatusRejected, store.StatusFailed}, f.Status) {
 		f.Status = ""
 	}
@@ -1111,18 +1130,6 @@ func (s *Server) auditFilter(r *http.Request) (store.AuditFilter, string) {
 	return f, period
 }
 
-func (s *Server) agentNames(ctx context.Context) (map[string]string, []*store.Agent, error) {
-	agents, err := s.Store.ListAgents(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	names := map[string]string{}
-	for _, a := range agents {
-		names[a.ID] = a.Name
-	}
-	return names, agents, nil
-}
-
 func (s *Server) auditPage(w http.ResponseWriter, r *http.Request) {
 	f, period := s.auditFilter(r)
 	pg, _ := strconv.Atoi(r.URL.Query().Get("page"))
@@ -1137,13 +1144,8 @@ func (s *Server) auditPage(w http.ResponseWriter, r *http.Request) {
 	if more {
 		rows = rows[:auditPageSize]
 	}
-	names, agents, err := s.agentNames(r.Context())
-	if err != nil {
-		s.fail(w, "listing agents", err)
-		return
-	}
 	s.render(w, r, "audit", "Audit log", map[string]any{
-		"Rows": rows, "Names": names, "Agents": agents, "Filter": f, "Period": period,
+		"Rows": rows, "Agents": s.Config().AgentNames(), "Filter": f, "Period": period,
 		"Page": pg, "More": more, "LogSubject": s.Config().Audit.LogSubject,
 		"Query": r.URL.Query(),
 	})
@@ -1156,26 +1158,17 @@ func (s *Server) auditCSV(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "loading audit log", err)
 		return
 	}
-	names, _, err := s.agentNames(r.Context())
-	if err != nil {
-		s.fail(w, "listing agents", err)
-		return
-	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="email-me-audit.csv"`)
 	cw := csv.NewWriter(w)
 	cw.Write([]string{"time", "agent", "token_id", "source_ip", "recipients", "size_bytes", "attachments", "services",
 		"encrypted", "signed", "signing_key", "transport", "status", "error", "upstream_code", "message_id", "subject"})
 	for _, e := range rows {
-		agent := names[e.AgentID]
-		if agent == "" {
-			agent = e.AgentID
-		}
 		up := ""
 		if e.UpstreamCode != 0 {
 			up = strconv.Itoa(e.UpstreamCode)
 		}
-		cw.Write([]string{e.TS.Format(time.RFC3339), csvSafe(agent), e.TokenID, e.SourceIP, strings.Join(e.Recipients, " "),
+		cw.Write([]string{e.TS.Format(time.RFC3339), csvSafe(e.Agent), e.TokenID, e.SourceIP, strings.Join(e.Recipients, " "),
 			strconv.FormatInt(e.SizeBytes, 10), strconv.Itoa(e.AttachmentCount), strings.Join(e.Services, " "),
 			strconv.FormatBool(e.Encrypted), strconv.FormatBool(e.Signed), e.SigningKeyFpr, e.Transport, e.Status, e.ErrorCode,
 			up, e.MessageID, csvSafe(e.Subject)})

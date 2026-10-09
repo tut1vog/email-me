@@ -32,7 +32,7 @@ func (w *Writer) Record(ctx context.Context, e *store.AuditEntry) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := w.st.InsertAudit(ctx, e); err != nil {
-		w.log.Error("writing audit row", "err", err, "agent_id", e.AgentID, "status", e.Status)
+		w.log.Error("writing audit row", "err", err, "agent", e.Agent, "status", e.Status)
 	}
 }
 

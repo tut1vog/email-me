@@ -7,10 +7,9 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,7 +17,6 @@ import (
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/dashboard"
 	"github.com/tut1vog/email-me/internal/keys"
-	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
@@ -29,45 +27,11 @@ type dash struct {
 	t        *testing.T
 	env      *testutil.Env
 	st       *store.Store
-	reg      *recipients.Registry
 	settings *settings.Manager
 	keys     *keys.Manager
 	ts       *httptest.Server
 	c        *http.Client
-	restart  *fakeRestart
 	srv      *dashboard.Server
-	// configChanged stands in for config.yaml changing on disk.
-	configChanged *atomic.Bool
-}
-
-// fakeRestart stands in for the process restart: it counts requests and
-// fails them with err (config.yaml not loading) when set.
-type fakeRestart struct {
-	mu    sync.Mutex
-	calls int
-	err   error
-}
-
-func (f *fakeRestart) request() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.err != nil {
-		return f.err
-	}
-	f.calls++
-	return nil
-}
-
-func (f *fakeRestart) fail(err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.err = err
-}
-
-func (f *fakeRestart) count() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.calls
 }
 
 func newDash(t *testing.T, o testutil.Options) *dash {
@@ -76,34 +40,39 @@ func newDash(t *testing.T, o testutil.Options) *dash {
 }
 
 // newDashWith is newDash with a hook that can change the state database
-// before the settings are loaded from it.
+// before the settings manager opens it.
 func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *store.Store)) *dash {
 	t.Helper()
 	env := testutil.NewEnv(t, o)
-	cfg := env.Config
 	st := testutil.OpenStore(t, env)
 	if prepare != nil {
 		prepare(env, st)
 	}
-	sm := testutil.BootstrapSettings(t, env, st)
-	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg, testutil.DefaultPolicy(sm))
-	if err != nil {
-		t.Fatal(err)
-	}
+	sm := testutil.Settings(t, env, st)
 	km := testutil.Keys(t, env, st, sm)
-	rs := &fakeRestart{}
-	changed := &atomic.Bool{}
-	srv, err := dashboard.New(dashboard.Deps{Config: sm.Current, Store: st, Recipients: reg, Settings: sm, Keys: km,
+	srv, err := dashboard.New(dashboard.Deps{Store: st, Settings: sm, Keys: km,
 		Sender: upstream.NewDynamic(func() config.SMTP { return sm.Current().Upstream.SMTP }),
-		Log:    testutil.DiscardLogger(), Restart: rs.request, ConfigChanged: changed.Load})
+		Log:    testutil.DiscardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
+	d := &dash{t: t, env: env, st: st, settings: sm, keys: km, ts: ts, srv: srv}
+	d.c = newClient()
+	return d
+}
+
+func newClient() *http.Client {
 	jar, _ := cookiejar.New(nil)
-	c := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c, restart: rs, srv: srv, configChanged: changed}
+	return &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+// session returns d with a client of its own: another browser.
+func (d *dash) session() *dash {
+	cp := *d
+	cp.c = newClient()
+	return &cp
 }
 
 type page struct {
@@ -151,22 +120,10 @@ func (d *dash) csrf() string {
 	return m[1]
 }
 
-// loginForm adds the login page's CSRF token to form; the page also sets
-// the cookie the token must match.
-func (d *dash) loginForm(form url.Values) url.Values {
-	d.t.Helper()
-	m := csrfRe.FindStringSubmatch(d.get("/login").body)
-	if m == nil {
-		d.t.Fatal("no CSRF token on the login page")
-	}
-	form.Set("csrf", m[1])
-	return form
-}
-
+// login signs in with a fresh console link, as the operator does.
 func (d *dash) login() {
 	d.t.Helper()
-	p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}, "next": {"/"}}))
-	if p.status != http.StatusSeeOther {
+	if p := d.get("/login?token=" + d.srv.NewLink()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/" {
 		d.t.Fatalf("login: %d %s", p.status, p.body)
 	}
 }
@@ -179,9 +136,9 @@ func (d *dash) form(kv ...string) url.Values {
 	return v
 }
 
-var agentLocRe = regexp.MustCompile(`^/agents/(ag_[^/]+)`)
+var agentLocRe = regexp.MustCompile(`^/agents/([^/]+)/tokens$`)
 
-func (d *dash) createAgent(name string, recipients ...string) *store.Agent {
+func (d *dash) createAgent(name string, recipients ...string) *config.Agent {
 	d.t.Helper()
 	f := d.form("name", name, "description", "test agent")
 	for _, r := range recipients {
@@ -192,9 +149,15 @@ func (d *dash) createAgent(name string, recipients ...string) *store.Agent {
 	if p.status != http.StatusSeeOther || m == nil {
 		d.t.Fatalf("create agent: %d %s", p.status, p.header.Get("Location"))
 	}
-	a, err := d.st.GetAgent(context.Background(), m[1])
-	if err != nil {
-		d.t.Fatal(err)
+	return d.agent(m[1])
+}
+
+// agent returns the current configuration's agent, failing if there is none.
+func (d *dash) agent(name string) *config.Agent {
+	d.t.Helper()
+	a, ok := d.settings.Current().Agent(name)
+	if !ok {
+		d.t.Fatalf("no agent %s", name)
 	}
 	return a
 }
@@ -202,10 +165,13 @@ func (d *dash) createAgent(name string, recipients ...string) *store.Agent {
 func TestLoginRequiredAndHeaders(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	p := d.get("/agents")
-	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/login?next=%2Fagents" {
+	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/login" {
 		t.Fatalf("unauthenticated: %d %s", p.status, p.header.Get("Location"))
 	}
 	lp := d.get("/login")
+	if lp.status != http.StatusUnauthorized || !strings.Contains(lp.body, "email-me console") {
+		t.Fatalf("login page must say how to get a link: %d", lp.status)
+	}
 	for h, want := range map[string]string{"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin"} {
 		if lp.header.Get(h) != want {
 			t.Errorf("%s = %q", h, lp.header.Get(h))
@@ -220,26 +186,20 @@ func TestLoginRequiredAndHeaders(t *testing.T) {
 	if strings.Contains(lp.body, "<script>") || strings.Contains(lp.body, "onclick") {
 		t.Fatal("no inline scripts (CSP)")
 	}
+	if p := d.post("/agents", url.Values{"name": {"x"}}); p.status != http.StatusUnauthorized {
+		t.Fatalf("POST without a session: %d", p.status)
+	}
 }
 
-func TestLoginFlowAndThrottle(t *testing.T) {
+func TestConsoleLogin(t *testing.T) {
 	d := newDash(t, testutil.Options{})
-	// A frozen clock keeps the 1s lockout from expiring while argon2 runs
-	// slowly under -race load.
-	dashboard.FreezeThrottle(d.srv, time.Now())
-	for i := 0; i < 5; i++ {
-		if p := d.post("/login", d.loginForm(url.Values{"password": {"wrong"}})); p.status != http.StatusUnauthorized {
-			t.Fatalf("attempt %d: %d", i, p.status)
-		}
+	link := d.srv.NewLink()
+	if p := d.get("/login?token=wrong"); p.status != http.StatusUnauthorized || !strings.Contains(p.body, "already used") {
+		t.Fatalf("a wrong link: %d", p.status)
 	}
-	if p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}})); p.status != http.StatusTooManyRequests {
-		t.Fatalf("throttled login must be refused even with the right password: %d", p.status)
-	}
-
-	d2 := newDash(t, testutil.Options{})
-	p := d2.post("/login", d2.loginForm(url.Values{"password": {d2.env.AdminPW}, "next": {"//evil.example/"}}))
+	p := d.get("/login?token=" + link)
 	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/" {
-		t.Fatalf("open redirect: %s", p.header.Get("Location"))
+		t.Fatalf("a fresh link: %d %s", p.status, p.header.Get("Location"))
 	}
 	cookie := p.header.Get("Set-Cookie")
 	for _, want := range []string{"HttpOnly", "SameSite=Strict", "Path=/"} {
@@ -247,13 +207,31 @@ func TestLoginFlowAndThrottle(t *testing.T) {
 			t.Errorf("cookie lacks %s: %s", want, cookie)
 		}
 	}
-	home := d2.get("/")
+	home := d.get("/")
 	if home.status != 200 || !strings.Contains(home.body, "Create your first agent") {
 		t.Fatalf("first-run overview: %d", home.status)
 	}
-	d2.post("/logout", d2.form())
-	if p := d2.get("/"); p.status != http.StatusSeeOther {
+	// The link works once: another browser cannot reuse it.
+	other := d.session()
+	if p := other.get("/login?token=" + link); p.status != http.StatusUnauthorized {
+		t.Fatalf("a spent link: %d", p.status)
+	}
+	other.login()
+	d.post("/logout", d.form())
+	if p := d.get("/"); p.status != http.StatusSeeOther {
 		t.Fatal("logout must end the session")
+	}
+	if p := other.get("/"); p.status != 200 {
+		t.Fatal("logout ends only its own session")
+	}
+	// Closing the console ends every session and voids unspent links.
+	unspent := d.srv.NewLink()
+	d.srv.EndSessions()
+	if p := other.get("/"); p.status != http.StatusSeeOther {
+		t.Fatal("EndSessions must end every session")
+	}
+	if p := d.get("/login?token=" + unspent); p.status != http.StatusUnauthorized {
+		t.Fatal("EndSessions must void unspent links")
 	}
 }
 
@@ -270,8 +248,7 @@ func TestCSRFAndOrigin(t *testing.T) {
 	if p := d.post("/agents", d.form("name", "x"), evil); p.status != http.StatusForbidden {
 		t.Fatalf("cross-origin: %d", p.status)
 	}
-	agents, _ := d.st.ListAgents(context.Background())
-	if len(agents) != 0 {
+	if len(d.settings.Current().Agents) != 0 {
 		t.Fatal("no agent may be created by rejected requests")
 	}
 }
@@ -290,11 +267,11 @@ func TestAgentTokenAndKeyLifecycle(t *testing.T) {
 	if a.Policy.Recipients == nil || (*a.Policy.Recipients)[0] != "me" {
 		t.Fatalf("recipients not saved: %+v", a.Policy)
 	}
-	k1, err := d.st.ActiveKey(ctx, a.ID)
+	k1, err := d.st.ActiveKey(ctx, a.Name)
 	if err != nil {
 		t.Fatal("agent must get a signing key on creation")
 	}
-	ap := d.get("/agents/" + a.ID)
+	ap := d.get("/agents/" + a.Name)
 	if ap.status != 200 || !strings.Contains(ap.body, k1.Fingerprint) || !strings.Contains(ap.body, "Agent bench created") {
 		t.Fatalf("agent page: %d", ap.status)
 	}
@@ -303,7 +280,7 @@ func TestAgentTokenAndKeyLifecycle(t *testing.T) {
 	}
 
 	// Issue a token: shown once, and it authenticates.
-	tp := d.post("/agents/"+a.ID+"/tokens", d.form("label", "build-02", "expires_days", "30", "cidrs", "10.0.0.0/8, 192.168.1.5"))
+	tp := d.post("/agents/"+a.Name+"/tokens", d.form("label", "build-02", "expires_days", "30", "cidrs", "10.0.0.0/8, 192.168.1.5"))
 	tok := tokenRe.FindString(tp.body)
 	if tp.status != 200 || tok == "" || !strings.Contains(tp.body, "EMAIL_ME_TOKEN") || !strings.Contains(tp.body, "GET the base URL") {
 		t.Fatalf("token page: %d", tp.status)
@@ -314,36 +291,36 @@ func TestAgentTokenAndKeyLifecycle(t *testing.T) {
 		strings.Join(st.AllowedCIDRs, ",") != "10.0.0.0/8,192.168.1.5/32" {
 		t.Fatalf("stored token: %+v %v", st, err)
 	}
-	if strings.Contains(d.get("/agents/"+a.ID).body, secret) {
+	if strings.Contains(d.get("/agents/"+a.Name).body, secret) {
 		t.Fatal("token secret must never be shown again")
 	}
-	if p := d.post("/agents/"+a.ID+"/tokens", d.form("cidrs", "not-an-ip")); p.status != http.StatusSeeOther {
+	if p := d.post("/agents/"+a.Name+"/tokens", d.form("cidrs", "not-an-ip")); p.status != http.StatusSeeOther {
 		t.Fatal("bad CIDR must be rejected with a flash")
 	}
-	d.post("/agents/"+a.ID+"/tokens/"+id+"/revoke", d.form())
+	d.post("/agents/"+a.Name+"/tokens/"+id+"/revoke", d.form())
 	st, _ = d.st.GetToken(ctx, id)
 	if st.RevokedAt == nil {
 		t.Fatal("token must be revoked")
 	}
 
 	// Keys: download, rotate, revocation certificates.
-	pub := d.get("/agents/" + a.ID + "/keys/" + k1.Fingerprint + "/public.asc")
+	pub := d.get("/agents/" + a.Name + "/keys/" + k1.Fingerprint + "/public.asc")
 	if pub.status != 200 || !strings.Contains(pub.body, "BEGIN PGP PUBLIC KEY BLOCK") || strings.Contains(pub.body, "PRIVATE") ||
 		!strings.Contains(pub.header.Get("Content-Disposition"), "bench-") {
 		t.Fatalf("public key download: %d", pub.status)
 	}
-	d.post("/agents/"+a.ID+"/keys/rotate", d.form())
-	k2, _ := d.st.ActiveKey(ctx, a.ID)
+	d.post("/agents/"+a.Name+"/keys/rotate", d.form())
+	k2, _ := d.st.ActiveKey(ctx, a.Name)
 	if k2.Fingerprint == k1.Fingerprint {
 		t.Fatal("rotation must change the key")
 	}
 	for _, kind := range []string{"revocation.asc", "revocation-compromised.asc"} {
-		if rev := d.get("/agents/" + a.ID + "/keys/" + k1.Fingerprint + "/" + kind); rev.status != 200 || !strings.Contains(rev.body, "Revocation certificate") {
+		if rev := d.get("/agents/" + a.Name + "/keys/" + k1.Fingerprint + "/" + kind); rev.status != 200 || !strings.Contains(rev.body, "Revocation certificate") {
 			t.Fatalf("retired key %s: %d", kind, rev.status)
 		}
 	}
 	other := d.createAgent("other")
-	if p := d.get("/agents/" + other.ID + "/keys/" + k2.Fingerprint + "/public.asc"); p.status != 404 {
+	if p := d.get("/agents/" + other.Name + "/keys/" + k2.Fingerprint + "/public.asc"); p.status != 404 {
 		t.Fatal("keys must only be served under their own agent")
 	}
 	if b := d.get("/keys.asc"); strings.Count(b.body, "BEGIN PGP PUBLIC KEY BLOCK") != 3 {
@@ -351,21 +328,27 @@ func TestAgentTokenAndKeyLifecycle(t *testing.T) {
 	}
 
 	// Disable, then delete with confirmation.
-	d.post("/agents/"+a.ID, d.form("description", "renamed"))
-	a2, _ := d.st.GetAgent(ctx, a.ID)
-	if a2.Enabled || a2.Description != "renamed" {
+	d.post("/agents/"+a.Name, d.form("description", "renamed"))
+	if a2 := d.agent("bench"); a2.Enabled() || a2.Description != "renamed" {
 		t.Fatalf("update: %+v", a2)
 	}
-	if !strings.Contains(d.get("/agents/"+a.ID+"/delete").body, "revocation certificate") {
+	if !strings.Contains(d.get("/agents/"+a.Name+"/delete").body, "revocation certificate") {
 		t.Fatal("delete page must offer revocation certificates")
 	}
-	d.post("/agents/"+a.ID+"/delete", d.form("confirm", "wrong"))
-	if _, err := d.st.GetAgent(ctx, a.ID); err != nil {
-		t.Fatal("wrong confirmation must not delete")
-	}
-	d.post("/agents/"+a.ID+"/delete", d.form("confirm", "bench"))
-	if _, err := d.st.GetAgent(ctx, a.ID); err == nil {
+	d.post("/agents/"+a.Name+"/delete", d.form("confirm", "wrong"))
+	d.agent("bench") // wrong confirmation must not delete
+	d.post("/agents/"+a.Name+"/delete", d.form("confirm", "bench"))
+	if _, ok := d.settings.Current().Agent("bench"); ok {
 		t.Fatal("agent must be deleted")
+	}
+	if ks, _ := d.st.ListKeys(ctx, "bench"); len(ks) != 0 {
+		t.Fatal("its keys must be deleted")
+	}
+	if _, err := d.st.GetToken(ctx, id); err == nil {
+		t.Fatal("its tokens must be deleted")
+	}
+	if !strings.Contains(read(t, d.env.Path), "other:") || strings.Contains(read(t, d.env.Path), "bench:") {
+		t.Fatal("config.yaml must follow")
 	}
 }
 
@@ -374,30 +357,29 @@ func TestPolicyEditorEnforcesSigningRules(t *testing.T) {
 	d.login()
 	a := d.createAgent("vault", "me")
 	save := func(kv ...string) {
-		d.post("/agents/"+a.ID+"/policy", d.form(kv...))
+		d.post("/agents/"+a.Name+"/policy", d.form(kv...))
 	}
 	save("ov_services", "on", "services", "markdown", "services", "e2e", "require_signing", "inherit")
-	page := d.get("/agents/" + a.ID).body
+	page := d.get("/agents/" + a.Name).body
 	if !strings.Contains(page, "mutually exclusive") {
 		t.Fatal("require_signing (inherited true) + e2e must be refused with an explanation")
 	}
-	got, _ := d.st.GetAgent(context.Background(), a.ID)
-	if got.Policy.Services != nil {
+	if got := d.agent("vault"); got.Policy.Services != nil {
 		t.Fatal("refused policy must not be saved")
 	}
 	save("ov_recipients", "on", "recipients", "me", "ov_services", "on", "services", "e2e", "require_signing", "false",
 		"ov_rate", "on", "per_hour", "5", "per_day", "50", "ov_max_bytes", "on", "max_bytes", "2MiB")
-	got, _ = d.st.GetAgent(context.Background(), a.ID)
+	got := d.agent("vault")
 	if got.Policy.Services == nil || (*got.Policy.Services)[0] != "e2e" || got.Policy.RequireSigning == nil || *got.Policy.RequireSigning ||
 		got.Policy.RateLimit.PerHour != 5 || int64(*got.Policy.MaxMessageBytes) != 2<<20 {
 		t.Fatalf("policy not saved: %+v", got.Policy)
 	}
 	save("ov_recipients", "on", "recipients", "ghost", "require_signing", "false")
-	if !strings.Contains(d.get("/agents/"+a.ID).body, "Unknown recipient aliases: ghost") {
+	if !strings.Contains(d.get("/agents/"+a.Name).body, "Unknown recipient aliases: ghost") {
 		t.Fatal("unknown alias must be refused")
 	}
 	save("ov_rate", "on", "per_hour", "zero", "per_day", "1", "require_signing", "false")
-	if !strings.Contains(d.get("/agents/"+a.ID).body, "Rate limits must be numbers") {
+	if !strings.Contains(d.get("/agents/"+a.Name).body, "Rate limits must be numbers") {
 		t.Fatal("bad numbers must be refused")
 	}
 }
@@ -406,7 +388,7 @@ func TestOverviewWarnings(t *testing.T) {
 	d := newDash(t, testutil.Options{PublicURL: "http://gw.example.com:8025"})
 	d.login()
 	a := d.createAgent("bench", "me")
-	d.st.InsertAudit(context.Background(), &store.AuditEntry{AgentID: a.ID, Status: store.StatusSent, Transport: "insecure"})
+	d.st.InsertAudit(context.Background(), &store.AuditEntry{Agent: a.Name, Status: store.StatusSent, Transport: "insecure"})
 	body := d.get("/").body
 	for _, want := range []string{"Plain HTTP from a non-local network", "bench", "Signing is not configured", "plain HTTP on a non-localhost host"} {
 		if !strings.Contains(body, want) {
@@ -420,8 +402,8 @@ func TestAuditPageAndCSV(t *testing.T) {
 	d.login()
 	a := d.createAgent("bench", "me")
 	ctx := context.Background()
-	d.st.InsertAudit(ctx, &store.AuditEntry{AgentID: a.ID, TokenID: "tok", Status: store.StatusSent, Recipients: []string{"me"}, Transport: "local", Subject: "=cmd|' /C calc'!A0", TS: time.Now()})
-	d.st.InsertAudit(ctx, &store.AuditEntry{AgentID: a.ID, Status: store.StatusRejected, ErrorCode: "recipient_not_allowed", TS: time.Now()})
+	d.st.InsertAudit(ctx, &store.AuditEntry{Agent: a.Name, TokenID: "tok", Status: store.StatusSent, Recipients: []string{"me"}, Transport: "local", Subject: "=cmd|' /C calc'!A0", TS: time.Now()})
+	d.st.InsertAudit(ctx, &store.AuditEntry{Agent: a.Name, Status: store.StatusRejected, ErrorCode: "recipient_not_allowed", TS: time.Now()})
 	p := d.get("/audit?status=rejected")
 	if !strings.Contains(p.body, "recipient_not_allowed") || strings.Contains(p.body, "<span class=\"tag ok\">sent</span>") {
 		t.Fatal("status filter")
@@ -436,13 +418,10 @@ func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
 	s := d.get("/settings").body
-	for _, secret := range []string{d.env.SMTP.Pass, d.env.AdminPW, "$argon2id$"} {
+	for _, secret := range []string{d.env.SMTP.Pass} {
 		if strings.Contains(s, secret) {
 			t.Fatalf("settings page leaks a secret: %q", secret)
 		}
-	}
-	if strings.Contains(s, "Effective configuration") || strings.Contains(s, "admin_password") {
-		t.Fatal("the YAML dump and the admin password file are gone")
 	}
 	for _, want := range []string{`id="bootstrap"`, d.env.Config.KEK.File,
 		`name="password" type="password" autocomplete="new-password"`, "A password is stored, encrypted.", `value="gateway@example.com"`,
@@ -474,9 +453,10 @@ func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
 	}
 }
 
-func TestLoginRedirectTargets(t *testing.T) {
+func TestRedirectTargets(t *testing.T) {
 	d := newDash(t, testutil.Options{})
-	for next, want := range map[string]string{
+	d.login()
+	for back, want := range map[string]string{
 		"/agents?x=1":           "/agents?x=1",
 		"/\t/evil.example":      "/",
 		"/\\evil.example":       "/",
@@ -485,57 +465,10 @@ func TestLoginRedirectTargets(t *testing.T) {
 		"/%0a/evil.example":     "/%0a/evil.example", // percent-encoded stays a local path
 		"":                      "/",
 	} {
-		p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}, "next": {next}}))
+		p := d.post("/settings/test-smtp", d.form("back", back))
 		if got := p.header.Get("Location"); got != want {
-			t.Errorf("next=%q redirected to %q, want %q", next, got, want)
+			t.Errorf("back=%q redirected to %q, want %q", back, got, want)
 		}
-	}
-}
-
-func TestParallelGuessesAreThrottled(t *testing.T) {
-	d := newDash(t, testutil.Options{})
-	const n = 20
-	codes := make(chan int, n)
-	form := d.loginForm(url.Values{"password": {"wrong guess"}}).Encode()
-	for i := 0; i < n; i++ {
-		go func() {
-			req, _ := http.NewRequest("POST", d.ts.URL+"/login", strings.NewReader(form))
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			res, err := d.c.Do(req)
-			if err != nil {
-				codes <- 0
-				return
-			}
-			res.Body.Close()
-			codes <- res.StatusCode
-		}()
-	}
-	verified := 0
-	for i := 0; i < n; i++ {
-		if <-codes == http.StatusUnauthorized {
-			verified++
-		}
-	}
-	if verified > 5 {
-		t.Fatalf("%d parallel guesses reached the password check; the throttle allows 5", verified)
-	}
-}
-
-func TestLoginCSRF(t *testing.T) {
-	d := newDash(t, testutil.Options{})
-	// Without the token, or with a token but not the cookie it came with
-	// (a cross-site form cannot make the browser send that cookie), the
-	// password is never checked.
-	if p := d.post("/login", url.Values{"password": {d.env.AdminPW}}); p.status != http.StatusForbidden || !strings.Contains(p.body, "login form expired") {
-		t.Fatalf("login without a token: %d", p.status)
-	}
-	stranger := d.session()
-	form := d.loginForm(url.Values{"password": {d.env.AdminPW}})
-	if p := stranger.post("/login", form); p.status != http.StatusForbidden {
-		t.Fatalf("token without its cookie: %d", p.status)
-	}
-	if p := d.post("/login", form); p.status != http.StatusSeeOther {
-		t.Fatalf("token with its cookie: %d %s", p.status, p.body)
 	}
 }
 
@@ -543,14 +476,19 @@ func TestSessionCookieSecureBehindTLS(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	secure := func(proto string) bool {
 		t.Helper()
-		form := d.loginForm(url.Values{"password": {d.env.AdminPW}})
-		p := d.post("/login", form, func(r *http.Request) { r.Header.Set("X-Forwarded-Proto", proto) })
-		for _, c := range (&http.Response{Header: p.header}).Cookies() {
+		req, _ := http.NewRequest("GET", d.ts.URL+"/login?token="+d.srv.NewLink(), nil)
+		req.Header.Set("X-Forwarded-Proto", proto)
+		res, err := d.c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		for _, c := range res.Cookies() {
 			if c.Name == "email_me_session" {
 				return c.Secure
 			}
 		}
-		t.Fatalf("no session cookie: %d", p.status)
+		t.Fatalf("no session cookie: %d", res.StatusCode)
 		return false
 	}
 	if secure("http") {
@@ -561,44 +499,36 @@ func TestSessionCookieSecureBehindTLS(t *testing.T) {
 	}
 }
 
-func TestLoginRejectsMultipartAndHugeBodies(t *testing.T) {
+func TestRejectsMultipartAndHugeBodies(t *testing.T) {
 	d := newDash(t, testutil.Options{})
-	big := strings.NewReader("password=" + strings.Repeat("a", 200<<10))
-	req, _ := http.NewRequest("POST", d.ts.URL+"/login", big)
+	d.login()
+	csrf := d.csrf()
+	big := strings.NewReader("csrf=" + csrf + "&name=" + strings.Repeat("a", 200<<10))
+	req, _ := http.NewRequest("POST", d.ts.URL+"/agents", big)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	res, err := http.DefaultClient.Do(req)
+	res, err := d.c.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	res.Body.Close()
 	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("oversized login body: %d", res.StatusCode)
+		t.Fatalf("oversized body: %d", res.StatusCode)
 	}
-	mp := "--X\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n" + d.env.AdminPW + "\r\n--X--\r\n"
-	req, _ = http.NewRequest("POST", d.ts.URL+"/login", strings.NewReader(mp))
+	mp := "--X\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n" + csrf + "\r\n--X\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nmp\r\n--X--\r\n"
+	req, _ = http.NewRequest("POST", d.ts.URL+"/agents", strings.NewReader(mp))
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=X")
 	res, _ = d.c.Do(req)
 	res.Body.Close()
-	if res.StatusCode == http.StatusSeeOther {
-		t.Fatal("multipart login bodies must not be parsed")
+	if _, ok := d.settings.Current().Agent("mp"); ok || res.StatusCode == http.StatusSeeOther {
+		t.Fatal("multipart bodies must not be parsed")
 	}
 }
 
-func TestSharedHostHint(t *testing.T) {
-	d := newDash(t, testutil.Options{})
-	req, _ := http.NewRequest("GET", d.ts.URL+"/login", nil)
-	req.Host = "localhost:8026"
-	res, _ := http.DefaultClient.Do(req)
-	b, _ := io.ReadAll(res.Body)
-	res.Body.Close()
-	if !strings.Contains(string(b), "http://email-me.localhost:8026") {
-		t.Fatal("plain localhost should suggest a dedicated host name")
+func read(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
 	}
-	req.Host = "email-me.localhost:8026"
-	res, _ = http.DefaultClient.Do(req)
-	b, _ = io.ReadAll(res.Body)
-	res.Body.Close()
-	if strings.Contains(string(b), "Tip: open the dashboard") {
-		t.Fatal("no hint on a dedicated host name")
-	}
+	return string(b)
 }

@@ -1,5 +1,7 @@
-// Package store persists agents, tokens, signing keys and audit metadata in
-// SQLite. It never stores message content.
+// Package store persists what the gateway generates or must keep secret in
+// SQLite: tokens, signing keys, sealed credentials and audit metadata. Agents
+// and recipients live in config.yaml; rows name them. It never stores
+// message content.
 package store
 
 import (
@@ -113,4 +115,19 @@ func fromNullUnix(n sql.NullInt64) *time.Time {
 
 func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+func (s *Store) execOne(ctx context.Context, q string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

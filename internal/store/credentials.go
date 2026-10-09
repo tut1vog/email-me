@@ -76,7 +76,7 @@ func (s *Store) ResetKeyring(ctx context.Context) (Discarded, error) {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM keyring"); err != nil {
 		return d, err
 	}
-	res, err := tx.ExecContext(ctx, "UPDATE settings SET smtp_password = NULL, smtp_password_sealed = 0 WHERE smtp_password_sealed = 1")
+	res, err := tx.ExecContext(ctx, "DELETE FROM credentials WHERE smtp_password_sealed = 1")
 	if err != nil {
 		return d, err
 	}
@@ -93,40 +93,6 @@ func (s *Store) ResetKeyring(ctx context.Context) (Discarded, error) {
 	n, _ = res.RowsAffected()
 	d.AgentKeys = int(n)
 	return d, tx.Commit()
-}
-
-// Admin is the dashboard's admin password.
-type Admin struct {
-	PasswordHash string // argon2id PHC string
-	// MustChange marks a setup password: the next login must replace it.
-	MustChange bool
-	UpdatedAt  time.Time
-}
-
-// GetAdmin returns the admin password, or ErrNotFound before the first start.
-func (s *Store) GetAdmin(ctx context.Context) (*Admin, error) {
-	var a Admin
-	var must int
-	var updated int64
-	err := s.db.QueryRowContext(ctx, "SELECT password_hash, must_change, updated_at FROM admin WHERE id = 1").
-		Scan(&a.PasswordHash, &must, &updated)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	a.MustChange = must == 1
-	a.UpdatedAt = time.Unix(updated, 0).UTC()
-	return &a, nil
-}
-
-// SetAdmin stores the admin password hash.
-func (s *Store) SetAdmin(ctx context.Context, hash string, mustChange bool) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO admin (id, password_hash, must_change, updated_at) VALUES (1, ?, ?, ?)
-ON CONFLICT (id) DO UPDATE SET password_hash = excluded.password_hash, must_change = excluded.must_change, updated_at = excluded.updated_at`,
-		hash, b2i(mustChange), unix(time.Now()))
-	return err
 }
 
 // CertifyKey is the master key that certifies new agent keys.

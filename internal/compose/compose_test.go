@@ -21,7 +21,7 @@ func baseMessage() *Message {
 	return &Message{
 		FromName: "bench via email-me", FromAddr: "gateway@example.com",
 		To: []string{"me@example.com"}, Subject: "[bench] Results ✓", OuterSubject: "[bench] Encrypted message",
-		Agent: "bench", AgentID: "ag_1", TokenID: "tok1", MessageID: NewMessageID(),
+		Agent: "bench", TokenID: "tok1", MessageID: NewMessageID(),
 		Date: time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC), Text: "Hello\nworld",
 	}
 }
@@ -75,7 +75,7 @@ func TestPlainTextMessage(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, got, want)
 		}
 	}
-	root := "<" + ThreadRoot("ag_1", "nightly") + ">"
+	root := "<" + ThreadRoot("bench", "nightly") + ">"
 	if h.Get("In-Reply-To") != root || h.Get("References") != root {
 		t.Fatal("threading headers missing")
 	}
@@ -279,8 +279,8 @@ func TestEncryptedMessageHidesSubject(t *testing.T) {
 }
 
 func TestThreadRootDeterministic(t *testing.T) {
-	a := ThreadRoot("ag_1", "nightly")
-	if a != ThreadRoot("ag_1", "nightly") || a == ThreadRoot("ag_2", "nightly") || a == ThreadRoot("ag_1", "weekly") {
+	a := ThreadRoot("bench", "nightly")
+	if a != ThreadRoot("bench", "nightly") || a == ThreadRoot("other", "nightly") || a == ThreadRoot("bench", "weekly") {
 		t.Fatal("thread root must be deterministic per agent and key")
 	}
 	if !strings.HasSuffix(a, "@"+MessageIDDomain) || !strings.HasPrefix(a, "thread-") {

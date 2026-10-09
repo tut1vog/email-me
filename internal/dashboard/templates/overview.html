@@ -7,7 +7,7 @@
   <div>
     <strong>Plain HTTP from a non-local network in the last 7 days.</strong>
     <p>Tokens and message content crossed the network unencrypted for
-    {{range $i, $a := $d.Insecure}}{{if $i}}, {{end}}<a href="/agents/{{$a.ID}}">{{$a.Name}}</a>{{if $a.RequireSigning}} (signing required, so content was plaintext on this hop){{end}}{{end}}.</p>
+    {{range $i, $a := $d.Insecure}}{{if $i}}, {{end}}<a href="/agents/{{$a.Name}}">{{$a.Name}}</a>{{if $a.RequireSigning}} (signing required, so content was plaintext on this hop){{end}}{{end}}.</p>
     <details class="help">
       <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>How to fix</summary>
       <p>Use TLS (<code>api.tls</code> or a TLS reverse proxy with <code>trusted_proxies</code>), or an encrypted tunnel (Tailscale, WireGuard, SSH) with <code>api.external_transport_encryption: true</code>.</p>
@@ -97,7 +97,7 @@
     <tbody>
     {{range $d.Rows}}
       <tr{{if not .Agent.Enabled}} class="muted"{{end}}>
-        <td><a href="/agents/{{.Agent.ID}}">{{.Agent.Name}}</a>{{if not .Agent.Enabled}} <span class="tag">disabled</span>{{end}}</td>
+        <td><a href="/agents/{{.Agent.Name}}">{{.Agent.Name}}</a>{{if not .Agent.Enabled}} <span class="tag">disabled</span>{{end}}</td>
         <td class="num">{{.Day.Sent}}</td><td class="num">{{.Day.Rejected}}</td><td class="num{{if .Day.Failed}} bad{{end}}">{{.Day.Failed}}</td>
         <td class="num">{{.Week.Sent}}</td><td class="num">{{.Week.Rejected}}</td><td class="num{{if .Week.Failed}} bad{{end}}">{{.Week.Failed}}</td>
       </tr>

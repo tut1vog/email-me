@@ -20,22 +20,21 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
-	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
 
 type Deps struct {
-	// Config returns the current configuration. Saved settings replace it,
-	// so a handler reads it once and uses that snapshot throughout.
-	Config     func() *config.Config
-	Store      *store.Store
-	Recipients *recipients.Registry
-	Keys       *keys.Manager
-	Sender     upstream.Sender
-	Limiter    *ratelimit.Limiter
-	Audit      *audit.Writer
-	Log        *slog.Logger
+	// Config returns the current configuration. Saved changes replace it,
+	// so a request reads it once (caller.cfg) and uses that snapshot
+	// throughout.
+	Config  func() *config.Config
+	Store   *store.Store
+	Keys    *keys.Manager
+	Sender  upstream.Sender
+	Limiter *ratelimit.Limiter
+	Audit   *audit.Writer
+	Log     *slog.Logger
 }
 
 type Server struct {
@@ -53,18 +52,18 @@ type Server struct {
 const maxConcurrentSends = 4
 
 // acquireSend claims one of the agent's concurrent send slots.
-func (s *Server) acquireSend(agentID string) (release func(), ok bool) {
+func (s *Server) acquireSend(agent string) (release func(), ok bool) {
 	s.busyMu.Lock()
 	defer s.busyMu.Unlock()
-	if s.busy[agentID] >= maxConcurrentSends {
+	if s.busy[agent] >= maxConcurrentSends {
 		return nil, false
 	}
-	s.busy[agentID]++
+	s.busy[agent]++
 	return func() {
 		s.busyMu.Lock()
 		defer s.busyMu.Unlock()
-		if s.busy[agentID]--; s.busy[agentID] <= 0 {
-			delete(s.busy, agentID)
+		if s.busy[agent]--; s.busy[agent] <= 0 {
+			delete(s.busy, agent)
 		}
 	}, true
 }
@@ -107,8 +106,9 @@ const callerKey ctxKey = 0
 
 // caller is an authenticated agent request.
 type caller struct {
+	cfg       *config.Config // the configuration this request runs with
 	token     *store.Token
-	agent     *store.Agent
+	agent     *config.Agent
 	policy    policy.Effective
 	ip        netip.Addr
 	transport string
@@ -137,20 +137,22 @@ func (s *Server) authenticate(r *http.Request) (*caller, *apiError) {
 	if err != nil || !auth.SecretMatches(secret, t.SecretHash) || !t.Active(s.now()) {
 		return nil, unauthorized
 	}
-	a, err := s.Store.GetAgent(r.Context(), t.AgentID)
-	if err != nil {
+	// A token whose agent is no longer in config.yaml is inert.
+	cfg := s.Config()
+	a, ok := cfg.Agent(t.Agent)
+	if !ok {
 		return nil, unauthorized
 	}
-	n := newNetInfo(s.Config())
-	c := &caller{token: t, agent: a, ip: n.ClientIP(r), transport: n.Transport(r)}
-	if !a.Enabled {
+	n := newNetInfo(cfg)
+	c := &caller{cfg: cfg, token: t, agent: a, ip: n.ClientIP(r), transport: n.Transport(r)}
+	if !a.Enabled() {
 		return c, newErr(http.StatusForbidden, CodeAgentDisabled, "Agent %q is disabled by the operator. Stop sending and tell your operator.", a.Name)
 	}
 	if len(t.AllowedCIDRs) > 0 && !ipAllowed(c.ip, t.AllowedCIDRs) {
 		return c, newErr(http.StatusForbidden, CodeSourceIPNotAllowed,
 			"Requests with this token are not allowed from %s. Ask your operator to allow this address.", c.ip)
 	}
-	c.policy = s.Recipients.Effective(a.Policy)
+	c.policy = cfg.Effective(a.Policy)
 	if err := s.Store.TouchToken(r.Context(), t.ID, c.ip.String(), s.now()); err != nil {
 		s.Log.Warn("recording token use", "err", err, "token_id", t.ID)
 	}
@@ -175,7 +177,7 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 		if e != nil {
 			if c != nil && r.Method == http.MethodPost {
 				s.Audit.Record(r.Context(), &store.AuditEntry{
-					AgentID: c.agent.ID, TokenID: c.token.ID, SourceIP: c.ip.String(), Transport: c.transport,
+					Agent: c.agent.Name, TokenID: c.token.ID, SourceIP: c.ip.String(), Transport: c.transport,
 					Status: store.StatusRejected, ErrorCode: e.Code,
 				})
 			}
@@ -258,11 +260,11 @@ type capabilities struct {
 }
 
 // signingStatus reports whether the agent's active key can sign right now.
-func (s *Server) signingStatus(ctx context.Context, agentID string) (available bool, fpr string) {
+func (s *Server) signingStatus(ctx context.Context, agent string) (available bool, fpr string) {
 	if !s.Keys.Enabled() {
 		return false, ""
 	}
-	k, err := s.Keys.ActiveKey(ctx, agentID)
+	k, err := s.Keys.ActiveKey(ctx, agent)
 	if err != nil {
 		return false, ""
 	}
@@ -274,9 +276,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	p := c.policy
 	var rcpts []recipientCap
 	for _, alias := range p.Recipients {
-		rc, ok := s.Recipients.Get(alias)
+		rc, ok := c.cfg.Recipient(alias)
 		if !ok {
-			continue // deleted since the policy was resolved
+			continue // not reached: the policy was resolved against c.cfg
 		}
 		rcpts = append(rcpts, recipientCap{
 			Alias:               alias,
@@ -288,12 +290,12 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if rcpts == nil {
 		rcpts = []recipientCap{}
 	}
-	hour, day, err := s.Limiter.Remaining(r.Context(), c.agent.ID, p.RateLimit)
+	hour, day, err := s.Limiter.Remaining(r.Context(), c.agent.Name, p.RateLimit)
 	if err != nil {
 		s.internal(w, "computing rate limits", err)
 		return
 	}
-	avail, fpr := s.signingStatus(r.Context(), c.agent.ID)
+	avail, fpr := s.signingStatus(r.Context(), c.agent.Name)
 	hasSign := p.HasService(policy.SvcSign)
 	services := make([]string, 0, len(p.Services))
 	for _, svc := range policy.AllServices {
@@ -332,16 +334,11 @@ func (s *Server) handleRecipientKey(w http.ResponseWriter, r *http.Request) {
 			"Fetching recipient keys requires the e2e service, which this agent does not have.").with("service", policy.SvcE2E))
 		return
 	}
-	rc, ok := s.Recipients.Get(alias)
+	rc, ok := c.cfg.Recipient(alias)
 	if !ok || !c.policy.AllowsRecipient(alias) {
 		writeError(w, newErr(http.StatusForbidden, CodeRecipientNotAllow,
 			"Recipient alias %q is not permitted for this agent. Allowed: %s.", alias, strings.Join(c.policy.Recipients, ", ")).
 			with("allowed", nonNil(c.policy.Recipients)))
-		return
-	}
-	if rc.KeyErr != nil {
-		writeError(w, newErr(http.StatusServiceUnavailable, CodeEncryptionUnavail,
-			"Recipient %q's stored PGP key cannot be read. Tell your operator to replace it; do not retry.", alias))
 		return
 	}
 	if rc.Key == nil {
@@ -355,7 +352,7 @@ func (s *Server) handleRecipientKey(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/pgp-keys")
 	w.Header().Set("X-Email-Me-Key-Fingerprint", rc.Fingerprint())
-	w.Write([]byte(rc.PublicKey))
+	w.Write([]byte(rc.PGPPublicKey))
 }
 
 func (s *Server) internal(w http.ResponseWriter, what string, err error) {

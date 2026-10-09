@@ -30,17 +30,17 @@ func TestOverviewTiles(t *testing.T) {
 	ctx := context.Background()
 	a := d.createAgent("bench", "me")
 	b := d.createAgent("idle")
-	d.post("/agents/"+b.ID, d.form("description", "off")) // no "enabled" → disabled
-	if tp := d.post("/agents/"+a.ID+"/tokens", d.form("label", "ci")); tp.status != 200 {
+	d.post("/agents/"+b.Name, d.form("description", "off")) // no "enabled" → disabled
+	if tp := d.post("/agents/"+a.Name+"/tokens", d.form("label", "ci")); tp.status != 200 {
 		t.Fatalf("issue token: %d", tp.status)
 	}
 	now := time.Now()
 	for _, e := range []store.AuditEntry{
-		{AgentID: a.ID, Status: store.StatusSent, TS: now},
-		{AgentID: a.ID, Status: store.StatusSent, TS: now.Add(-time.Hour)},
-		{AgentID: a.ID, Status: store.StatusSent, TS: now.Add(-3 * 24 * time.Hour)}, // week only
-		{AgentID: a.ID, Status: store.StatusFailed, TS: now},
-		{AgentID: a.ID, Status: store.StatusRejected, TS: now},
+		{Agent: a.Name, Status: store.StatusSent, TS: now},
+		{Agent: a.Name, Status: store.StatusSent, TS: now.Add(-time.Hour)},
+		{Agent: a.Name, Status: store.StatusSent, TS: now.Add(-3 * 24 * time.Hour)}, // week only
+		{Agent: a.Name, Status: store.StatusFailed, TS: now},
+		{Agent: a.Name, Status: store.StatusRejected, TS: now},
 		{Status: store.StatusRejected, ErrorCode: "unauthorized", TS: now}, // no agent: still counted
 	} {
 		if err := d.st.InsertAudit(ctx, &e); err != nil {
@@ -99,7 +99,7 @@ func TestAuditColumnsAndAutosubmit(t *testing.T) {
 	a := d.createAgent("bench", "me")
 	fpr := strings.Repeat("AB", 20)
 	d.st.InsertAudit(context.Background(), &store.AuditEntry{
-		AgentID: a.ID, TokenID: "tk_one", SourceIP: "203.0.113.7", Recipients: []string{"me"}, SizeBytes: 2048,
+		Agent: a.Name, TokenID: "tk_one", SourceIP: "203.0.113.7", Recipients: []string{"me"}, SizeBytes: 2048,
 		AttachmentCount: 2, Services: []string{"markdown"}, Encrypted: true, Signed: true, SigningKeyFpr: fpr,
 		Transport: "insecure", Status: store.StatusSent, TS: time.Now(),
 	})
@@ -132,7 +132,7 @@ func TestPagesHaveNoInlineStyleOrScript(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true, PublicURL: "http://gw.example.com:8025"})
 	d.login()
 	a := d.createAgent("bench", "me")
-	d.st.InsertAudit(context.Background(), &store.AuditEntry{AgentID: a.ID, Status: store.StatusSent, Transport: "insecure", Signed: true, TS: time.Now()})
+	d.st.InsertAudit(context.Background(), &store.AuditEntry{Agent: a.Name, Status: store.StatusSent, Transport: "insecure", Signed: true, TS: time.Now()})
 	d.post("/settings/audit", d.form("retention_days", "60")) // a pending restart adds the banner
 	for _, path := range []string{"/", "/agents", "/audit", "/settings", "/recipients", "/recipients/new", "/recipients/me", "/recipients/ops", "/recipients/me/delete", "/settings/guide"} {
 		p := d.get(path)

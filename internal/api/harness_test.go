@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -46,13 +47,15 @@ type harness struct {
 	t        *testing.T
 	env      *testutil.Env
 	st       *store.Store
-	reg      *recipients.Registry
 	settings *settings.Manager
 	keys     *keys.Manager
 	ts       *httptest.Server
 	router   routers.Router
 	logs     *syncBuffer
 	srv      *api.Server
+	// unchecked are agents the API sees although validation would refuse
+	// them, to test the API's own guards.
+	unchecked map[string]*config.Agent
 }
 
 type syncBuffer struct {
@@ -88,18 +91,23 @@ func loadSpec(t testing.TB) *openapi3.T {
 func newHarness(t *testing.T, o testutil.Options) *harness {
 	t.Helper()
 	env := testutil.NewEnv(t, o)
-	cfg := env.Config
-	st := testutil.OpenStore(t, env)
-	sm := testutil.BootstrapSettings(t, env, st)
-	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg, testutil.DefaultPolicy(sm))
-	if err != nil {
-		t.Fatal(err)
+	st, sm := testutil.Bootstrap(t, env)
+	h := &harness{t: t, env: env, st: st, settings: sm, unchecked: map[string]*config.Agent{}}
+	current := func() *config.Config {
+		c := sm.Current()
+		if len(h.unchecked) == 0 {
+			return c
+		}
+		cp := *c
+		cp.Agents = maps.Clone(c.Agents)
+		maps.Copy(cp.Agents, h.unchecked)
+		return &cp
 	}
 	km := testutil.Keys(t, env, st, sm)
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := api.New(api.Deps{
-		Config: sm.Current, Store: st, Recipients: reg, Keys: km,
+		Config: current, Store: st, Keys: km,
 		Sender:  upstream.NewDynamic(func() config.SMTP { return sm.Current().Upstream.SMTP }),
 		Limiter: ratelimit.New(st), Audit: audit.NewWriter(st, func() bool { return sm.Current().Audit.LogSubject }, log), Log: log,
 	})
@@ -111,31 +119,62 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, router: router, logs: logs, srv: srv}
+	h.keys, h.ts, h.router, h.logs, h.srv = km, ts, router, logs, srv
+	return h
 }
 
 func ptr[T any](v T) *T { return &v }
 
 // agent creates an agent (with a signing key when signing is configured) and a token.
-func (h *harness) agent(name string, p policy.Policy) (*store.Agent, string) {
+func (h *harness) agent(name string, p policy.Policy) (*config.Agent, string) {
 	h.t.Helper()
-	ctx := context.Background()
-	a, err := h.st.CreateAgent(ctx, name, "", p)
-	if err != nil {
-		h.t.Fatal(err)
-	}
+	a := testutil.AddAgent(h.t, h.settings, name, p)
 	if h.keys.Enabled() {
-		if _, err := h.keys.Create(ctx, a.ID, a.Name); err != nil {
+		if _, err := h.keys.Create(context.Background(), a.Name); err != nil {
 			h.t.Fatal(err)
 		}
 	}
 	return a, h.token(a, nil, nil)
 }
 
-func (h *harness) token(a *store.Agent, cidrs []string, expires *time.Time) string {
+// uncheckedAgent adds an agent that validation would refuse, with a token.
+func (h *harness) uncheckedAgent(name string, p policy.Policy) string {
+	h.t.Helper()
+	a := &config.Agent{Name: name, Policy: p}
+	h.unchecked[name] = a
+	if h.keys.Enabled() {
+		if _, err := h.keys.Create(context.Background(), name); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+	return h.token(a, nil, nil)
+}
+
+// putAgent replaces an agent in the configuration, as the dashboard does.
+func (h *harness) putAgent(a *config.Agent) {
+	h.t.Helper()
+	if _, err := h.settings.PutAgent(context.Background(), a, false); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// putRecipient adds or replaces a recipient, as the dashboard does.
+func (h *harness) putRecipient(in recipients.Input, create bool) {
+	h.t.Helper()
+	cur, _ := h.settings.Current().Recipient(in.Alias)
+	r, err := recipients.Validate(in, cur, time.Now())
+	if err == nil {
+		_, err = h.settings.PutRecipient(context.Background(), r, create)
+	}
+	if err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *harness) token(a *config.Agent, cidrs []string, expires *time.Time) string {
 	h.t.Helper()
 	tok, id, hash := auth.NewToken()
-	if err := h.st.CreateToken(context.Background(), &store.Token{ID: id, AgentID: a.ID, SecretHash: hash, AllowedCIDRs: cidrs, CreatedAt: time.Now(), ExpiresAt: expires}); err != nil {
+	if err := h.st.CreateToken(context.Background(), &store.Token{ID: id, Agent: a.Name, SecretHash: hash, AllowedCIDRs: cidrs, CreatedAt: time.Now(), ExpiresAt: expires}); err != nil {
 		h.t.Fatal(err)
 	}
 	return tok
@@ -226,9 +265,9 @@ func (h *harness) validate(method, path string, reqBody []byte, r resp) {
 	}
 }
 
-func (h *harness) auditRows(agentID string) []*store.AuditEntry {
+func (h *harness) auditRows(agent string) []*store.AuditEntry {
 	h.t.Helper()
-	rows, err := h.st.ListAudit(context.Background(), store.AuditFilter{AgentID: agentID})
+	rows, err := h.st.ListAudit(context.Background(), store.AuditFilter{Agent: agent})
 	if err != nil {
 		h.t.Fatal(err)
 	}

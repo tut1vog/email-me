@@ -1,11 +1,13 @@
 // Package dashboard serves the operator's management UI: agents, tokens,
-// policies, signing keys, recipients, audit log and settings. It is the only management
-// interface; there is no management API or CLI.
+// policies, signing keys, recipients, audit log and settings. Agents,
+// recipients and settings are saved to config.yaml (through the settings
+// package), the rest to the state database. It is served only while
+// `email-me console` runs, which hands out one-time login links (NewLink);
+// closing the console ends every session (EndSessions).
 package dashboard
 
 import (
 	"context"
-	"crypto/subtle"
 	"embed"
 	"fmt"
 	"html/template"
@@ -18,12 +20,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tut1vog/email-me/internal/admin"
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/config"
-	"github.com/tut1vog/email-me/internal/ids"
 	"github.com/tut1vog/email-me/internal/keys"
-	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/units"
@@ -38,42 +37,28 @@ var staticFS embed.FS
 
 const (
 	sessionCookie = "email_me_session"
-	loginCookie   = "email_me_login" // the login form's CSRF token
 	maxFormBytes  = 64 << 10
 )
 
 type Deps struct {
-	// Config returns the current configuration. Saved settings replace it,
-	// so a handler reads it once and uses that snapshot throughout.
-	Config     func() *config.Config
-	Store      *store.Store
-	Recipients *recipients.Registry
-	Settings   *settings.Manager
-	Keys       *keys.Manager
-	Sender     upstream.Sender
-	Log        *slog.Logger
-	// Restart asks the process to restart, re-reading config.yaml. It
-	// returns an error, and nothing restarts, if config.yaml no longer loads.
-	Restart func() error
-	// ConfigChanged reports whether config.yaml changed on disk since this
-	// start, so a restart is needed to apply it. Nil means never.
-	ConfigChanged func() bool
+	Store *store.Store
+	// Settings serves the current configuration and saves changes to it.
+	// A handler reads the configuration once (Config) and uses that
+	// snapshot throughout.
+	Settings *settings.Manager
+	Keys     *keys.Manager
+	Sender   upstream.Sender
+	Log      *slog.Logger
 }
 
 type Server struct {
 	Deps
 	sessions *auth.Sessions
-	throttle *auth.LoginThrottle
 	pages    map[string]*template.Template
 	now      func() time.Time
-	// bootID identifies this start, so the restarting page can tell when
-	// the next one is up (GET /up).
-	bootID string
 
 	smtpMu    sync.Mutex
 	smtpCheck *smtpStatus
-
-	argonSlots chan struct{}
 }
 
 type smtpStatus struct {
@@ -86,15 +71,8 @@ func New(d Deps) (*Server, error) {
 	s := &Server{
 		Deps:     d,
 		sessions: auth.NewSessions(),
-		// Backoff is capped at a minute: brute force against a ≥12-character
-		// password is hopeless at that rate, and every local client shares
-		// one address behind Docker's NAT, so long lockouts would let any
-		// local process lock the operator out.
-		throttle:   auth.NewLoginThrottle(5, time.Minute),
-		argonSlots: make(chan struct{}, 2),
-		pages:      map[string]*template.Template{},
-		now:        time.Now,
-		bootID:     ids.Random(16),
+		pages:    map[string]*template.Template{},
+		now:      time.Now,
 	}
 	all, err := fs.Glob(templateFS, "templates/*.html")
 	if err != nil {
@@ -125,38 +103,45 @@ func New(d Deps) (*Server, error) {
 	return s, nil
 }
 
+// Config returns the current configuration.
+func (s *Server) Config() *config.Config { return s.Settings.Current() }
+
+// NewLink mints a one-time login link token for the console: GET
+// /login?token=... with it starts a session.
+func (s *Server) NewLink() string { return s.sessions.NewLink() }
+
+// EndSessions ends every session and voids every unspent link, when the
+// console closes.
+func (s *Server) EndSessions() { s.sessions.Clear() }
+
 // Handler returns the dashboard's HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	static, _ := fs.Sub(staticFS, "static")
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(static)))
-	mux.HandleFunc("GET /login", s.loginPage)
-	mux.HandleFunc("POST /login", s.login)
-	mux.HandleFunc("GET /up", s.up)
+	mux.HandleFunc("GET /login", s.login)
 
 	authed := func(pattern string, h http.HandlerFunc) { mux.Handle(pattern, s.requireSession(h)) }
 	authed("POST /logout", s.logout)
-	authed("GET /password", s.passwordPage)
-	authed("POST /password", s.changePassword)
 	authed("GET /{$}", s.overview)
 	authed("GET /agents", s.agents)
 	authed("GET /agents/new", s.newAgentPage)
 	authed("POST /agents", s.createAgent)
-	authed("GET /agents/{id}", s.agentOverview)
-	authed("GET /agents/{id}/tokens", s.agentTokens)
-	authed("GET /agents/{id}/policy", s.agentPolicy)
-	authed("GET /agents/{id}/signing", s.agentSigning)
-	authed("POST /agents/{id}", s.updateAgent)
-	authed("POST /agents/{id}/policy", s.updatePolicy)
-	authed("GET /agents/{id}/delete", s.deleteAgentPage)
-	authed("POST /agents/{id}/delete", s.deleteAgent)
-	authed("POST /agents/{id}/tokens", s.issueToken)
-	authed("POST /agents/{id}/tokens/{tid}/revoke", s.revokeToken)
-	authed("POST /agents/{id}/keys", s.createKey)
-	authed("POST /agents/{id}/keys/rotate", s.rotateKey)
-	authed("GET /agents/{id}/keys/{fpr}/public.asc", s.downloadPublicKey)
-	authed("GET /agents/{id}/keys/{fpr}/revocation.asc", s.downloadRevocation)
-	authed("GET /agents/{id}/keys/{fpr}/revocation-compromised.asc", s.downloadRevocationCompromised)
+	authed("GET /agents/{name}", s.agentOverview)
+	authed("GET /agents/{name}/tokens", s.agentTokens)
+	authed("GET /agents/{name}/policy", s.agentPolicy)
+	authed("GET /agents/{name}/signing", s.agentSigning)
+	authed("POST /agents/{name}", s.updateAgent)
+	authed("POST /agents/{name}/policy", s.updatePolicy)
+	authed("GET /agents/{name}/delete", s.deleteAgentPage)
+	authed("POST /agents/{name}/delete", s.deleteAgent)
+	authed("POST /agents/{name}/tokens", s.issueToken)
+	authed("POST /agents/{name}/tokens/{tid}/revoke", s.revokeToken)
+	authed("POST /agents/{name}/keys", s.createKey)
+	authed("POST /agents/{name}/keys/rotate", s.rotateKey)
+	authed("GET /agents/{name}/keys/{fpr}/public.asc", s.downloadPublicKey)
+	authed("GET /agents/{name}/keys/{fpr}/revocation.asc", s.downloadRevocation)
+	authed("GET /agents/{name}/keys/{fpr}/revocation-compromised.asc", s.downloadRevocationCompromised)
 	authed("GET /recipients", s.recipients)
 	authed("GET /recipients/new", s.newRecipientPage)
 	authed("POST /recipients", s.createRecipient)
@@ -170,13 +155,11 @@ func (s *Server) Handler() http.Handler {
 	authed("POST /settings/upstream", s.saveUpstream)
 	authed("POST /settings/api", s.saveAPI)
 	authed("POST /settings/policy", s.saveDefaultPolicy)
-	authed("POST /settings/dashboard", s.saveDashboard)
 	authed("POST /settings/audit", s.saveAudit)
 	authed("POST /settings/signing", s.saveSigning)
 	authed("POST /settings/certify-key", s.setCertifyKey)
 	authed("POST /settings/certify-key/remove", s.removeCertifyKey)
 	authed("POST /settings/test-smtp", s.testSMTP)
-	authed("POST /settings/restart", s.restart)
 	authed("POST /settings/test-send", s.testSend)
 	authed("GET /settings/guide", s.guidePreview)
 	authed("GET /keys.asc", s.keyBundle)
@@ -249,19 +232,10 @@ func (s *Server) requireSession(next http.HandlerFunc) http.Handler {
 		}
 		if sess == nil {
 			if r.Method == http.MethodGet {
-				http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
 				return
 			}
-			http.Error(w, "session expired; log in again", http.StatusUnauthorized)
-			return
-		}
-		// A setup password must be replaced before anything else.
-		if sess.MustChange() && r.URL.Path != "/password" && r.URL.Path != "/logout" {
-			if r.Method == http.MethodGet {
-				http.Redirect(w, r, "/password?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
-				return
-			}
-			http.Error(w, "choose a new admin password first", http.StatusForbidden)
+			http.Error(w, "signed out; run email-me console for a new login link", http.StatusUnauthorized)
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -278,42 +252,35 @@ func (s *Server) requireSession(next http.HandlerFunc) http.Handler {
 	})
 }
 
+// login spends a console login link: it starts a session and redirects to
+// the overview, so the token leaves the address bar at once. Without a
+// valid token it explains how to get one.
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	tok := r.URL.Query().Get("token")
+	if tok == "" {
+		s.renderStatus(w, r, http.StatusUnauthorized, "login", "Sign in", map[string]any{})
+		return
+	}
+	sess, ok := s.sessions.Redeem(tok)
+	if !ok {
+		s.renderStatus(w, r, http.StatusUnauthorized, "login", "Sign in", map[string]any{
+			"Error": "This login link was already used, or the console that made it was closed."})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: sess.ID, Path: "/", HttpOnly: true, Secure: secureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+	})
+	s.Log.Info("dashboard login", "ip", clientIP(r))
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
-	s.renderLogin(w, r, http.StatusOK, safeNext(r.URL.Query().Get("next")), "")
-}
-
-// renderLogin renders the login page. While the admin password is a setup
-// password, the page says where to find it.
-//
-// There is no session yet to hold a CSRF token, so each render issues one
-// in a SameSite=Strict cookie and in the form, and login compares the two:
-// another site can neither read the token nor make the browser send the
-// cookie, so it cannot log the browser in.
-func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int, next, errMsg string) {
-	tok := ids.Random(52)
-	http.SetCookie(w, &http.Cookie{
-		Name: loginCookie, Value: tok, Path: "/login", HttpOnly: true, Secure: secureRequest(r),
-		SameSite: http.SameSiteStrictMode,
-	})
-	s.renderStatus(w, r, status, "login", "Log in", map[string]any{
-		"Next": next, "Error": errMsg, "SharedHost": sharedHostHint(r.Host), "Setup": admin.Pending(r.Context(), s.Store),
-		"CSRF": tok,
-	})
-}
-
-// validLoginCSRF reports whether the login form's token matches its cookie.
-func validLoginCSRF(r *http.Request) bool {
-	c, err := r.Cookie(loginCookie)
-	tok := r.PostForm.Get("csrf")
-	return err == nil && tok != "" && subtle.ConstantTimeCompare([]byte(c.Value), []byte(tok)) == 1
 }
 
 // secureRequest reports whether the browser reached the dashboard over
@@ -325,99 +292,15 @@ func secureRequest(r *http.Request) bool {
 	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
-// sharedHostHint returns a dedicated-host URL suggestion when the dashboard
-// is opened as plain localhost/127.0.0.1. Browsers send cookies for a host to
-// every port on it, so a web server some local process runs on another port
-// of the same host would receive the session cookie. A dedicated name such as
-// email-me.localhost keeps the cookie away from other ports' hosts.
-func sharedHostHint(host string) string {
-	h, port, err := net.SplitHostPort(host)
-	if err != nil {
-		h, port = host, ""
-	}
-	if !config.IsLoopbackHost(h) {
-		return ""
-	}
-	u := "http://email-me.localhost"
-	if port != "" {
-		u += ":" + port
-	}
-	return u
-}
-
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
-	// ParseForm (not FormValue) so multipart bodies are never parsed or spilled to disk.
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	next := safeNext(r.PostForm.Get("next"))
-	if !validLoginCSRF(r) {
-		s.renderLogin(w, r, http.StatusForbidden, next, "The login form expired. Log in again.")
-		return
-	}
-	// Begin counts the attempt before the expensive password check, so
-	// parallel guesses cannot all slip past the throttle.
-	if ok, wait := s.throttle.Begin(ip); !ok {
-		s.renderLogin(w, r, http.StatusTooManyRequests, next, fmt.Sprintf("Too many failed attempts. Try again in %d seconds.", int(wait.Seconds())+1))
-		return
-	}
-	ok, mustChange, err := s.verifyPassword(r.Context(), r.PostForm.Get("password"))
-	if err != nil {
-		s.fail(w, "checking the admin password", err)
-		return
-	}
-	if !ok {
-		s.Log.Warn("dashboard login failed", "ip", ip)
-		s.renderLogin(w, r, http.StatusUnauthorized, next, "Wrong password.")
-		return
-	}
-	s.throttle.Success(ip)
-	// The current lifetime: a saved change applies to the next login, and
-	// sessions already open keep theirs.
-	ttl := s.Config().Dashboard.SessionTTL.D()
-	sess := s.sessions.Create(ttl)
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: sess.ID, Path: "/", HttpOnly: true, Secure: secureRequest(r),
-		SameSite: http.SameSiteStrictMode, MaxAge: int(ttl.Seconds()),
-	})
-	http.SetCookie(w, &http.Cookie{Name: loginCookie, Value: "", Path: "/login", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	s.Log.Info("dashboard login", "ip", ip, "setup_password", mustChange)
-	if mustChange {
-		sess.SetMustChange(true)
-		next = "/password?next=" + url.QueryEscape(next)
-	}
-	http.Redirect(w, r, next, http.StatusSeeOther)
-}
-
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	s.endSession(w, r)
+	s.sessions.Delete(sessionFrom(r).ID)
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-// endSession deletes the request's session and clears its cookie.
-func (s *Server) endSession(w http.ResponseWriter, r *http.Request) {
-	s.sessions.Delete(sessionFrom(r).ID)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
-}
-
-// verifyPassword checks the admin password, reporting whether it is a
-// setup password. It runs argon2id (64 MiB per check) under a small
-// semaphore so concurrent login attempts cannot exhaust memory.
-func (s *Server) verifyPassword(ctx context.Context, password string) (ok, mustChange bool, err error) {
-	select {
-	case s.argonSlots <- struct{}{}:
-		defer func() { <-s.argonSlots }()
-	case <-ctx.Done():
-		return false, false, ctx.Err()
-	}
-	return admin.Verify(ctx, s.Store, password)
-}
-
-// safeNext only allows local paths as post-login redirects: no scheme, no
-// host, no "//" or backslash tricks, and no control characters (browsers
-// strip tabs and newlines, turning "/\t/evil.com" into "//evil.com").
+// safeNext only allows local paths as redirects: no scheme, no host, no
+// "//" or backslash tricks, and no control characters (browsers strip tabs
+// and newlines, turning "/\t/evil.com" into "//evil.com").
 func safeNext(next string) string {
 	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
 		return "/"
@@ -443,10 +326,9 @@ type page struct {
 	LoggedIn bool
 	Data     any
 
-	// Whether config.yaml changed since this start (a restart applies it),
-	// and problems with the stored settings at boot. Logged in only.
+	// Whether config.yaml was edited since this start, which a restart
+	// applies. Logged in only.
 	ConfigChanged bool
-	LoadProblems  []string
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, name, title string, data any) {
@@ -460,15 +342,9 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request, status int
 		return
 	}
 	p := page{Title: title, Nav: name, Section: sectionOf(name), Data: data}
-	if sess := sessionFrom(r); sess != nil && sess.MustChange() {
-		// Only the Password page is reachable: show it like the login page.
-		p.CSRF, p.Flash = sess.CSRF, sess.PopFlash()
-	} else if sess != nil {
+	if sess := sessionFrom(r); sess != nil {
 		p.CSRF, p.Flash, p.LoggedIn = sess.CSRF, sess.PopFlash(), true
-		p.ConfigChanged = s.configChanged()
-		if s.Settings != nil {
-			p.LoadProblems = s.Settings.LoadProblems()
-		}
+		p.ConfigChanged = s.Settings.Changed()
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
@@ -490,14 +366,9 @@ func sectionOf(name string) string {
 		return "audit"
 	case "settings", "guide":
 		return "settings"
-	case "password":
-		return "password"
 	}
 	return ""
 }
-
-// configChanged reports whether config.yaml changed since this start.
-func (s *Server) configChanged() bool { return s.ConfigChanged != nil && s.ConfigChanged() }
 
 func (s *Server) flash(r *http.Request, kind, format string, args ...any) {
 	if sess := sessionFrom(r); sess != nil {

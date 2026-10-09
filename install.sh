@@ -122,9 +122,9 @@ main() {
 	$sudo mv -f "$dir/.email-me.new" "$target"
 
 	if [ -n "$current" ]; then
-		say "updated $target from $current to $version; restart email-me to run it"
+		say "updated $target from $current to $version; run email-me restart to run it"
 	else
-		say "installed $version at $target"
+		say "installed $version at $target; run email-me start"
 	fi
 	case :$PATH: in
 	*:"$dir":*) ;;

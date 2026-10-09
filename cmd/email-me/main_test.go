@@ -4,94 +4,166 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/tut1vog/email-me/internal/policy"
+	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/console"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
-// gateway is serve's loop running in the test process on ephemeral ports.
+// gateway is run in the test process on ephemeral ports.
 type gateway struct {
-	t         *testing.T
-	env       *testutil.Env
-	addrs     chan [2]string
-	hup       chan os.Signal
-	done      chan struct{}
-	err       error
-	api, dash string // base URLs of the current run
-	c         *http.Client
+	t      *testing.T
+	env    *testutil.Env
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error
+	api    string       // the API's base URL
+	opened chan string  // the dashboard's address, each time a console opens it
+	c      *http.Client // the operator's browser
+	dash   string       // the dashboard's base URL while a console is open
+	close  func()       // closes the console
+	closed <-chan error // the console's result
 }
 
+// startGateway runs the gateway on env, with the SMTP password an operator
+// would have entered.
 func startGateway(t *testing.T, env *testutil.Env) *gateway {
 	t.Helper()
 	testutil.SeedState(t, env)
 	return startFresh(t, env)
 }
 
-// startFresh starts serve on env's state database as it is: on a fresh
-// one, the admin has only a setup password and no SMTP password is set.
+// startFresh runs the gateway on env's state database as it is.
 func startFresh(t *testing.T, env *testutil.Env) *gateway {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	jar, _ := cookiejar.New(nil)
-	g := &gateway{t: t, env: env, addrs: make(chan [2]string, 4), hup: make(chan os.Signal, 1), done: make(chan struct{}),
+	g := &gateway{t: t, env: env, cancel: cancel, done: make(chan struct{}), opened: make(chan string, 4),
 		c: &http.Client{Jar: jar, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
-	hooks := runHooks{hup: g.hup, started: func(api, dash string) { g.addrs <- [2]string{api, dash} }}
+	started := make(chan string, 1)
 	go func() {
-		g.err = loop(ctx, env.Path, hooks)
-		close(g.done)
+		defer close(g.done)
+		g.err = run(ctx, options{config: env.Path, dataDir: env.DataDir,
+			started: func(api string) { started <- api }, consoleOpened: func(dash string) { g.opened <- dash }})
 	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-g.done:
-			if g.err != nil {
-				t.Errorf("serve: %v", g.err)
-			}
-		case <-time.After(30 * time.Second):
-			t.Error("serve did not stop")
-		}
-	})
-	g.waitStarted()
+	t.Cleanup(g.stop)
+	select {
+	case api := <-started:
+		g.api = "http://" + api
+	case <-g.done:
+		t.Fatalf("the gateway did not start: %v", g.err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the gateway did not start")
+	}
 	return g
 }
 
-// waitStarted waits for the next run's listeners.
-func (g *gateway) waitStarted() {
-	g.t.Helper()
+// stop stops the gateway as SIGTERM does and waits for it.
+func (g *gateway) stop() {
+	g.cancel()
 	select {
-	case a := <-g.addrs:
-		g.api, g.dash = "http://"+a[0], "http://"+a[1]
 	case <-g.done:
-		g.t.Fatalf("serve ended: %v", g.err)
 	case <-time.After(30 * time.Second):
-		g.t.Fatal("serve did not start")
+		g.t.Fatal("the gateway did not stop")
 	}
 }
 
-// noRestart checks that no new run starts for a while.
-func (g *gateway) noRestart() {
+var linkRe = regexp.MustCompile(`Dashboard: (http://\S+)`)
+
+// openConsole runs `email-me console` against the gateway and signs the
+// browser in with its link.
+func (g *gateway) openConsole() {
 	g.t.Helper()
-	select {
-	case <-g.addrs:
-		g.t.Fatal("the gateway restarted")
-	case <-g.done:
-		g.t.Fatalf("serve ended: %v", g.err)
-	case <-time.After(500 * time.Millisecond):
+	link := g.openConsoleOnly()
+	// The link names email-me.localhost; the test reaches it by address.
+	if status, _ := g.get(g.dash + link.RequestURI()); status != http.StatusSeeOther {
+		g.t.Fatalf("login link: %d", status)
 	}
+}
+
+// openConsoleOnly runs `email-me console` and returns its login link.
+func (g *gateway) openConsoleOnly() *url.URL {
+	g.t.Helper()
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := make(chan error, 1)
+	out := &syncBuilder{}
+	go func() { closed <- console.Attach(ctx, filepath.Join(g.env.DataDir, console.SocketName), pr, out) }()
+	var addr string
+	select {
+	case addr = <-g.opened:
+	case err := <-closed:
+		g.t.Fatalf("console: %v", err)
+	case <-time.After(10 * time.Second):
+		g.t.Fatal("the console did not open the dashboard")
+	}
+	g.dash, g.closed = "http://"+addr, closed
+	g.close = func() {
+		pw.Close()
+		cancel()
+	}
+	var link string
+	for deadline := time.Now().Add(5 * time.Second); link == "" && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if m := linkRe.FindStringSubmatch(out.String()); m != nil {
+			link = m[1]
+		}
+	}
+	u, err := url.Parse(link)
+	if err != nil || u.Hostname() != "email-me.localhost" || u.Path != "/login" || u.Port() != strings.Split(addr, ":")[1] {
+		g.t.Fatalf("login link %q: %v", link, err)
+	}
+	return u
+}
+
+// closeConsole ends the console as Ctrl-C does and waits for the
+// dashboard to close.
+func (g *gateway) closeConsole() {
+	g.t.Helper()
+	g.close()
+	if err := <-g.closed; err != nil {
+		g.t.Fatalf("console: %v", err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		c, err := net.Dial("tcp", strings.TrimPrefix(g.dash, "http://"))
+		if err != nil {
+			return
+		}
+		c.Close()
+		if time.Now().After(deadline) {
+			g.t.Fatal("the dashboard is still open")
+		}
+	}
+}
+
+// syncBuilder collects what a console prints while the test reads it.
+type syncBuilder struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuilder) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuilder) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 func (g *gateway) do(req *http.Request) (int, string) {
@@ -115,49 +187,18 @@ func (g *gateway) post(path string, form url.Values) (int, string) {
 	g.t.Helper()
 	req, _ := http.NewRequest("POST", g.dash+path, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", g.dash)
 	return g.do(req)
-}
-
-var loginCSRFRe = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
-
-// loginForm adds the login page's CSRF token to form; the page also sets
-// the cookie the token must match.
-func (g *gateway) loginForm(form url.Values) url.Values {
-	g.t.Helper()
-	_, body := g.get(g.dash + "/login")
-	m := loginCSRFRe.FindStringSubmatch(body)
-	if m == nil {
-		g.t.Fatal("no CSRF token on the login page")
-	}
-	form.Set("csrf", m[1])
-	return form
-}
-
-func (g *gateway) bootID() string {
-	g.t.Helper()
-	status, id := g.get(g.dash + "/up")
-	if status != http.StatusOK || id == "" {
-		g.t.Fatalf("GET /up: %d %q", status, id)
-	}
-	return id
-}
-
-func (g *gateway) login() {
-	g.t.Helper()
-	if status, _ := g.post("/login", g.loginForm(url.Values{"password": {g.env.AdminPW}, "next": {"/settings"}})); status != http.StatusSeeOther {
-		g.t.Fatalf("login: %d", status)
-	}
 }
 
 var csrfRe = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
 
-// form returns form values with the session's CSRF token.
 func (g *gateway) form(kv ...string) url.Values {
 	g.t.Helper()
 	_, body := g.get(g.dash + "/settings")
 	m := csrfRe.FindStringSubmatch(body)
 	if m == nil {
-		g.t.Fatal("no CSRF token: not logged in?")
+		g.t.Fatal("no CSRF token")
 	}
 	v := url.Values{"csrf": {m[1]}}
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -166,193 +207,132 @@ func (g *gateway) form(kv ...string) url.Values {
 	return v
 }
 
-func (g *gateway) session() string {
-	u, _ := url.Parse(g.dash)
-	for _, c := range g.c.Jar.Cookies(u) {
-		if c.Name == "email_me_session" {
-			return c.Value
-		}
-	}
-	return ""
-}
-
-func TestSettingsApplyWithoutRestart(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	g := startGateway(t, env)
-	boot := g.bootID()
-	if status, _ := g.get(g.api + "/"); status != http.StatusOK {
-		t.Fatalf("public guide: %d", status)
-	}
-	g.login()
-	if status, _ := g.post("/settings/api", g.form("docs", "authenticated")); status != http.StatusSeeOther {
-		t.Fatalf("saving api settings: %d", status)
-	}
-	if status, _ := g.get(g.api + "/"); status != http.StatusUnauthorized {
-		t.Fatalf("api.docs authenticated must apply at once: %d", status)
-	}
-
-	// The upstream server changes for the next send.
-	other := testutil.StartSMTP(t)
-	if status, _ := g.post("/settings/upstream", g.form("host", other.Host, "port", strconv.Itoa(other.Port), "security", "none",
-		"username", env.SMTP.User, "timeout", "5s", "from", "gateway@example.com")); status != http.StatusSeeOther {
-		t.Fatalf("saving upstream settings: %d", status)
-	}
-	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther {
-		t.Fatalf("test send: %d", status)
-	}
-	if other.Count() != 1 || env.SMTP.Count() != 0 {
-		t.Fatalf("test send: new server %d, old server %d", other.Count(), env.SMTP.Count())
-	}
-
-	g.noRestart()
-	if g.bootID() != boot {
-		t.Fatal("saving settings must not restart")
-	}
-	if status, body := g.get(g.dash + "/settings"); status != http.StatusOK || strings.Contains(body, `id="restart-banner"`) {
-		t.Fatalf("the session stays and no restart is asked for: %d", status)
-	}
-}
-
-func TestRestartForConfigFile(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	g := startGateway(t, env)
-	boot := g.bootID()
-	g.login()
-	if _, body := g.get(g.dash + "/settings"); strings.Contains(body, `id="restart-banner"`) {
-		t.Fatal("no banner while config.yaml is unchanged")
-	}
-	edit := func(comment string) {
-		t.Helper()
-		data, err := os.ReadFile(env.Path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(env.Path, append(data, "# "+comment+"\n"...), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	edit("edited")
-	if _, body := g.get(g.dash + "/agents"); !strings.Contains(body, `id="restart-banner"`) {
-		t.Fatal("a changed config.yaml must ask for a restart")
-	}
-	old := g.session()
-
-	status, body := g.post("/settings/restart", g.form())
-	if status != http.StatusOK || !strings.Contains(body, `data-boot="`+boot+`"`) {
-		t.Fatalf("restart: %d", status)
-	}
-	g.waitStarted()
-	if g.bootID() == boot {
-		t.Fatal("a restart must change the boot id")
-	}
-	req, _ := http.NewRequest("GET", g.dash+"/settings", nil)
-	req.AddCookie(&http.Cookie{Name: "email_me_session", Value: old})
-	res, err := (&http.Client{CheckRedirect: g.c.CheckRedirect}).Do(req)
+func read(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	res.Body.Close()
-	if res.StatusCode != http.StatusSeeOther || !strings.HasPrefix(res.Header.Get("Location"), "/login") {
-		t.Fatalf("sessions must not survive a restart: %d", res.StatusCode)
-	}
-	g.login()
-	if _, body := g.get(g.dash + "/settings"); strings.Contains(body, `id="restart-banner"`) || !strings.Contains(body, "config.yaml is unchanged since email-me started.") {
-		t.Fatal("the restart applied config.yaml: no banner")
-	}
-
-	// SIGHUP restarts the same way.
-	edit("edited again")
-	if _, body := g.get(g.dash + "/settings"); !strings.Contains(body, `id="restart-banner"`) {
-		t.Fatal("a changed config.yaml must ask for a restart")
-	}
-	boot = g.bootID()
-	g.hup <- syscall.SIGHUP
-	g.waitStarted()
-	if g.bootID() == boot {
-		t.Fatal("SIGHUP must restart")
-	}
-	g.login()
-	if _, body := g.get(g.dash + "/settings"); strings.Contains(body, `id="restart-banner"`) {
-		t.Fatal("SIGHUP applied config.yaml: no banner")
-	}
+	return string(b)
 }
 
-func TestRestartRefusedWhenConfigBroken(t *testing.T) {
+func TestConsoleOpensTheDashboard(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
 	g := startGateway(t, env)
-	boot := g.bootID()
-	g.login()
-	good := env.YAML
-	if err := os.WriteFile(env.Path, []byte(good+"bogus_key: true\n"), 0o600); err != nil {
-		t.Fatal(err)
+	if status, _ := g.get(g.api + "/healthz"); status != 200 {
+		t.Fatalf("the API runs without a console: %d", status)
 	}
 
-	status, _ := g.post("/settings/restart", g.form())
-	if status != http.StatusSeeOther {
-		t.Fatalf("refused restart: %d", status)
+	g.openConsole()
+	if status, body := g.get(g.dash + "/"); status != 200 || !strings.Contains(body, "Overview") {
+		t.Fatalf("signed in: %d", status)
 	}
-	_, body := g.get(g.dash + "/settings")
-	if !strings.Contains(body, "Not restarted: config.yaml no longer loads") || !strings.Contains(body, "bogus_key") {
-		t.Fatal("the refusal must say why, and keep the session")
-	}
-	g.hup <- syscall.SIGHUP
-	g.noRestart()
-	if g.bootID() != boot {
-		t.Fatal("the gateway must keep running")
+	// One console at a time.
+	if err := console.Attach(context.Background(), filepath.Join(env.DataDir, console.SocketName), nil, io.Discard); err == nil || !strings.Contains(err.Error(), "already open") {
+		t.Fatalf("a second console: %v", err)
 	}
 
-	if err := os.WriteFile(env.Path, []byte(good), 0o600); err != nil {
-		t.Fatal(err)
+	// Closing the console closes the dashboard and ends the session: the
+	// next console's dashboard needs its own link.
+	g.closeConsole()
+	link := g.openConsoleOnly()
+	if status, _ := g.get(g.dash + "/"); status != http.StatusSeeOther {
+		t.Fatalf("the old session must be gone: %d", status)
 	}
-	g.hup <- syscall.SIGHUP
-	g.waitStarted()
-	if g.bootID() == boot {
-		t.Fatal("SIGHUP must restart once config.yaml loads again")
+	if status, _ := g.get(g.dash + link.RequestURI()); status != http.StatusSeeOther {
+		t.Fatal("the new link signs in")
+	}
+	if status, _ := g.get(g.dash + "/"); status != 200 {
+		t.Fatal("signed in again")
+	}
+	g.closeConsole()
+
+	// A console whose gateway stops is told so.
+	g.openConsole()
+	g.stop()
+	if err := <-g.closed; err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("the console of a stopped gateway: %v", err)
+	}
+	if g.err != nil {
+		t.Fatalf("a clean stop: %v", g.err)
 	}
 }
 
-func TestFirstStartAndResetAdminPassword(t *testing.T) {
+func TestChangesApplyAtOnceAndLandInConfigFile(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
-	g := startFresh(t, env)
-	if status, _ := g.post("/login", g.loginForm(url.Values{"password": {env.AdminPW}})); status != http.StatusUnauthorized {
-		t.Fatal("a fresh install has only a setup password")
+	g := startGateway(t, env)
+	g.openConsole()
+	if status, _ := g.get(g.api + "/"); status != 200 {
+		t.Fatalf("docs are public: %d", status)
 	}
-	if _, body := g.get(g.dash + "/login"); !strings.Contains(body, "one-time setup password") {
-		t.Fatal("the login page says where the setup password is")
+	if status, _ := g.post("/settings/api", g.form("docs", "authenticated")); status != http.StatusSeeOther {
+		t.Fatalf("save: %d", status)
 	}
-
-	// The recovery command works on the running gateway's database.
-	var out strings.Builder
-	if err := resetAdminPassword(env.Path, &out); err != nil {
+	if status, _ := g.get(g.api + "/"); status != http.StatusUnauthorized {
+		t.Fatalf("a saved setting applies to the next request: %d", status)
+	}
+	if status, _ := g.post("/agents", g.form("name", "bench", "recipients", "me")); status != http.StatusSeeOther {
+		t.Fatalf("creating an agent: %d", status)
+	}
+	c, err := config.Load(env.Path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`Setup password: (\S+)`).FindStringSubmatch(out.String())
-	if m == nil {
-		t.Fatalf("output: %s", out.String())
+	if a, ok := c.Agent("bench"); c.API.Docs != "authenticated" || !ok || (*a.Policy.Recipients)[0] != "me" {
+		t.Fatalf("config.yaml holds the changes:\n%s", read(t, env.Path))
 	}
-	status, _ := g.post("/login", g.loginForm(url.Values{"password": {m[1]}, "next": {"/settings"}}))
-	if status != http.StatusSeeOther {
-		t.Fatalf("setup login: %d", status)
+
+	// The configuration survives the state database: a fresh one starts
+	// with the same agents and settings.
+	g.stop()
+	if err := os.RemoveAll(env.DataDir); err != nil {
+		t.Fatal(err)
 	}
-	_, body := g.get(g.dash + "/password")
-	tok := csrfRe.FindStringSubmatch(body)
-	if tok == nil {
-		t.Fatal("no CSRF token on the Password page")
+	os.MkdirAll(env.DataDir, 0o700)
+	g = startFresh(t, env)
+	g.openConsole()
+	if _, body := g.get(g.dash + "/agents"); !strings.Contains(body, "bench") {
+		t.Fatal("the agent survives losing state.db")
 	}
-	if status, _ := g.post("/password", url.Values{"csrf": {tok[1]}, "password": {env.AdminPW}, "confirm": {env.AdminPW}, "next": {"/settings"}}); status != http.StatusSeeOther {
-		t.Fatalf("choosing a password: %d", status)
+	if status, _ := g.get(g.api + "/"); status != http.StatusUnauthorized {
+		t.Fatal("so do the settings")
 	}
-	// Seeded upstream, but no password: the operator enters it.
-	_, body = g.get(g.dash + "/")
-	if !strings.Contains(body, "username but no password") {
-		t.Fatal("a seeded username without a password needs attention")
+}
+
+func TestHandEditAppliesOnRestart(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	g := startGateway(t, env)
+	g.openConsole()
+	if _, body := g.get(g.dash + "/agents"); strings.Contains(body, `id="restart-banner"`) {
+		t.Fatal("no banner while config.yaml is unchanged")
 	}
-	if status, _ := g.post("/settings/upstream", g.form("host", env.SMTP.Host, "port", strconv.Itoa(env.SMTP.Port), "security", "none",
-		"username", env.SMTP.User, "password", env.SMTP.Pass, "timeout", "5s", "from", "gateway@example.com")); status != http.StatusSeeOther {
-		t.Fatalf("saving the SMTP password: %d", status)
+	edited := strings.Replace(read(t, env.Path), "  docs: public\n", "  docs: authenticated\n", 1)
+	os.WriteFile(env.Path, []byte(edited), 0o600)
+	if _, body := g.get(g.dash + "/agents"); !strings.Contains(body, `id="restart-banner"`) {
+		t.Fatal("a hand edit raises the banner")
 	}
-	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 1 {
-		t.Fatalf("test send: %d, %d messages", status, env.SMTP.Count())
+	if status, _ := g.get(g.api + "/"); status != 200 {
+		t.Fatal("a hand edit is not applied before a restart")
+	}
+	if status, body := g.post("/settings/audit", g.form("retention_days", "7")); status != http.StatusUnprocessableEntity || !strings.Contains(body, "email-me restart") {
+		t.Fatalf("saves are refused meanwhile: %d", status)
+	}
+	g.stop()
+	g = startFresh(t, env)
+	if status, _ := g.get(g.api + "/"); status != http.StatusUnauthorized {
+		t.Fatal("the restart applies the edit")
+	}
+	if read(t, env.Path) != edited {
+		t.Fatal("the edit is kept as written")
+	}
+}
+
+func TestBrokenConfigIsFatal(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	os.WriteFile(env.Path, []byte(env.YAML+"agents:\n  Bad_Name: {}\n"), 0o600)
+	err := run(context.Background(), options{config: env.Path, dataDir: env.DataDir})
+	if err == nil || !strings.Contains(err.Error(), `agents: name "Bad_Name"`) {
+		t.Fatalf("a broken config.yaml must be fatal: %v", err)
 	}
 }
 
@@ -371,59 +351,37 @@ func writeKEK(t *testing.T, env *testutil.Env, name string) []byte {
 func TestKEKRotation(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{Signing: true})
 	g := startGateway(t, env)
-	g.login()
+	g.openConsole()
 	if status, _ := g.post("/agents", g.form("name", "bench")); status != http.StatusSeeOther {
 		t.Fatalf("creating an agent: %d", status)
 	}
-	kekPath := filepath.Join(env.Dir, "kek")
-	old, err := os.ReadFile(kekPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	g.stop()
+	old := read(t, filepath.Join(env.Dir, "kek"))
 
-	// A new KEK alone does not open the keyring: the restart is refused.
+	// A new KEK alone does not open the keyring.
 	writeKEK(t, env, "kek")
-	boot := g.bootID()
-	g.hup <- syscall.SIGHUP
-	g.noRestart()
-	if g.bootID() != boot {
-		t.Fatal("the gateway must keep running")
-	}
-	status, _ := g.post("/settings/restart", g.form())
-	if _, body := g.get(g.dash + "/settings"); status != http.StatusSeeOther || !strings.Contains(body, "does not open the state database") {
-		t.Fatal("the dashboard refuses the restart and says why")
+	if err := run(context.Background(), options{config: env.Path, dataDir: env.DataDir}); err == nil || !strings.Contains(err.Error(), "does not open the state database") {
+		t.Fatalf("a wrong KEK must be fatal: %v", err)
 	}
 
-	// With the previous KEK alongside, the restart rewraps the keyring.
-	if err := os.WriteFile(filepath.Join(env.Dir, "previous_kek"), old, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	withPrevious := strings.Replace(env.YAML, "kek:\n", fmt.Sprintf("kek:\n  previous_file: %q\n", filepath.Join(env.Dir, "previous_kek")), 1)
-	if err := os.WriteFile(env.Path, []byte(withPrevious), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	g.hup <- syscall.SIGHUP
-	g.waitStarted()
-	g.login()
-	if _, body := g.get(g.dash + "/"); !strings.Contains(body, "kek.previous_file is still set") {
-		t.Fatal("the overview asks to remove the previous KEK")
+	// With the previous KEK beside it, the start rewraps the keyring.
+	os.WriteFile(filepath.Join(env.Dir, "previous_kek"), []byte(old), 0o600)
+	g = startFresh(t, env)
+	g.openConsole()
+	if _, body := g.get(g.dash + "/"); !strings.Contains(body, "previous key-encryption key is still there") {
+		t.Fatal("the overview asks to delete the previous KEK")
 	}
 	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 1 {
 		t.Fatal("the SMTP password still decrypts")
 	}
+	g.stop()
 
 	// The next start needs only the new KEK; the agent's key still opens
-	// (serve checks every key at start).
-	if err := os.WriteFile(env.Path, []byte(env.YAML), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(env.Dir, "previous_kek")); err != nil {
-		t.Fatal(err)
-	}
-	g.hup <- syscall.SIGHUP
-	g.waitStarted()
-	g.login()
-	if _, body := g.get(g.dash + "/"); strings.Contains(body, "kek.previous_file is still set") {
+	// (run checks every key at start).
+	os.Remove(filepath.Join(env.Dir, "previous_kek"))
+	g = startFresh(t, env)
+	g.openConsole()
+	if _, body := g.get(g.dash + "/"); strings.Contains(body, "previous key-encryption key") {
 		t.Fatal("no previous KEK any more")
 	}
 	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 2 {
@@ -432,7 +390,7 @@ func TestKEKRotation(t *testing.T) {
 }
 
 func TestWrongKEKIsFatalAndResetKeyring(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{Signing: true})
+	env := testutil.NewEnv(t, testutil.Options{Signing: true, Agents: "bench: {}\n"})
 	testutil.SeedState(t, env)
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
@@ -440,41 +398,103 @@ func TestWrongKEKIsFatalAndResetKeyring(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	a, err := st.CreateAgent(ctx, "bench", "", policy.Policy{})
-	if err != nil {
+	if _, err := testutil.Keys(t, env, st, testutil.Settings(t, env, st)).Create(ctx, "bench"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testutil.Keys(t, env, st, testutil.BootstrapSettings(t, env, st)).Create(ctx, a.ID, a.Name); err != nil {
-		t.Fatal(err)
-	}
-	before, _ := st.ActiveKey(ctx, a.ID)
+	before, _ := st.ActiveKey(ctx, "bench")
 
 	// The KEK is lost: a start with another one fails.
 	writeKEK(t, env, "kek")
-	if err := run(ctx, env.Path, runHooks{}); err == nil || !strings.Contains(err.Error(), "does not open the state database's keyring") {
+	if err := run(ctx, options{config: env.Path, dataDir: env.DataDir}); err == nil || !strings.Contains(err.Error(), "does not open the state database's keyring") {
 		t.Fatalf("a wrong KEK must be fatal: %v", err)
 	}
 
 	var out strings.Builder
-	if err := resetKeyring(env.Path, false, &out); err != nil || !strings.Contains(out.String(), "--yes") {
+	if err := resetKeyring(env.DataDir, false, &out); err != nil || !strings.Contains(out.String(), "--yes") {
 		t.Fatalf("without --yes: %v %s", err, out.String())
 	}
 	if _, err := st.GetKeyring(ctx); err != nil {
 		t.Fatal("without --yes nothing is discarded")
 	}
 	out.Reset()
-	if err := resetKeyring(env.Path, true, &out); err != nil || !strings.Contains(out.String(), "SMTP password removed") || !strings.Contains(out.String(), "1 agent signing key(s) retired") {
+	if err := resetKeyring(env.DataDir, true, &out); err != nil || !strings.Contains(out.String(), "SMTP password removed") || !strings.Contains(out.String(), "1 agent signing key(s) retired") {
 		t.Fatalf("reset: %v %s", err, out.String())
+	}
+	if err := resetKeyring(t.TempDir(), true, &out); err == nil || !strings.Contains(err.Error(), "no state database") {
+		t.Fatalf("no database: %v", err)
 	}
 
 	// The next start creates a new keyring and a new key for the agent.
 	g := startFresh(t, env)
-	g.login()
-	after, err := st.ActiveKey(ctx, a.ID)
+	g.openConsole()
+	after, err := st.ActiveKey(ctx, "bench")
 	if err != nil || after.Fingerprint == before.Fingerprint {
 		t.Fatalf("a new agent key: %v", err)
 	}
 	if _, body := g.get(g.dash + "/settings"); !strings.Contains(body, "No password is stored.") {
 		t.Fatal("the SMTP password was discarded")
+	}
+}
+
+func TestSendThroughTheGateway(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	g := startGateway(t, env)
+	g.openConsole()
+	if status, _ := g.post("/agents", g.form("name", "bench", "recipients", "me")); status != http.StatusSeeOther {
+		t.Fatalf("creating an agent: %d", status)
+	}
+	_, body := g.post("/agents/bench/tokens", g.form("label", "ci"))
+	tok := regexp.MustCompile(`em_[a-z2-7]{12}_[a-z2-7]{52}`).FindString(body)
+	if tok == "" {
+		t.Fatal("no token")
+	}
+	req, _ := http.NewRequest("POST", g.api+"/v1/messages", strings.NewReader(`{"to":["me"],"subject":"hi","body":{"text":"hello"}}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	if status, body := g.do(req); status != 200 || env.SMTP.Count() != 1 {
+		t.Fatalf("send: %d %s", status, body)
+	}
+}
+
+func TestDispatch(t *testing.T) {
+	run := func(args ...string) (string, string, error) {
+		var out, errOut strings.Builder
+		err := dispatch(context.Background(), args, &out, &errOut)
+		return out.String(), errOut.String(), err
+	}
+	if out, _, err := run("version"); err != nil || out != version+"\n" {
+		t.Fatalf("version: %q %v", out, err)
+	}
+	if _, errOut, err := run(); err != errUsage || !strings.Contains(errOut, "Usage: email-me") {
+		t.Fatalf("no command: %v", err)
+	}
+	if _, errOut, err := run("serve"); err != errUsage || !strings.Contains(errOut, `unknown command "serve"`) {
+		t.Fatalf("unknown command: %v %s", err, errOut)
+	}
+	if _, _, err := run("start", "extra"); err != errUsage {
+		t.Fatalf("stray argument: %v", err)
+	}
+	t.Setenv("EMAIL_ME_CONTAINER", "1")
+	if _, _, err := run("start"); err == nil || !strings.Contains(err.Error(), "runs on the host") {
+		t.Fatalf("start in the container: %v", err)
+	}
+	if _, _, err := run("console", "--data-dir", t.TempDir()); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Fatalf("console without a gateway: %v", err)
+	}
+}
+
+func TestHealthcheck(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	g := startGateway(t, env)
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(g.api, "http://"))
+	cfg := filepath.Join(t.TempDir(), "config.yaml")
+	os.WriteFile(cfg, []byte("api:\n  listen: 127.0.0.1:"+port+"\n"), 0o600)
+	var errOut strings.Builder
+	if err := healthcheck(cfg, &errOut); err != nil {
+		t.Fatalf("healthy: %v %s", err, errOut.String())
+	}
+	g.stop()
+	if err := healthcheck(cfg, &errOut); err != errUnhealthy || !strings.Contains(errOut.String(), "unhealthy") {
+		t.Fatalf("stopped: %v", err)
 	}
 }

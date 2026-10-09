@@ -1,9 +1,9 @@
-{{define "actions"}}{{$d := .Data}}<a class="button secondary" href="/audit.csv?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Export CSV</a>{{end}}
+{{define "actions"}}{{$d := .Data}}<a class="button secondary" href="/audit.csv?agent={{$d.Filter.Agent}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Export CSV</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}
 <form method="get" action="/audit" class="filters" data-autosubmit>
   <label>Agent <select name="agent"><option value="">all</option>
-    {{range $d.Agents}}<option value="{{.ID}}" {{if eq .ID $d.Filter.AgentID}}selected{{end}}>{{.Name}}</option>{{end}}</select></label>
+    {{range $d.Agents}}<option value="{{.}}" {{if eq . $d.Filter.Agent}}selected{{end}}>{{.}}</option>{{end}}</select></label>
   <label>Status <select name="status">
     <option value="" {{if eq $d.Filter.Status ""}}selected{{end}}>all</option>
     <option value="sent" {{if eq $d.Filter.Status "sent"}}selected{{end}}>sent</option>
@@ -25,7 +25,7 @@
     {{range $d.Rows}}
       <tr>
         <td class="nowrap">{{ts .TS}}</td>
-        <td>{{with index $d.Names .AgentID}}{{.}}{{else}}<code>{{.AgentID}}</code>{{end}}</td>
+        <td>{{.Agent}}</td>
         <td>{{join .Recipients ", "}}</td>
         <td>{{if $d.LogSubject}}{{with .Subject}}<span>{{.}}</span>{{else}}<span class="muted">(no subject)</span>{{end}}{{end}}
           {{- if .SizeBytes}}<span class="sub">{{bytesize .SizeBytes}}{{if .AttachmentCount}} · {{.AttachmentCount}} att{{end}}</span>{{end}}
@@ -46,8 +46,8 @@
 <nav class="pager" aria-label="Pages">
   <span class="pager-info">Page {{$d.Page}}</span>
   <span class="row">
-  {{- if gt $d.Page 1}}<a class="button secondary sm" href="/audit?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{sub $d.Page 1}}">← Newer</a>{{end}}
-  {{- if $d.More}}<a class="button secondary sm" href="/audit?agent={{$d.Filter.AgentID}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{add $d.Page 1}}">Older →</a>{{end -}}
+  {{- if gt $d.Page 1}}<a class="button secondary sm" href="/audit?agent={{$d.Filter.Agent}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{sub $d.Page 1}}">← Newer</a>{{end}}
+  {{- if $d.More}}<a class="button secondary sm" href="/audit?agent={{$d.Filter.Agent}}&amp;status={{$d.Filter.Status}}&amp;period={{$d.Period}}&amp;page={{add $d.Page 1}}">Older →</a>{{end -}}
   </span>
 </nav>
 {{end}}

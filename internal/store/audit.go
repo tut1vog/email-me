@@ -20,7 +20,7 @@ const (
 type AuditEntry struct {
 	ID              int64
 	TS              time.Time
-	AgentID         string
+	Agent           string
 	TokenID         string
 	SourceIP        string
 	Recipients      []string
@@ -38,7 +38,7 @@ type AuditEntry struct {
 	Subject         string
 }
 
-const auditCols = "id, ts, agent_id, token_id, source_ip, recipients, size_bytes, attachment_count, services, encrypted, signed, signing_key_fpr, transport, status, error_code, upstream_code, message_id, subject"
+const auditCols = "id, ts, agent, token_id, source_ip, recipients, size_bytes, attachment_count, services, encrypted, signed, signing_key_fpr, transport, status, error_code, upstream_code, message_id, subject"
 
 func nullStr(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
 
@@ -60,8 +60,8 @@ func (s *Store) InsertAudit(ctx context.Context, e *AuditEntry) error {
 		upstream = sql.NullInt64{Int64: int64(e.UpstreamCode), Valid: true}
 	}
 	res, err := s.db.ExecContext(ctx,
-		"INSERT INTO audit (ts, agent_id, token_id, source_ip, recipients, size_bytes, attachment_count, services, encrypted, signed, signing_key_fpr, transport, status, error_code, upstream_code, message_id, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		unix(e.TS), nullStr(e.AgentID), nullStr(e.TokenID), nullStr(e.SourceIP), string(rcpt), e.SizeBytes, e.AttachmentCount, string(svc),
+		"INSERT INTO audit (ts, agent, token_id, source_ip, recipients, size_bytes, attachment_count, services, encrypted, signed, signing_key_fpr, transport, status, error_code, upstream_code, message_id, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		unix(e.TS), nullStr(e.Agent), nullStr(e.TokenID), nullStr(e.SourceIP), string(rcpt), e.SizeBytes, e.AttachmentCount, string(svc),
 		b2i(e.Encrypted), b2i(e.Signed), nullStr(e.SigningKeyFpr), nullStr(e.Transport), e.Status, nullStr(e.ErrorCode), upstream,
 		nullStr(e.MessageID), nullStr(e.Subject))
 	if err != nil {
@@ -80,20 +80,20 @@ func nonNil(s []string) []string {
 
 // AuditFilter selects audit rows. Zero values mean "any".
 type AuditFilter struct {
-	AgentID string
-	Status  string
-	Since   time.Time
-	Until   time.Time
-	Limit   int
-	Offset  int
+	Agent  string
+	Status string
+	Since  time.Time
+	Until  time.Time
+	Limit  int
+	Offset int
 }
 
 func (s *Store) ListAudit(ctx context.Context, f AuditFilter) ([]*AuditEntry, error) {
 	var where []string
 	var args []any
-	if f.AgentID != "" {
-		where = append(where, "agent_id = ?")
-		args = append(args, f.AgentID)
+	if f.Agent != "" {
+		where = append(where, "agent = ?")
+		args = append(args, f.Agent)
 	}
 	if f.Status != "" {
 		where = append(where, "status = ?")
@@ -134,7 +134,7 @@ func (s *Store) ListAudit(ctx context.Context, f AuditFilter) ([]*AuditEntry, er
 			return nil, err
 		}
 		e.TS = time.Unix(ts, 0).UTC()
-		e.AgentID, e.TokenID, e.SourceIP = agent.String, token.String, ip.String
+		e.Agent, e.TokenID, e.SourceIP = agent.String, token.String, ip.String
 		e.SigningKeyFpr, e.Transport, e.ErrorCode = fpr.String, transport.String, errCode.String
 		e.MessageID, e.Subject = msgID.String, subject.String
 		e.UpstreamCode = int(upstream.Int64)
@@ -148,12 +148,12 @@ func (s *Store) ListAudit(ctx context.Context, f AuditFilter) ([]*AuditEntry, er
 
 // SentSince counts an agent's successful sends since t and returns the
 // timestamp of the oldest one (for Retry-After).
-func (s *Store) SentSince(ctx context.Context, agentID string, t time.Time) (int, time.Time, error) {
+func (s *Store) SentSince(ctx context.Context, agent string, t time.Time) (int, time.Time, error) {
 	var n int
 	var oldest sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		"SELECT COUNT(*), MIN(ts) FROM audit WHERE agent_id = ? AND status = 'sent' AND ts >= ?",
-		agentID, unix(t)).Scan(&n, &oldest)
+		"SELECT COUNT(*), MIN(ts) FROM audit WHERE agent = ? AND status = 'sent' AND ts >= ?",
+		agent, unix(t)).Scan(&n, &oldest)
 	if err != nil {
 		return 0, time.Time{}, err
 	}
@@ -166,11 +166,11 @@ func (s *Store) SentSince(ctx context.Context, agentID string, t time.Time) (int
 
 // OldestSentInWindow returns the timestamp of the k-th newest successful send
 // since t (1-based from the oldest), used to compute when a slot frees up.
-func (s *Store) NthOldestSent(ctx context.Context, agentID string, since time.Time, n int) (time.Time, error) {
+func (s *Store) NthOldestSent(ctx context.Context, agent string, since time.Time, n int) (time.Time, error) {
 	var ts int64
 	err := s.db.QueryRowContext(ctx,
-		"SELECT ts FROM audit WHERE agent_id = ? AND status = 'sent' AND ts >= ? ORDER BY ts ASC LIMIT 1 OFFSET ?",
-		agentID, unix(since), n-1).Scan(&ts)
+		"SELECT ts FROM audit WHERE agent = ? AND status = 'sent' AND ts >= ? ORDER BY ts ASC LIMIT 1 OFFSET ?",
+		agent, unix(since), n-1).Scan(&ts)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -183,7 +183,7 @@ type Counts struct{ Sent, Rejected, Failed int }
 // StatsSince returns per-agent counts since t.
 func (s *Store) StatsSince(ctx context.Context, t time.Time) (map[string]*Counts, error) {
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT COALESCE(agent_id, ''), status, COUNT(*) FROM audit WHERE ts >= ? GROUP BY agent_id, status", unix(t))
+		"SELECT COALESCE(agent, ''), status, COUNT(*) FROM audit WHERE ts >= ? GROUP BY agent, status", unix(t))
 	if err != nil {
 		return nil, err
 	}
@@ -212,10 +212,10 @@ func (s *Store) StatsSince(ctx context.Context, t time.Time) (map[string]*Counts
 	return out, rows.Err()
 }
 
-// InsecureAgents lists agent IDs that sent over an insecure transport since t.
+// InsecureAgents lists the agents that sent over an insecure transport since t.
 func (s *Store) InsecureAgents(ctx context.Context, t time.Time) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT DISTINCT agent_id FROM audit WHERE transport = 'insecure' AND ts >= ? AND agent_id IS NOT NULL ORDER BY agent_id", unix(t))
+		"SELECT DISTINCT agent FROM audit WHERE transport = 'insecure' AND ts >= ? AND agent IS NOT NULL ORDER BY agent", unix(t))
 	if err != nil {
 		return nil, err
 	}

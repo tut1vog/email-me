@@ -1,13 +1,25 @@
-// Command email-me runs the email gateway.
+// Command email-me is the email gateway, and the host commands that run it
+// in a Docker container.
 //
-//	email-me serve [--config /config/config.yaml]   (default command)
-//	email-me healthcheck [--config ...]             (for Docker HEALTHCHECK)
+// On the host:
+//
+//	email-me start                  create and start the container (the first run writes a starter config)
+//	email-me stop                   stop it
+//	email-me restart                stop, then start: applies config.yaml and a new version
+//	email-me console                open the dashboard until Ctrl-C
+//	email-me reset-keyring [--yes]  lost key-encryption key: discard the sealed credentials
 //	email-me version
-//	email-me reset-admin-password [--config ...]    (forgotten admin password)
-//	email-me reset-keyring --yes [--config ...]     (lost key-encryption key)
 //
-// Settings saved on the dashboard apply at once. serve restarts in place on
-// SIGHUP or from the dashboard, to apply edits to config.yaml.
+// In the container, or directly on a host without Docker:
+//
+//	email-me run [--config F] [--data-dir D] [--listen-all]   the gateway, in the foreground
+//	email-me healthcheck [--config F]                         GET /healthz, for Docker's HEALTHCHECK
+//	email-me console [--data-dir D] [--stdin]
+//	email-me reset-keyring [--yes] [--data-dir D]
+//
+// The configuration lives in config.yaml in the configuration directory
+// (~/.config/email-me, mounted at /config in the container); the state
+// database in the data directory (/data in the container).
 package main
 
 import (
@@ -21,6 +33,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -28,16 +41,15 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/tut1vog/email-me/internal/admin"
 	"github.com/tut1vog/email-me/internal/api"
 	"github.com/tut1vog/email-me/internal/audit"
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/console"
 	"github.com/tut1vog/email-me/internal/dashboard"
+	"github.com/tut1vog/email-me/internal/host"
 	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/keys"
-	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
-	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -47,48 +59,153 @@ import (
 // -ldflags "-X main.version=v1.2.3".
 var version = "dev"
 
-func main() {
-	cmd, args := "serve", os.Args[1:]
-	switch {
-	case len(args) == 0:
-	case args[0] == "serve", args[0] == "healthcheck", args[0] == "version", args[0] == "reset-admin-password", args[0] == "reset-keyring":
-		cmd, args = args[0], args[1:]
-	}
-	if cmd == "version" {
-		fmt.Println(version)
-		return
-	}
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-	defaultCfg := os.Getenv("EMAIL_ME_CONFIG")
-	if defaultCfg == "" {
-		defaultCfg = "/config/config.yaml"
-	}
-	cfgPath := fs.String("config", defaultCfg, "path to config.yaml (env EMAIL_ME_CONFIG)")
-	yes := false
-	if cmd == "reset-keyring" {
-		fs.BoolVar(&yes, "yes", false, "discard the credentials (without it, only say what would be discarded)")
-	}
-	fs.Parse(args)
+const usage = `Usage: email-me <command>
 
-	switch cmd {
-	case "healthcheck":
-		os.Exit(healthcheck(*cfgPath))
-	case "reset-admin-password":
-		if err := resetAdminPassword(*cfgPath, os.Stdout); err != nil {
-			fmt.Fprintln(os.Stderr, "email-me:", err)
-			os.Exit(1)
-		}
-	case "reset-keyring":
-		if err := resetKeyring(*cfgPath, yes, os.Stdout); err != nil {
-			fmt.Fprintln(os.Stderr, "email-me:", err)
-			os.Exit(1)
-		}
+Commands:
+  start           create and start the gateway's container
+  stop            stop it
+  restart         stop, then start: applies config.yaml and a new version
+  console         open the dashboard and print a login link; Ctrl-C closes it
+  reset-keyring   lost key-encryption key: discard the credentials sealed with it
+  version         print the version
+
+  run             run the gateway in the foreground (the container's command)
+  healthcheck     check the gateway answers (Docker's HEALTHCHECK)
+
+Configuration: ~/.config/email-me/config.yaml (or $EMAIL_ME_CONFIG_DIR).
+`
+
+// errUsage exits with status 2 after the usage was shown.
+var errUsage = errors.New("usage")
+
+// inContainer reports whether this process runs in the image, which sets
+// EMAIL_ME_CONTAINER: there console and reset-keyring act on the local
+// gateway, and the host commands do not exist.
+func inContainer() bool { return os.Getenv("EMAIL_ME_CONTAINER") != "" }
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := dispatch(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	var exit *exec.ExitError
+	switch {
+	case err == nil:
+	case errors.Is(err, errUsage):
+		os.Exit(2)
+	case errors.As(err, &exit):
+		os.Exit(exit.ExitCode()) // docker's command already said why
+	case errors.Is(err, errUnhealthy):
+		os.Exit(1)
 	default:
-		if err := serve(*cfgPath); err != nil {
-			fmt.Fprintln(os.Stderr, "email-me:", err)
-			os.Exit(1)
-		}
+		fmt.Fprintln(os.Stderr, "email-me:", err)
+		os.Exit(1)
 	}
+}
+
+func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, usage)
+		return errUsage
+	}
+	cmd, args := args[0], args[1:]
+	fs := flag.NewFlagSet("email-me "+cmd, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configDir, _ := host.ConfigDir()
+	dataDir, _ := host.DataDir()
+	switch cmd {
+	case "version", "-v", "--version":
+		fmt.Fprintln(stdout, version)
+		return nil
+	case "help", "-h", "--help":
+		fmt.Fprint(stdout, usage)
+		return nil
+
+	case "run":
+		cfgPath := fs.String("config", filepath.Join(configDir, "config.yaml"), "config file")
+		data := fs.String("data-dir", dataDir, "state directory")
+		listenAll := fs.Bool("listen-all", false, "listen on all interfaces at the configured ports (in a container, whose ports are published on the configured host addresses)")
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		return run(ctx, options{config: *cfgPath, dataDir: *data, listenAll: *listenAll})
+
+	case "healthcheck":
+		cfgPath := fs.String("config", filepath.Join(configDir, "config.yaml"), "config file")
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		return healthcheck(*cfgPath, stderr)
+
+	case "console":
+		data := fs.String("data-dir", dataDir, "the gateway's state directory, when it runs on this host without Docker")
+		stdin := fs.Bool("stdin", false, "also close the dashboard when standard input ends")
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		if inContainer() || flagSet(fs, "data-dir") {
+			var in io.Reader
+			if *stdin {
+				in = os.Stdin
+			}
+			return console.Attach(ctx, filepath.Join(*data, console.SocketName), in, stdout)
+		}
+		return newHost(configDir, dataDir, stdout, stderr).Console(ctx)
+
+	case "reset-keyring":
+		yes := fs.Bool("yes", false, "discard the credentials (without it, only say what would be discarded)")
+		data := fs.String("data-dir", dataDir, "the gateway's state directory, when it runs on this host without Docker")
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		if inContainer() || flagSet(fs, "data-dir") {
+			return resetKeyring(*data, *yes, stdout)
+		}
+		return newHost(configDir, dataDir, stdout, stderr).ResetKeyring(ctx, *yes)
+
+	case "start", "stop", "restart":
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		if inContainer() {
+			return fmt.Errorf("%s runs on the host, not in the container", cmd)
+		}
+		h := newHost(configDir, dataDir, stdout, stderr)
+		switch cmd {
+		case "start":
+			return h.Start(ctx)
+		case "stop":
+			return h.Stop(ctx)
+		}
+		return h.Restart(ctx)
+	}
+	fmt.Fprintf(stderr, "email-me: unknown command %q\n\n%s", cmd, usage)
+	return errUsage
+}
+
+func parse(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(fs.Output(), "%s: unexpected argument %q\n", fs.Name(), fs.Arg(0))
+		return errUsage
+	}
+	return nil
+}
+
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
+}
+
+func newHost(configDir, dataDir string, stdout, stderr io.Writer) *host.Host {
+	image := os.Getenv("EMAIL_ME_IMAGE")
+	if image == "" {
+		image = host.ImageFor(version)
+	}
+	return &host.Host{Dir: configDir, DataDir: dataDir, Image: image, UID: os.Getuid(), GID: os.Getgid(),
+		Docker: host.CLI{}, Out: stdout, Err: stderr}
 }
 
 func newLogger(c config.Log) *slog.Logger {
@@ -97,62 +214,54 @@ func newLogger(c config.Log) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
-// errRestart ends a run that should be followed by the next one.
-var errRestart = errors.New("restart requested")
-
-// runHooks lets tests observe and drive the serve loop.
-type runHooks struct {
-	// started is called with the bound addresses once both listeners are up.
-	started func(apiAddr, dashAddr string)
-	// hup delivers SIGHUP. serve subscribes once, for the process lifetime,
-	// so a SIGHUP between two runs is not fatal.
-	hup <-chan os.Signal
-	// grace is how long a dashboard-requested restart waits before it stops
-	// the listeners, so the restarting page's assets still load.
-	grace time.Duration
+// options configure run.
+type options struct {
+	config, dataDir string
+	// listenAll binds each listener on all interfaces at its configured
+	// port: in a container, whose ports Docker publishes on the configured
+	// host addresses.
+	listenAll bool
+	// started, for tests, is called with the API's bound address once it
+	// listens; consoleOpened with the dashboard's each time a console
+	// opens it.
+	started       func(apiAddr string)
+	consoleOpened func(dashAddr string)
 }
 
-// serve runs the gateway until SIGINT or SIGTERM. A restart (the
-// dashboard's Restart button or SIGHUP) ends one run and starts the next in
-// the same process, reloading config.yaml; if the next run cannot start,
-// serve returns its error.
-func serve(cfgPath string) error {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
-	return loop(ctx, cfgPath, runHooks{hup: hup, grace: time.Second})
-}
-
-func loop(ctx context.Context, cfgPath string, hooks runHooks) error {
-	for {
-		if err := run(ctx, cfgPath, hooks); !errors.Is(err, errRestart) {
-			return err
-		}
+// bindAddr is where a listener binds: listen itself, or all interfaces at
+// its port with listenAll.
+func (o options) bindAddr(listen string) string {
+	if !o.listenAll {
+		return listen
 	}
+	_, port, _ := net.SplitHostPort(listen)
+	return ":" + port
 }
 
-// run is one start of the gateway. It returns nil when ctx ends,
-// errRestart when a restart was requested, or the error that stopped it.
-func run(ctx context.Context, cfgPath string, hooks runHooks) error {
-	cfg, err := config.Load(cfgPath)
+// run runs the gateway until ctx ends: the agent API, the console's
+// control socket (which opens the dashboard on demand) and the retention
+// job.
+func run(ctx context.Context, o options) error {
+	cfg, err := config.Load(o.config)
 	if err != nil {
 		return err
 	}
 	log := newLogger(cfg.Log)
 
-	// runCtx ends with this run: it stops the retention job.
+	// runCtx stops the retention job and the console socket.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	st, err := store.Open(filepath.Join(cfg.DataDir, "state.db"))
+	if err := os.MkdirAll(o.dataDir, 0o700); err != nil {
+		return err
+	}
+	st, err := store.Open(filepath.Join(o.dataDir, "state.db"))
 	if err != nil {
-		return fmt.Errorf("opening state database in %s: %w", cfg.DataDir, err)
+		return fmt.Errorf("opening state database in %s: %w", o.dataDir, err)
 	}
 	defer st.Close()
 
 	// The keyring before anything that reads a credential. A KEK that does
-	// not open it is fatal, like any other bootstrap problem.
+	// not open it is fatal, like any other configuration problem.
 	kr, ev, err := keyring.Open(runCtx, st, cfg.KEK.Key, cfg.KEK.Previous)
 	if err != nil {
 		return err
@@ -161,50 +270,33 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	case ev == keyring.Created:
 		log.Info("created the keyring: stored credentials are encrypted under kek.file from now on")
 	case ev == keyring.Rewrapped:
-		log.Info("rotated the key-encryption key: the keyring is now encrypted under kek.file; remove kek.previous_file and restart")
+		log.Info("rotated the key-encryption key: the keyring is now encrypted under kek.file; delete the previous key")
 	case cfg.KEK.Previous != nil:
-		log.Info("kek.previous_file is no longer needed: the keyring opens with kek.file; remove it")
+		log.Info("the previous key-encryption key is no longer needed: the keyring opens with kek.file; delete it")
 	case kr == nil:
 		log.Warn("no key-encryption key (kek.file): signing is off and the SMTP password is stored unencrypted")
 	}
-	setup, err := admin.Ensure(runCtx, st)
-	if err != nil {
-		return err
-	}
-	if setup != "" {
-		// The one secret ever logged: it works once, to choose a password.
-		log.Warn("dashboard setup password: log in with it and choose your own; every start prints a new one until you do", "password", setup)
-	}
 
-	// Settings first: they complete cfg (upstream, default policy, ...).
 	// From here on, everything reads the current configuration through sm,
-	// so a saved setting applies at once; cfg itself is used only for the
-	// bootstrap keys, which need a restart.
-	sm, _, err := settings.Bootstrap(runCtx, st, cfg, kr, log)
+	// so a change saved on the dashboard applies at once; cfg itself is used
+	// only for the bootstrap keys.
+	sm, err := settings.Open(runCtx, o.config, cfg, st, kr, log)
 	if err != nil {
 		return err
 	}
-	for _, w := range cfg.Warnings {
+	cur := sm.Current()
+	for _, w := range cur.Warnings {
 		log.Warn(w)
 	}
-
-	reg, seeded, err := recipients.Bootstrap(runCtx, st, cfg, func() policy.Effective { return sm.Current().DefaultPolicy })
-	if err != nil {
-		return err
+	if len(cur.Recipients) == 0 {
+		log.Warn("no recipients: agents cannot send until you add one on the dashboard")
 	}
-	if len(seeded) > 0 {
-		log.Info("imported recipients from config.yaml into the state database; manage them in the dashboard from now on", "aliases", seeded)
-	}
-	if reg.Len() == 0 {
-		log.Warn("no recipients: agents cannot send until you add one in the dashboard")
-	}
-	for _, rc := range reg.All() {
-		if rc.KeyErr != nil {
-			log.Warn("recipient's stored PGP key cannot be read: replace or remove it in the dashboard", "alias", rc.Alias, "err", rc.KeyErr)
+	if orphans, err := st.AgentsWithData(runCtx); err == nil {
+		for _, name := range orphans {
+			if _, ok := cur.Agent(name); !ok {
+				log.Info("the state database holds tokens and keys of an agent that is not in config.yaml; they are inert", "agent", name)
+			}
 		}
-	}
-	if u := reg.UnknownAliases(cfg.Defaults.Policy); len(u) > 0 {
-		log.Warn("defaults.policy.recipients names recipients that do not exist; they are ignored", "aliases", u)
 	}
 
 	km := keys.NewManager(st, keysOptions(sm, kr))
@@ -212,7 +304,7 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		log.Error("the certification key cannot be loaded; new agent keys are not certified until it is set again on the Settings page", "err", err)
 	}
 	if km.Enabled() {
-		n, err := km.EnsureAll(runCtx)
+		n, err := km.EnsureAll(runCtx, cur.AgentNames())
 		switch {
 		case errors.Is(err, keys.ErrNoFrom):
 			log.Warn("some agents have no signing key; they get one once upstream.from is set on the Settings page")
@@ -220,46 +312,18 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 			return fmt.Errorf("checking signing keys: %w", err)
 		}
 		if n > 0 {
-			log.Info("generated signing keys for existing agents", "count", n)
+			log.Info("generated signing keys for agents without one", "count", n)
 		}
-	}
-
-	// A restart is refused while config.yaml does not load or its KEK does
-	// not open the keyring, so a typo cannot take the gateway down.
-	preflight := func() error {
-		c, err := config.Load(cfgPath)
-		if err != nil {
-			return fmt.Errorf("config.yaml no longer loads: %w", err)
-		}
-		return keyring.Verify(runCtx, st, c.KEK.Key, c.KEK.Previous)
-	}
-	restart := make(chan struct{}, 1)
-	requestRestart := func() error {
-		if err := preflight(); err != nil {
-			return err
-		}
-		select {
-		case restart <- struct{}{}:
-		default: // one is already on its way
-		}
-		return nil
-	}
-
-	// configChanged re-hashes config.yaml when a dashboard page renders:
-	// the file is small, and an unreadable one counts as changed.
-	configChanged := func() bool {
-		fp, err := config.FileFingerprint(cfgPath)
-		return err != nil || fp != cfg.Fingerprint
 	}
 
 	sender := upstream.NewDynamic(func() config.SMTP { return sm.Current().Upstream.SMTP })
 	auditW := audit.NewWriter(st, func() bool { return sm.Current().Audit.LogSubject }, log)
 	apiSrv := api.New(api.Deps{
-		Config: sm.Current, Store: st, Recipients: reg, Keys: km, Sender: sender,
+		Config: sm.Current, Store: st, Keys: km, Sender: sender,
 		Limiter: ratelimit.New(st), Audit: auditW, Log: log.With("component", "api"),
 	})
-	dash, err := dashboard.New(dashboard.Deps{Config: sm.Current, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: sender,
-		Log: log.With("component", "dashboard"), Restart: requestRestart, ConfigChanged: configChanged})
+	dash, err := dashboard.New(dashboard.Deps{Store: st, Settings: sm, Keys: km, Sender: sender,
+		Log: log.With("component", "dashboard")})
 	if err != nil {
 		return err
 	}
@@ -278,39 +342,29 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	if cfg.API.Certificate != nil {
 		apiHTTP.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*cfg.API.Certificate}, MinVersion: tls.VersionTLS12}
 	}
-	dashHTTP := &http.Server{
-		Handler:           dash.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      time.Minute,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    64 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
-	}
-
-	// Bind both before serving, so a port that cannot be (re)bound fails
-	// the run at once.
-	apiLn, err := net.Listen("tcp", cfg.API.Listen)
+	apiLn, err := net.Listen("tcp", o.bindAddr(cfg.API.Listen))
 	if err != nil {
 		return fmt.Errorf("API server: %w", err)
 	}
-	dashLn, err := net.Listen("tcp", cfg.Dashboard.Listen)
+	ctlLn, err := console.Listen(filepath.Join(o.dataDir, console.SocketName))
 	if err != nil {
 		apiLn.Close()
-		return fmt.Errorf("dashboard server: %w", err)
+		return err
 	}
+	consoles := &console.Server{Dash: dash, Listen: cfg.Dashboard.Listen, Bind: o.bindAddr(cfg.Dashboard.Listen),
+		Log: log.With("component", "console"), Opened: o.consoleOpened}
 
-	retention := make(chan struct{})
-	go func() {
-		defer close(retention)
+	var bg group
+	bg.Go(func() {
 		audit.RunRetention(runCtx, st, func() time.Duration {
 			return time.Duration(sm.Current().Audit.RetentionDays) * 24 * time.Hour
 		}, log)
-	}()
+	})
+	bg.Go(func() { consoles.Serve(runCtx, ctlLn) })
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 1)
 	go func() {
-		log.Info("API listening", "addr", apiLn.Addr().String(), "tls", apiHTTP.TLSConfig != nil, "docs", cfg.API.Docs)
+		log.Info("API listening", "addr", apiLn.Addr().String(), "tls", apiHTTP.TLSConfig != nil, "docs", cur.API.Docs)
 		var err error
 		if apiHTTP.TLSConfig != nil {
 			err = apiHTTP.ServeTLS(apiLn, "", "")
@@ -319,63 +373,56 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		}
 		errc <- fmt.Errorf("API server: %w", err)
 	}()
-	go func() {
-		log.Info("dashboard listening", "addr", dashLn.Addr().String())
-		errc <- fmt.Errorf("dashboard server: %w", dashHTTP.Serve(dashLn))
-	}()
 	upstreamAddr := "not configured"
-	if cfg.Upstream.SMTP.Host != "" {
-		upstreamAddr = cfg.Upstream.SMTP.Addr()
+	if cur.Upstream.SMTP.Host != "" {
+		upstreamAddr = cur.Upstream.SMTP.Addr()
 	}
-	log.Info("email-me started", "signing", km.Enabled(), "recipients", reg.Len(), "upstream", upstreamAddr)
-	if hooks.started != nil {
-		hooks.started(apiLn.Addr().String(), dashLn.Addr().String())
+	log.Info("email-me started; run email-me console to open the dashboard", "version", version,
+		"signing", km.Enabled(), "recipients", len(cur.Recipients), "agents", len(cur.Agents), "upstream", upstreamAddr)
+	if o.started != nil {
+		o.started(apiLn.Addr().String())
 	}
 
 	var result error
-wait:
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info("shutting down")
-			break wait
-		case <-restart:
-			log.Info("restarting to re-read config.yaml")
-			// Let the restarting page load its stylesheet and script first.
-			time.Sleep(hooks.grace)
-			result = errRestart
-			break wait
-		case <-hooks.hup:
-			if err := preflight(); err != nil {
-				log.Error("SIGHUP: not restarting", "err", err)
-				continue
-			}
-			log.Info("SIGHUP: restarting to re-read config.yaml")
-			result = errRestart
-			break wait
-		case err := <-errc: // a listener failed: stop the other and exit
-			result = err
-			break wait
-		}
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down")
+	case result = <-errc: // the listener failed
 	}
-	// API first, so in-flight sends finish; then the dashboard, then the
-	// retention job; the store closes last (deferred).
+	// API first, so in-flight sends finish; then the console (and with it
+	// the dashboard) and the retention job; the store closes last
+	// (deferred).
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), sm.Current().Upstream.SMTP.Timeout.D()+10*time.Second)
 	defer cancel()
 	if err := apiHTTP.Shutdown(shutdownCtx); err != nil {
 		apiHTTP.Close()
 	}
-	if err := dashHTTP.Shutdown(shutdownCtx); err != nil {
-		dashHTTP.Close()
-	}
 	cancelRun()
-	<-retention
+	bg.Wait()
 	return result
+}
+
+// group runs functions and waits for them.
+type group struct{ done []chan struct{} }
+
+func (g *group) Go(f func()) {
+	c := make(chan struct{})
+	g.done = append(g.done, c)
+	go func() {
+		defer close(c)
+		f()
+	}()
+}
+
+func (g *group) Wait() {
+	for _, c := range g.done {
+		<-c
+	}
 }
 
 // keysOptions configures signing: keys are sealed under the keyring (nil:
 // signing is off), and the From address and key validity of new keys
-// follow the saved settings.
+// follow the configuration.
 func keysOptions(sm *settings.Manager, kr *keyring.Keyring) keys.Options {
 	return keys.Options{Keyring: kr, From: func() (string, time.Duration) {
 		c := sm.Current()
@@ -383,50 +430,16 @@ func keysOptions(sm *settings.Manager, kr *keyring.Keyring) keys.Options {
 	}}
 }
 
-// openStateDB opens state.db for a recovery command. It reads only
-// data_dir from config.yaml, so it works when the rest of the file does
-// not load.
-func openStateDB(cfgPath string) (*store.Store, error) {
-	var c struct {
-		DataDir string `yaml:"data_dir"`
-	}
-	data, err := os.ReadFile(cfgPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("reading config: %w", err)
-	}
-	if err := yaml.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
-	}
-	if c.DataDir == "" {
-		c.DataDir = "/data"
-	}
-	path := filepath.Join(c.DataDir, "state.db")
-	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("no state database at %s: %w", path, err)
-	}
-	return store.Open(path)
-}
-
-// resetAdminPassword replaces the admin password with a setup password
-// that the next login must change, and prints it.
-func resetAdminPassword(cfgPath string, out io.Writer) error {
-	st, err := openStateDB(cfgPath)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	pw, err := admin.Reset(context.Background(), st)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "Setup password: %s\n\nLog in to the dashboard with it; you will choose a new password next.\nSessions already open stay valid until they expire or email-me restarts.\n", pw)
-	return nil
-}
-
 // resetKeyring discards the keyring and every credential sealed under it,
 // for a lost key-encryption key. Without yes it only says what it would do.
-func resetKeyring(cfgPath string, yes bool, out io.Writer) error {
-	st, err := openStateDB(cfgPath)
+// It needs nothing but the state database, so it works when the gateway
+// cannot start.
+func resetKeyring(dataDir string, yes bool, out io.Writer) error {
+	path := filepath.Join(dataDir, "state.db")
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("no state database at %s: %w", path, err)
+	}
+	st, err := store.Open(path)
 	if err != nil {
 		return err
 	}
@@ -437,8 +450,8 @@ func resetKeyring(cfgPath string, yes bool, out io.Writer) error {
   - the certification master key (set it again on the Settings page),
   - every agent's signing private key (the keys are retired; their public keys
     and revocation certificates stay, and agents get new keys at the next start).
-Agents, tokens, recipients, settings and the audit log are kept.
-Stop email-me (or restart it right after), then run again with --yes.
+Tokens, the audit log and config.yaml are kept.
+Run again with --yes, then email-me restart.
 `)
 		return nil
 	}
@@ -448,7 +461,7 @@ Stop email-me (or restart it right after), then run again with --yes.
 	}
 	fmt.Fprintf(out, "Discarded the keyring: SMTP password %s, certification key %s, %d agent signing key(s) retired.\n",
 		yesNo(d.SMTPPassword, "removed", "none stored"), yesNo(d.CertifyKey, "removed", "none set"), d.AgentKeys)
-	fmt.Fprintln(out, "Start email-me with the new kek.file: it creates a new keyring and new agent keys.")
+	fmt.Fprintln(out, "Run email-me restart with the new kek: it creates a new keyring and new agent keys.")
 	return nil
 }
 
@@ -459,9 +472,12 @@ func yesNo(b bool, yes, no string) string {
 	return no
 }
 
+// errUnhealthy fails healthcheck after it said why.
+var errUnhealthy = errors.New("unhealthy")
+
 // healthcheck GETs /healthz on the local API. It reads only api.listen and
-// api.tls from the config so it works without access to secrets.
-func healthcheck(cfgPath string) int {
+// api.tls from the config, so it works without access to secrets.
+func healthcheck(cfgPath string, stderr io.Writer) error {
 	var c struct {
 		API struct {
 			Listen string `yaml:"listen"`
@@ -488,13 +504,13 @@ func healthcheck(cfgPath string) int {
 	}
 	resp, err := client.Get(scheme + "://127.0.0.1:" + port + "/healthz")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "unhealthy:", err)
-		return 1
+		fmt.Fprintln(stderr, "unhealthy:", err)
+		return errUnhealthy
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintln(os.Stderr, "unhealthy: status", resp.StatusCode)
-		return 1
+		fmt.Fprintln(stderr, "unhealthy: status", resp.StatusCode)
+		return errUnhealthy
 	}
-	return 0
+	return nil
 }

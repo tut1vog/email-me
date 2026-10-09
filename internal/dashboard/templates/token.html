@@ -1,4 +1,4 @@
-{{define "crumbs"}}<a href="/agents">Agents</a><a href="/agents/{{.Data.Agent.ID}}/tokens">{{.Data.Agent.Name}}</a>{{end}}
+{{define "crumbs"}}<a href="/agents">Agents</a><a href="/agents/{{.Data.Agent.Name}}/tokens">{{.Data.Agent.Name}}</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}
 <section class="copy-panel">
@@ -46,6 +46,6 @@ EMAIL_ME_TOKEN={{$d.Token}}</pre>
       <p>Make sure that path uses TLS or an encrypted tunnel: signing requires the gateway to see message content.</p>
     </details>
   </div>
-  <div class="card-footer"><a class="button" href="/agents/{{$d.Agent.ID}}/tokens"><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Done</a></div>
+  <div class="card-footer"><a class="button" href="/agents/{{$d.Agent.Name}}/tokens"><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg>Done</a></div>
 </section>
 {{end}}

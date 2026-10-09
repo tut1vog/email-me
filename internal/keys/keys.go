@@ -224,15 +224,15 @@ func (m *Manager) generate(agentName string) (*store.AgentKey, *openpgp.Entity, 
 }
 
 // Create generates and stores the first key for an agent.
-func (m *Manager) Create(ctx context.Context, agentID, agentName string) (*store.AgentKey, error) {
+func (m *Manager) Create(ctx context.Context, agent string) (*store.AgentKey, error) {
 	if !m.Enabled() {
 		return nil, ErrNotConfigured
 	}
-	k, e, err := m.generate(agentName)
+	k, e, err := m.generate(agent)
 	if err != nil {
 		return nil, err
 	}
-	k.AgentID = agentID
+	k.Agent = agent
 	if err := m.store.InsertKey(ctx, k); err != nil {
 		return nil, err
 	}
@@ -242,15 +242,15 @@ func (m *Manager) Create(ctx context.Context, agentID, agentName string) (*store
 
 // Rotate replaces an agent's active key. The old key keeps its public key and
 // revocation certificate; its private material is discarded.
-func (m *Manager) Rotate(ctx context.Context, agentID, agentName string) (*store.AgentKey, error) {
+func (m *Manager) Rotate(ctx context.Context, agent string) (*store.AgentKey, error) {
 	if !m.Enabled() {
 		return nil, ErrNotConfigured
 	}
-	k, e, err := m.generate(agentName)
+	k, e, err := m.generate(agent)
 	if err != nil {
 		return nil, err
 	}
-	k.AgentID = agentID
+	k.Agent = agent
 	if err := m.store.RotateKey(ctx, k); err != nil {
 		return nil, err
 	}
@@ -262,11 +262,11 @@ func (m *Manager) Rotate(ctx context.Context, agentID, agentName string) (*store
 }
 
 // Signer returns the agent's decrypted signing entity and its fingerprint.
-func (m *Manager) Signer(ctx context.Context, agentID string) (*openpgp.Entity, string, error) {
+func (m *Manager) Signer(ctx context.Context, agent string) (*openpgp.Entity, string, error) {
 	if !m.Enabled() {
 		return nil, "", ErrNotConfigured
 	}
-	k, err := m.store.ActiveKey(ctx, agentID)
+	k, err := m.store.ActiveKey(ctx, agent)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, "", ErrNoKey
 	}
@@ -291,33 +291,30 @@ func (m *Manager) Signer(ctx context.Context, agentID string) (*openpgp.Entity, 
 }
 
 // ActiveKey returns the stored active key row (no decryption).
-func (m *Manager) ActiveKey(ctx context.Context, agentID string) (*store.AgentKey, error) {
-	return m.store.ActiveKey(ctx, agentID)
+func (m *Manager) ActiveKey(ctx context.Context, agent string) (*store.AgentKey, error) {
+	return m.store.ActiveKey(ctx, agent)
 }
 
-// EnsureAll verifies the keyring against existing keys and creates keys for
-// agents that lack one (e.g. signing was enabled after they were created).
-// Without a From address it creates none and, once every existing key is
-// verified, returns ErrNoFrom if an agent was left without a key.
-func (m *Manager) EnsureAll(ctx context.Context) (created int, err error) {
+// EnsureAll verifies the keyring against the agents' keys and creates keys
+// for agents that lack one (e.g. signing was enabled after they were
+// created, or they were added to config.yaml by hand). Without a From
+// address it creates none and, once every existing key is verified, returns
+// ErrNoFrom if an agent was left without a key.
+func (m *Manager) EnsureAll(ctx context.Context, agents []string) (created int, err error) {
 	if !m.Enabled() {
 		return 0, nil
-	}
-	agents, err := m.store.ListAgents(ctx)
-	if err != nil {
-		return 0, err
 	}
 	var missing error
 	email, _ := m.from()
 	for _, a := range agents {
-		k, err := m.store.ActiveKey(ctx, a.ID)
+		k, err := m.store.ActiveKey(ctx, a)
 		if errors.Is(err, store.ErrNotFound) {
 			if email == "" {
 				missing = ErrNoFrom
 				continue
 			}
-			if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
-				return created, fmt.Errorf("creating key for agent %s: %w", a.Name, err)
+			if _, err := m.Create(ctx, a); err != nil {
+				return created, fmt.Errorf("creating key for agent %s: %w", a, err)
 			}
 			created++
 			continue
@@ -326,7 +323,7 @@ func (m *Manager) EnsureAll(ctx context.Context) (created int, err error) {
 			return created, err
 		}
 		if _, err := m.open(k); err != nil {
-			return created, fmt.Errorf("agent %s: %w", a.Name, err)
+			return created, fmt.Errorf("agent %s: %w", a, err)
 		}
 	}
 	return created, missing

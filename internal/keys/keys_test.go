@@ -17,14 +17,14 @@ import (
 	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/pgp"
-	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
 func kr(b byte) *keyring.Keyring { return keyring.New(bytes.Repeat([]byte{b}, 32)) }
 
-func setup(t *testing.T, master *openpgp.Entity) (*store.Store, *keys.Manager, *store.Agent, string) {
+// setup returns a store, a keys manager and the name of an agent, bench.
+func setup(t *testing.T, master *openpgp.Entity) (*store.Store, *keys.Manager, string, string) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	st, err := store.Open(dbPath)
@@ -32,17 +32,13 @@ func setup(t *testing.T, master *openpgp.Entity) (*store.Store, *keys.Manager, *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	a, err := st.CreateAgent(context.Background(), "bench", "", policy.Policy{})
-	if err != nil {
-		t.Fatal(err)
-	}
 	m := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 365 * 24 * time.Hour, Email: "gateway@example.com"})
 	if master != nil {
 		if _, err := m.SetMaster(context.Background(), []byte(testutil.ArmorPrivate(t, master)), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return st, m, a, dbPath
+	return st, m, "bench", dbPath
 }
 
 func readPublic(t *testing.T, armored string) *openpgp.Entity {
@@ -57,7 +53,7 @@ func readPublic(t *testing.T, armored string) *openpgp.Entity {
 func TestCreateAndSign(t *testing.T) {
 	_, m, a, _ := setup(t, nil)
 	ctx := context.Background()
-	k, err := m.Create(ctx, a.ID, a.Name)
+	k, err := m.Create(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +70,7 @@ func TestCreateAndSign(t *testing.T) {
 	if exp := k.ExpiresAt.Sub(k.CreatedAt); exp < 364*24*time.Hour || exp > 366*24*time.Hour {
 		t.Fatalf("validity = %v", exp)
 	}
-	signer, fpr, err := m.Signer(ctx, a.ID)
+	signer, fpr, err := m.Signer(ctx, a)
 	if err != nil || fpr != k.Fingerprint {
 		t.Fatalf("Signer: %v %s", err, fpr)
 	}
@@ -91,10 +87,10 @@ func TestCreateAndSign(t *testing.T) {
 func TestPrivateKeyNeverStoredInPlaintext(t *testing.T) {
 	st, m, a, dbPath := setup(t, nil)
 	ctx := context.Background()
-	if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
+	if _, err := m.Create(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	signer, _, err := m.Signer(ctx, a.ID)
+	signer, _, err := m.Signer(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +115,14 @@ func TestPrivateKeyNeverStoredInPlaintext(t *testing.T) {
 func TestWrongKEKFailsLoudly(t *testing.T) {
 	st, m, a, _ := setup(t, nil)
 	ctx := context.Background()
-	if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
+	if _, err := m.Create(ctx, a); err != nil {
 		t.Fatal(err)
 	}
 	wrong := keys.NewManager(st, keys.Options{Keyring: kr(9), Validity: time.Hour, Email: "gateway@example.com"})
-	if _, err := wrong.EnsureAll(ctx); err == nil || !strings.Contains(err.Error(), "decrypting signing key") {
+	if _, err := wrong.EnsureAll(ctx, []string{a}); err == nil || !strings.Contains(err.Error(), "decrypting signing key") {
 		t.Fatalf("EnsureAll with the wrong data key must fail loudly, got %v", err)
 	}
-	if _, _, err := wrong.Signer(ctx, a.ID); err == nil {
+	if _, _, err := wrong.Signer(ctx, a); err == nil {
 		t.Fatal("Signer with wrong KEK must fail")
 	}
 }
@@ -134,14 +130,14 @@ func TestWrongKEKFailsLoudly(t *testing.T) {
 func TestEnsureAllCreatesMissingKeys(t *testing.T) {
 	st, m, a, _ := setup(t, nil)
 	ctx := context.Background()
-	n, err := m.EnsureAll(ctx)
+	n, err := m.EnsureAll(ctx, []string{a})
 	if err != nil || n != 1 {
 		t.Fatalf("EnsureAll = %d, %v", n, err)
 	}
-	if _, err := st.ActiveKey(ctx, a.ID); err != nil {
+	if _, err := st.ActiveKey(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	n, _ = m.EnsureAll(ctx)
+	n, _ = m.EnsureAll(ctx, []string{a})
 	if n != 0 {
 		t.Fatal("second EnsureAll must not create keys")
 	}
@@ -150,19 +146,19 @@ func TestEnsureAllCreatesMissingKeys(t *testing.T) {
 func TestRotateKeepsOldSignaturesVerifiable(t *testing.T) {
 	st, m, a, _ := setup(t, nil)
 	ctx := context.Background()
-	old, _ := m.Create(ctx, a.ID, a.Name)
-	oldSigner, _, _ := m.Signer(ctx, a.ID)
+	old, _ := m.Create(ctx, a)
+	oldSigner, _, _ := m.Signer(ctx, a)
 	var sig bytes.Buffer
 	openpgp.DetachSign(&sig, oldSigner, strings.NewReader("before rotation"), nil)
 
-	nk, err := m.Rotate(ctx, a.ID, a.Name)
+	nk, err := m.Rotate(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if nk.Fingerprint == old.Fingerprint {
 		t.Fatal("rotation must create a new key")
 	}
-	ks, _ := st.ListKeys(ctx, a.ID)
+	ks, _ := st.ListKeys(ctx, a)
 	active := 0
 	for _, k := range ks {
 		if k.RetiredAt == nil {
@@ -172,7 +168,7 @@ func TestRotateKeepsOldSignaturesVerifiable(t *testing.T) {
 	if active != 1 {
 		t.Fatalf("exactly one active key expected, got %d", active)
 	}
-	_, fpr, _ := m.Signer(ctx, a.ID)
+	_, fpr, _ := m.Signer(ctx, a)
 	if fpr != nk.Fingerprint {
 		t.Fatal("signer must use the new key")
 	}
@@ -187,7 +183,7 @@ func TestRotateKeepsOldSignaturesVerifiable(t *testing.T) {
 
 func TestRevocationCertificates(t *testing.T) {
 	_, m, a, _ := setup(t, nil)
-	k, _ := m.Create(context.Background(), a.ID, a.Name)
+	k, _ := m.Create(context.Background(), a)
 	pub := readPublic(t, k.PublicKey)
 	if pub.Revoked(time.Now()) {
 		t.Fatal("published key must not be revoked")
@@ -217,7 +213,7 @@ func TestRevocationCertificates(t *testing.T) {
 func TestMasterCertification(t *testing.T) {
 	master := testutil.NewKey(t, "email-me master", "gateway@example.com")
 	_, m, a, _ := setup(t, master)
-	k, err := m.Create(context.Background(), a.ID, a.Name)
+	k, err := m.Create(context.Background(), a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +287,7 @@ func TestMasterSetLoadRemove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k, err := m.Create(ctx, a.ID, a.Name)
+	k, err := m.Create(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +313,7 @@ func TestMasterSetLoadRemove(t *testing.T) {
 	if err := again.LoadMaster(ctx); err != nil || again.Master() == nil || pgp.Fingerprint(again.Master()) != pgp.Fingerprint(e) {
 		t.Fatalf("LoadMaster: %v", err)
 	}
-	k2, err := again.Rotate(ctx, a.ID, a.Name)
+	k2, err := again.Rotate(ctx, a)
 	if err != nil || !certifiedBy(t, k2.PublicKey, e) {
 		t.Fatalf("the loaded key must certify: %v", err)
 	}
@@ -328,7 +324,7 @@ func TestMasterSetLoadRemove(t *testing.T) {
 	if err := again.RemoveMaster(ctx); err != nil || again.Master() != nil {
 		t.Fatalf("RemoveMaster: %v", err)
 	}
-	k3, err := again.Rotate(ctx, a.ID, a.Name)
+	k3, err := again.Rotate(ctx, a)
 	if err != nil || certifiedBy(t, k3.PublicKey, e) {
 		t.Fatalf("a key generated after RemoveMaster is not certified: %v", err)
 	}
@@ -344,12 +340,12 @@ func TestExpiredKey(t *testing.T) {
 	st, _, a, _ := setup(t, nil)
 	m := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 24 * time.Hour, Email: "gateway@example.com"})
 	ctx := context.Background()
-	if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
+	if _, err := m.Create(ctx, a); err != nil {
 		t.Fatal(err)
 	}
 	later := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 24 * time.Hour, Email: "gateway@example.com"})
 	keys.SetNow(later, func() time.Time { return time.Now().Add(48 * time.Hour) })
-	if _, _, err := later.Signer(ctx, a.ID); !errors.Is(err, keys.ErrExpired) {
+	if _, _, err := later.Signer(ctx, a); !errors.Is(err, keys.ErrExpired) {
 		t.Fatalf("want ErrExpired, got %v", err)
 	}
 }
@@ -360,7 +356,7 @@ func TestDisabled(t *testing.T) {
 	if m.Enabled() {
 		t.Fatal("no KEK means disabled")
 	}
-	if _, _, err := m.Signer(context.Background(), a.ID); !errors.Is(err, keys.ErrNotConfigured) {
+	if _, _, err := m.Signer(context.Background(), a); !errors.Is(err, keys.ErrNotConfigured) {
 		t.Fatal(err)
 	}
 }
@@ -368,28 +364,25 @@ func TestDisabled(t *testing.T) {
 func TestNoKeysWithoutFromAddress(t *testing.T) {
 	st, m, a, _ := setup(t, nil)
 	ctx := context.Background()
-	b, err := st.CreateAgent(ctx, "other", "", policy.Policy{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.Create(ctx, b.ID, b.Name); err != nil {
+	b := "other"
+	if _, err := m.Create(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 	noFrom := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 365 * 24 * time.Hour})
-	if _, err := noFrom.Create(ctx, a.ID, a.Name); !errors.Is(err, keys.ErrNoFrom) {
+	if _, err := noFrom.Create(ctx, a); !errors.Is(err, keys.ErrNoFrom) {
 		t.Fatalf("Create without a From address: %v", err)
 	}
-	if _, err := noFrom.Rotate(ctx, b.ID, b.Name); !errors.Is(err, keys.ErrNoFrom) {
+	if _, err := noFrom.Rotate(ctx, b); !errors.Is(err, keys.ErrNoFrom) {
 		t.Fatalf("Rotate without a From address: %v", err)
 	}
-	n, err := noFrom.EnsureAll(ctx)
+	n, err := noFrom.EnsureAll(ctx, []string{a, b})
 	if n != 0 || !errors.Is(err, keys.ErrNoFrom) {
 		t.Fatalf("EnsureAll without a From address: %d, %v", n, err)
 	}
-	if _, err := st.ActiveKey(ctx, a.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := st.ActiveKey(ctx, a); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("no key may be generated without a From address")
 	}
-	if n, err := m.EnsureAll(ctx); n != 1 || err != nil {
+	if n, err := m.EnsureAll(ctx, []string{a}); n != 1 || err != nil {
 		t.Fatalf("EnsureAll with a From address: %d, %v", n, err)
 	}
 }
@@ -400,19 +393,19 @@ func TestFromFollowsSettings(t *testing.T) {
 	var from string
 	validity := 24 * time.Hour
 	m := keys.NewManager(st, keys.Options{Keyring: kr(7), From: func() (string, time.Duration) { return from, validity }})
-	if n, err := m.EnsureAll(ctx); n != 0 || !errors.Is(err, keys.ErrNoFrom) {
+	if n, err := m.EnsureAll(ctx, []string{a}); n != 0 || !errors.Is(err, keys.ErrNoFrom) {
 		t.Fatalf("EnsureAll without a From address: %d, %v", n, err)
 	}
 
 	// The From address is saved: the same manager generates keys with it.
 	from, validity = "gateway@example.com", 48*time.Hour
-	if m.UserID(a.Name) != "bench via email-me <gateway@example.com>" {
-		t.Fatalf("user ID = %q", m.UserID(a.Name))
+	if m.UserID(a) != "bench via email-me <gateway@example.com>" {
+		t.Fatalf("user ID = %q", m.UserID(a))
 	}
-	if n, err := m.EnsureAll(ctx); n != 1 || err != nil {
+	if n, err := m.EnsureAll(ctx, []string{a}); n != 1 || err != nil {
 		t.Fatalf("EnsureAll with a From address: %d, %v", n, err)
 	}
-	k, err := st.ActiveKey(ctx, a.ID)
+	k, err := st.ActiveKey(ctx, a)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +413,7 @@ func TestFromFollowsSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id := el[0].PrimaryIdentity(); id == nil || id.Name != m.UserID(a.Name) {
+	if id := el[0].PrimaryIdentity(); id == nil || id.Name != m.UserID(a) {
 		t.Fatalf("key user ID = %+v", id)
 	}
 	if got := k.ExpiresAt.Sub(k.CreatedAt); got != 48*time.Hour {

@@ -30,7 +30,6 @@ import (
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
-	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/units"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -151,7 +150,7 @@ func TestAuthentication(t *testing.T) {
 	expired := h.token(a, nil, &past)
 	revoked := h.token(a, nil, nil)
 	rid, _, _ := strings.Cut(strings.TrimPrefix(revoked, "em_"), "_")
-	h.st.RevokeToken(context.Background(), a.ID, rid)
+	h.st.RevokeToken(context.Background(), a.Name, rid)
 
 	cases := map[string]func(*http.Request){
 		"missing":      func(r *http.Request) { r.Header.Del("Authorization") },
@@ -177,11 +176,13 @@ func TestAuthentication(t *testing.T) {
 	if got.LastUsedAt == nil || got.LastUsedIP != "127.0.0.1" {
 		t.Fatalf("last use not recorded: %+v", got)
 	}
-	h.st.UpdateAgent(context.Background(), a.ID, "", false)
+	disabled := *a
+	disabled.Disabled = true
+	h.putAgent(&disabled)
 	if r := h.do("POST", "/v1/messages", tok, msg("me", "x", "y")); r.status != 403 || r.code(t) != "agent_disabled" {
 		t.Fatalf("disabled agent: %d %s", r.status, r.body)
 	}
-	if rows := h.auditRows(a.ID); len(rows) != 1 || rows[0].ErrorCode != "agent_disabled" {
+	if rows := h.auditRows(a.Name); len(rows) != 1 || rows[0].ErrorCode != "agent_disabled" {
 		t.Fatalf("disabled-agent attempt must be audited: %+v", rows)
 	}
 }
@@ -237,7 +238,7 @@ func TestCapabilities(t *testing.T) {
 	if !slices.Contains(c.Services, "sign") {
 		t.Fatal("require_signing (default) implies the sign service")
 	}
-	k, _ := h.st.ActiveKey(context.Background(), a.ID)
+	k, _ := h.st.ActiveKey(context.Background(), a.Name)
 	if !c.Signing.Available || !c.Signing.Required || !c.Signing.Default || c.Signing.Fingerprint != k.Fingerprint {
 		t.Fatalf("signing: %+v", c.Signing)
 	}
@@ -288,7 +289,7 @@ func TestSendSignedMarkdownByDefault(t *testing.T) {
 	if outer.Header.Get("Subject") != "[bench] Nightly results" || outer.Header.Get("X-Email-Me-Agent") != "bench" || outer.Header.Get("In-Reply-To") == "" {
 		t.Fatalf("headers: %v", outer.Header)
 	}
-	pr, err := pgpmail.Read(bytes.NewReader(c.Data), openpgp.EntityList{agentPublicKey(t, h, a.ID)}, nil, nil)
+	pr, err := pgpmail.Read(bytes.NewReader(c.Data), openpgp.EntityList{agentPublicKey(t, h, a.Name)}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,12 +304,12 @@ func TestSendSignedMarkdownByDefault(t *testing.T) {
 	if inner.Header.Get("X-Email-Me-Agent") != "bench" {
 		t.Fatal("agent attribution must be inside the signed entity")
 	}
-	rows := h.auditRows(a.ID)
+	rows := h.auditRows(a.Name)
 	if len(rows) != 1 {
 		t.Fatalf("audit rows: %d", len(rows))
 	}
 	e := rows[0]
-	k, _ := h.st.ActiveKey(context.Background(), a.ID)
+	k, _ := h.st.ActiveKey(context.Background(), a.Name)
 	if e.Status != "sent" || !e.Signed || e.SigningKeyFpr != k.Fingerprint || e.Transport != "local" || e.Subject != "" ||
 		!hasString(e.Services, "markdown") || !hasString(e.Services, "sign") || !hasString(e.Services, "thread") || e.MessageID == "" {
 		t.Fatalf("audit row: %+v", e)
@@ -339,7 +340,7 @@ func TestSendEncryptedAndSigned(t *testing.T) {
 	if outer.Header.Get("Subject") != "[bench] Encrypted message" {
 		t.Fatalf("outer subject = %q", outer.Header.Get("Subject"))
 	}
-	pr, err := pgpmail.Read(bytes.NewReader(c.Data), openpgp.EntityList{h.env.WorkKey, agentPublicKey(t, h, a.ID)}, nil, nil)
+	pr, err := pgpmail.Read(bytes.NewReader(c.Data), openpgp.EntityList{h.env.WorkKey, agentPublicKey(t, h, a.Name)}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,8 +451,8 @@ func TestSendE2E(t *testing.T) {
 
 func TestE2EBlockedWhenSigningRequired(t *testing.T) {
 	h := newHarness(t, testutil.Options{Signing: true})
-	// The dashboard refuses to save this combination; set it directly to test the API guard.
-	_, tok := h.agent("x", policy.Policy{Recipients: ptr([]string{"me"}), Services: ptr([]string{policy.SvcE2E})})
+	// Validation refuses this combination; bypass it to test the API guard.
+	tok := h.uncheckedAgent("x", policy.Policy{Recipients: ptr([]string{"me"}), Services: ptr([]string{policy.SvcE2E})})
 	send := map[string]any{"to": []string{"me"}, "body": map[string]any{"pgp_message": "x"}, "options": map[string]any{"encrypt": "e2e"}}
 	r := h.do("POST", "/v1/messages", tok, send)
 	if r.status != 403 || r.code(t) != "signing_required" {
@@ -507,7 +508,8 @@ func TestSigningNotConfigured(t *testing.T) {
 	if r := h.do("POST", "/v1/messages", withSvc, body); r.status != 503 || r.code(t) != "signing_unavailable" {
 		t.Fatalf("sign unavailable: %d %s", r.status, r.body)
 	}
-	_, req := h.agent("c", policy.Policy{Recipients: ptr([]string{"me"}), RequireSigning: ptr(true)})
+	// Validation refuses require_signing without a KEK; bypass it to test the API guard.
+	req := h.uncheckedAgent("c", policy.Policy{Recipients: ptr([]string{"me"}), RequireSigning: ptr(true)})
 	if r := h.do("POST", "/v1/messages", req, msg("me", "s", "b")); r.status != 503 || r.code(t) != "signing_unavailable" {
 		t.Fatalf("required but unconfigured: %d %s", r.status, r.body)
 	}
@@ -517,7 +519,7 @@ func TestExpiredSigningKey(t *testing.T) {
 	h := newHarness(t, testutil.Options{Signing: true})
 	a, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"})})
 	short := keys.NewManager(h.st, keys.Options{Keyring: testutil.Keyring(t, h.env, h.st), Validity: time.Second, Email: "gateway@example.com"})
-	if _, err := short.Rotate(context.Background(), a.ID, a.Name); err != nil {
+	if _, err := short.Rotate(context.Background(), a.Name); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(1100 * time.Millisecond)
@@ -591,7 +593,7 @@ func TestRejections(t *testing.T) {
 	if h.env.SMTP.Count() != 0 {
 		t.Fatal("rejected requests must not be delivered")
 	}
-	rows := h.auditRows(a.ID)
+	rows := h.auditRows(a.Name)
 	if len(rows) != len(cases) {
 		t.Fatalf("every rejection must be audited: %d rows for %d cases", len(rows), len(cases))
 	}
@@ -642,7 +644,7 @@ func TestUpstreamFailureAndIdempotency(t *testing.T) {
 	if r.status != 502 || r.code(t) != "upstream_failed" || r.json(t)["details"].(map[string]any)["upstream_code"].(float64) != 451 {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
-	rows := h.auditRows(a.ID)
+	rows := h.auditRows(a.Name)
 	if rows[0].Status != "failed" || rows[0].UpstreamCode != 451 {
 		t.Fatalf("audit: %+v", rows[0])
 	}
@@ -701,11 +703,11 @@ func TestInsecureTransportIsRecorded(t *testing.T) {
 		t.Fatalf("transport = %v", caps["transport"])
 	}
 	h.do("POST", "/v1/messages", tok, msg("me", "s", "b"), withHost("gateway.example.com"))
-	if rows := h.auditRows(a.ID); rows[0].Transport != "insecure" {
+	if rows := h.auditRows(a.Name); rows[0].Transport != "insecure" {
 		t.Fatal(rows[0].Transport)
 	}
 	ids, _ := h.st.InsecureAgents(context.Background(), time.Now().Add(-time.Hour))
-	if len(ids) != 1 || ids[0] != a.ID {
+	if len(ids) != 1 || ids[0] != a.Name {
 		t.Fatal(ids)
 	}
 }
@@ -851,29 +853,29 @@ func TestExpiredRecipientKey(t *testing.T) {
 	}
 }
 
-func TestDamagedRecipientKey(t *testing.T) {
+// Tokens of an agent removed from config.yaml are inert: they resolve to
+// no agent. Re-adding the agent revives them.
+func TestRemovedAgentTokensAreInert(t *testing.T) {
 	h := newHarness(t, testutil.Options{})
 	ctx := context.Background()
-	if err := h.st.CreateRecipient(ctx, &store.Recipient{Alias: "bad", Address: "bad@example.com", PublicKey: "not a key", RequireEncryption: true}); err != nil {
+	a, tok := h.agent("gone", policy.Policy{Recipients: ptr([]string{"me"})})
+	if r := h.do("GET", "/v1/capabilities", tok, nil); r.status != 200 {
+		t.Fatalf("before: %d %s", r.status, r.body)
+	}
+	// As a hand edit of config.yaml would: the tokens stay in the store.
+	if err := h.settings.DeleteAgent(ctx, a.Name); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.reg.Reload(ctx); err != nil {
-		t.Fatalf("a damaged stored key must not fail the reload: %v", err)
+	tok2 := h.token(a, nil, nil)
+	if r := h.do("POST", "/v1/messages", tok2, msgText("me")); r.status != 401 || r.code(t) != "unauthorized" {
+		t.Fatalf("a token of a removed agent: %d %s", r.status, r.body)
 	}
-	_, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"bad"}), Services: ptr([]string{policy.SvcEncrypt, policy.SvcE2E})})
-	body := map[string]any{"to": []string{"bad"}, "subject": "s", "body": map[string]any{"text": "b"}, "options": map[string]any{"encrypt": "pgp"}}
-	if r := h.do("POST", "/v1/messages", tok, body); r.status != 503 || r.code(t) != "encryption_unavailable" {
-		t.Fatalf("pgp to a damaged key: %d %s", r.status, r.body)
+	testutil.AddAgent(t, h.settings, "gone", a.Policy)
+	if r := h.do("POST", "/v1/messages", tok2, msgText("me")); r.status != 200 {
+		t.Fatalf("re-added: %d %s", r.status, r.body)
 	}
-	plain := map[string]any{"to": []string{"bad"}, "subject": "s", "body": map[string]any{"text": "b"}}
-	if r := h.do("POST", "/v1/messages", tok, plain); r.status != 403 || r.code(t) != "encryption_required" {
-		t.Fatalf("require_encryption must still hold: %d %s", r.status, r.body)
-	}
-	if r := h.do("GET", "/v1/recipients/bad/pgp-key", tok, nil); r.status != 503 {
-		t.Fatalf("a damaged key must not be served: %d", r.status)
-	}
-	if h.env.SMTP.Count() != 0 {
-		t.Fatal("nothing may be delivered")
+	if h.env.SMTP.Count() != 1 {
+		t.Fatal("one message")
 	}
 }
 
@@ -899,9 +901,7 @@ func TestRecipientChangesApplyWithoutRestart(t *testing.T) {
 
 	// Adding a key to ops: encryption becomes available and the new key is served.
 	key := testutil.NewKey(t, "Ops", "ops@example.net")
-	if _, err := h.reg.Update(ctx, "ops", recipients.Input{Address: "ops@example.net", Description: "Ops pager", PublicKeyArmor: testutil.ArmorPublic(t, key)}); err != nil {
-		t.Fatal(err)
-	}
+	h.putRecipient(recipients.Input{Alias: "ops", Address: "ops@example.net", Description: "Ops pager", PublicKeyArmor: testutil.ArmorPublic(t, key)}, false)
 	if capsFor()["ops"]["encryption_available"] != true {
 		t.Fatal("new key must be advertised")
 	}
@@ -914,9 +914,7 @@ func TestRecipientChangesApplyWithoutRestart(t *testing.T) {
 	}
 
 	// A recipient created while the agent's policy already names it becomes usable.
-	if _, err := h.reg.Create(ctx, recipients.Input{Alias: "pager", Address: "pager@example.net", Description: "Pager"}); err != nil {
-		t.Fatal(err)
-	}
+	h.putRecipient(recipients.Input{Alias: "pager", Address: "pager@example.net", Description: "Pager"}, true)
 	if _, ok := capsFor()["pager"]; !ok {
 		t.Fatal("created recipient must be advertised")
 	}
@@ -925,7 +923,7 @@ func TestRecipientChangesApplyWithoutRestart(t *testing.T) {
 	}
 
 	// Deleting ops: it disappears and sends to it are refused.
-	if err := h.reg.Delete(ctx, "ops"); err != nil {
+	if err := h.settings.DeleteRecipient(ctx, "ops"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := capsFor()["ops"]; ok {
@@ -962,7 +960,7 @@ func TestSettingsApplyWithoutRestart(t *testing.T) {
 	a, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"})})
 	save := func(f func(*config.Settings)) {
 		t.Helper()
-		s := h.settings.Saved()
+		s := h.settings.Current().Managed()
 		f(&s)
 		if _, err := h.settings.Save(ctx, s, settings.PasswordChange{}); err != nil {
 			t.Fatal(err)
@@ -993,7 +991,7 @@ func TestSettingsApplyWithoutRestart(t *testing.T) {
 	if r := h.do("POST", "/v1/messages", tok, msg("me", "second", "b")); r.status != 200 {
 		t.Fatalf("send: %d %s", r.status, r.body)
 	}
-	if rows := h.auditRows(a.ID); len(rows) != 2 || !strings.Contains(rows[0].Subject, "second") || rows[1].Subject != "" {
+	if rows := h.auditRows(a.Name); len(rows) != 2 || !strings.Contains(rows[0].Subject, "second") || rows[1].Subject != "" {
 		t.Fatalf("audit subjects: %q, %q", rows[0].Subject, rows[1].Subject)
 	}
 

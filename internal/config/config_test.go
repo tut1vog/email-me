@@ -3,7 +3,6 @@ package config_test
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,30 +10,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	emailme "github.com/tut1vog/email-me"
+
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/units"
 )
 
 func TestLoadValidConfig(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{Signing: true})
+	env := testutil.NewEnv(t, testutil.Options{Signing: true, Agents: "bot:\n  policy:\n    recipients: [me]\nidle:\n"})
 	c, err := config.Load(env.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.DefaultPolicy.Services != nil {
-		t.Fatal("Load must not resolve managed settings")
-	}
 	// The password is never in the file: a username without one warns.
-	if problems, warnings := c.ValidateManaged(); len(problems) != 0 || !slices.Equal(warnings, []string{config.SMTPPasswordMissing}) {
-		t.Fatalf("seed: %v %v", problems, warnings)
+	if !slices.Equal(c.Warnings, []string{config.SMTPPasswordMissing}) || len(c.BootstrapWarnings) != 0 {
+		t.Fatalf("warnings: %v", c.Warnings)
 	}
 	if !c.SigningConfigured() || len(c.KEK.Key) != 32 || c.KEK.Previous != nil {
 		t.Fatal("signing should be configured")
 	}
-	if !strings.Contains(c.Recipients["me"].PublicKeyArmor, "BEGIN PGP PUBLIC KEY BLOCK") || c.Recipients["ops"].PublicKeyArmor != "" {
-		t.Fatal("recipient keys loaded incorrectly")
+	me, ok := c.Recipient("me")
+	if !ok || me.Alias != "me" || me.Fingerprint() != pgp.Fingerprint(env.MeKey) || !me.KeyUsable(time.Now()) {
+		t.Fatalf("recipient me: %+v", me)
+	}
+	if ops, _ := c.Recipient("ops"); ops.Key != nil || ops.KeyUsable(time.Now()) {
+		t.Fatal("ops has no key")
+	}
+	if got := strings.Join(c.Aliases(), ","); got != "me,ops,work" {
+		t.Fatalf("aliases %s", got)
+	}
+	// An agent with nothing set is an enabled agent with the defaults.
+	if got := strings.Join(c.AgentNames(), ","); got != "bot,idle" {
+		t.Fatalf("agents %s", got)
+	}
+	if idle, ok := c.Agent("idle"); !ok || !idle.Enabled() || idle.Name != "idle" {
+		t.Fatalf("idle: %+v", idle)
+	}
+	if bot, _ := c.Agent("bot"); !slices.Equal(c.Effective(bot.Policy).Recipients, []string{"me"}) {
+		t.Fatal("bot's policy")
 	}
 	if !c.DefaultPolicy.RequireSigning || !c.DefaultPolicy.HasService(policy.SvcSign) {
 		t.Fatal("signing must be on by default when configured")
@@ -51,24 +69,28 @@ func TestSigningOffByDefaultWithoutSigning(t *testing.T) {
 	}
 }
 
+// writeConfig writes a config.yaml and an empty KEK file (no KEK) into a
+// new directory.
 func writeConfig(t *testing.T, yaml string) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "config.yaml")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "kek"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return p
 }
 
-const badManaged = `
+const badConfig = `
 api:
   listen: "nope"
   docs: sometimes
   trusted_proxies: ["not-an-ip"]
-dashboard:
-  session_ttl: 30s
 kek:
-  file: /does/not/exist
+  file: does/not/exist
 upstream:
   smtp:
     host: smtp.example.com
@@ -90,80 +112,63 @@ audit:
   retention_days: -1
 log:
   level: loud
+agents:
+  Bad_Name:
+    description: "two\nlines"
+  e2e:
+    policy:
+      services: [e2e]
+      require_signing: true
+      rate_limit: {per_hour: 0, per_day: 1}
 `
 
 func TestValidationCollectsAllProblems(t *testing.T) {
-	_, err := config.Load(writeConfig(t, badManaged))
+	_, err := config.Load(writeConfig(t, badConfig))
 	var ve *config.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("want ValidationError, got %v", err)
 	}
 	joined := strings.Join(ve.Problems, "\n")
 	for _, want := range []string{
-		"api.listen", "kek.file", `"Bad_Alias"`, "recipients.Bad_Alias.address",
-		"recipients.ok.require_encryption", "log.level",
+		// bootstrap
+		"api.listen", "kek.file", "log.level",
+		// managed settings
+		"api.docs", "trusted_proxies", "security none", "upstream.from", "fax",
+		"defaults.policy.require_signing is true but signing is not configured", "retention_days",
+		// recipients and agents
+		`"Bad_Alias"`, "recipients.Bad_Alias.address", "recipients.ok.require_encryption",
+		`"Bad_Name"`, "agents.Bad_Name.description must be a single line",
+		"agents.e2e.policy: rate_limit", "agents.e2e.policy: require_signing is true but signing is not configured",
+		"agents.e2e.policy: require_signing and the e2e service are mutually exclusive",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Errorf("missing bootstrap problem %q in:\n%s", want, joined)
-		}
-	}
-	// Managed keys are not checked by Load: only when they seed the
-	// database or are saved (ValidateManaged).
-	for _, managed := range []string{"api.docs", "upstream", "fax", "retention_days"} {
-		if strings.Contains(joined, managed) {
-			t.Errorf("Load reported managed key %q:\n%s", managed, joined)
-		}
-	}
-
-	env := testutil.NewEnv(t, testutil.Options{})
-	empty := filepath.Join(env.Dir, "empty_kek")
-	os.WriteFile(empty, nil, 0o600)
-	yaml := strings.NewReplacer(`"nope"`, `"127.0.0.1:0"`, "/does/not/exist", empty, "loud", "info").Replace(badManaged)
-	start, end := strings.Index(yaml, "recipients:\n  Bad"), strings.Index(yaml, "defaults:\n")
-	c, err := config.Load(writeConfig(t, yaml[:start]+yaml[end:]))
-	if err != nil {
-		t.Fatalf("valid bootstrap keys must load: %v", err)
-	}
-	problems, warnings := c.ValidateManaged()
-	joined = strings.Join(problems, "\n")
-	for _, want := range []string{
-		"api.docs", "trusted_proxies", "session_ttl must be at least 1m", "security none",
-		"upstream.from", "fax", "require_signing is true but signing is not configured", "retention_days",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("missing managed problem %q in:\n%s", want, joined)
+			t.Errorf("missing problem %q in:\n%s", want, joined)
 		}
 	}
 	// A username without a password is only a warning: it is entered on
 	// the dashboard.
-	if strings.Contains(joined, "password") || !slices.Contains(warnings, config.SMTPPasswordMissing) {
-		t.Errorf("password: %v %v", problems, warnings)
+	if strings.Contains(joined, "password") {
+		t.Errorf("password: %v", joined)
 	}
 }
 
-func TestBootstrapOnlyConfig(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	yaml := fmt.Sprintf("data_dir: %q\n", env.DataDir)
-	c, err := config.Load(writeConfig(t, yaml))
+func TestMinimalConfig(t *testing.T) {
+	c, err := config.Load(writeConfig(t, ""))
 	if err != nil {
-		t.Fatalf("a file with only bootstrap keys must load: %v", err)
+		t.Fatalf("an empty file must load: %v", err)
 	}
-	if !c.Managed().IsZero() {
-		t.Fatalf("no managed keys were set: %+v", c.Managed())
+	if !slices.Equal(c.Warnings, []string{config.UpstreamNotConfigured}) {
+		t.Fatalf("unconfigured upstream must be a warning: %v", c.Warnings)
 	}
-	problems, warnings := c.ValidateManaged()
-	if len(problems) != 0 {
-		t.Fatalf("defaults must be valid: %v", problems)
+	if c.API.Listen != "127.0.0.1:8025" || c.Dashboard.Listen != "127.0.0.1:8026" || c.KEK.File != "kek" || c.KEK.PreviousFile != "previous_kek" {
+		t.Fatalf("bootstrap defaults: %+v %+v", c.API, c.KEK)
 	}
-	if len(warnings) != 1 || warnings[0] != "upstream SMTP is not configured: set it on the Settings page" {
-		t.Fatalf("unconfigured upstream must be a warning: %v", warnings)
-	}
-	if c.Upstream.SMTP.Port != 587 || c.API.Docs != "public" || c.Dashboard.SessionTTL.D() != 12*time.Hour || c.Audit.RetentionDays != 30 {
+	if c.Upstream.SMTP.Port != 587 || c.API.Docs != "public" || c.Audit.RetentionDays != 30 {
 		t.Fatalf("managed defaults not applied: %+v", c.Managed())
 	}
 	// Format is checked only when set.
 	c.Upstream.SMTP.Host, c.Upstream.From = "smtp.example.com:587", "nope"
-	problems, warnings = c.ValidateManaged()
+	problems, warnings := c.ValidateManaged()
 	if len(problems) != 2 || len(warnings) != 0 {
 		t.Fatalf("got %v %v", problems, warnings)
 	}
@@ -181,28 +186,37 @@ func TestKEKFiles(t *testing.T) {
 	hex1 := strings.Repeat("ab", 32)
 	hex2 := strings.Repeat("cd", 32)
 	load := func(kek string) (*config.Config, error) {
-		return config.Load(writeConfig(t, fmt.Sprintf("data_dir: %q\nkek:\n%ssigning:\n  key_validity: 1y\n", dir, kek)))
+		return config.Load(write("config.yaml", "kek:\n"+kek+"signing:\n  key_validity: 1y\n"))
 	}
 
-	c, err := load(fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("kek", hex1+"\n"), write("prev", hex2)))
+	// Paths are relative to the file's directory.
+	write("kek", hex1+"\n")
+	write("previous_kek", hex2)
+	c, err := load("")
 	if err != nil || !c.KEK.Configured() || c.KEK.Key[0] != 0xab || c.KEK.Previous[0] != 0xcd || !c.SigningConfigured() {
 		t.Fatalf("both keys: %+v %v", c, err)
 	}
-	// An empty file is no KEK (compose mounts an empty variable), which
-	// also leaves signing off; a missing previous file is no previous KEK.
-	// The signing settings are kept for when a KEK is set.
-	c, err = load(fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("empty", "\n"), filepath.Join(dir, "absent")))
+	if c.Path("kek") != filepath.Join(dir, "kek") || c.Path("/abs") != "/abs" {
+		t.Fatal("Path")
+	}
+	// An empty file is no KEK, which also leaves signing off; a missing
+	// previous file is no previous KEK. The signing settings are kept for
+	// when a KEK is set.
+	write("empty", "\n")
+	c, err = load("  file: empty\n  previous_file: absent\n")
 	if err != nil || c.KEK.Key != nil || c.KEK.Previous != nil || c.SigningConfigured() {
 		t.Fatalf("empty: %+v %v", c, err)
 	}
 	if got := c.Managed().Signing.KeyValidity.D(); got != 365*24*time.Hour {
 		t.Fatalf("key_validity without a KEK: %v, want the file's 1y", got)
 	}
+	write("short", "abc")
+	write("bad", "x")
 	for kek, want := range map[string]string{
-		fmt.Sprintf("  file: %q\n", filepath.Join(dir, "absent")):                              "kek.file",
-		fmt.Sprintf("  file: %q\n", write("short", "abc")):                                     "kek.file: must contain 32 random bytes",
-		fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("k2", hex1), write("bad", "x")): "kek.previous_file: must contain",
-		fmt.Sprintf("  previous_file: %q\n", write("p2", hex2)):                                "kek.previous_file is set but kek.file is not",
+		"  file: absent\n":                      "kek.file",
+		"  file: short\n":                       "kek.file: must contain 32 random bytes",
+		"  previous_file: bad\n":                "kek.previous_file: must contain",
+		"  file: empty\n  previous_file: kek\n": "kek.previous_file is set but kek.file is empty",
 	} {
 		if _, err := load(kek); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: want %q, got %v", kek, want, err)
@@ -213,7 +227,6 @@ func TestKEKFiles(t *testing.T) {
 func TestManagedRoundTrip(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{DefaultsPolicy: "recipients: [me]\nrate_limit: {per_hour: 5, per_day: 10}", TrustedProxies: []string{"10.0.0.1"}})
 	c, _ := config.Load(env.Path)
-	c.ValidateManaged()
 	s := c.Managed()
 	if c.SigningConfigured() || s.Signing.KeyValidity.D() != 2*365*24*time.Hour {
 		t.Fatalf("no signing configured, key_validity defaulted: %v", s.Signing.KeyValidity)
@@ -275,12 +288,11 @@ func TestDiffSettings(t *testing.T) {
 	b.Upstream.SMTP.Port = 2525
 	b.Upstream.SMTP.Password = "not compared"
 	b.API.Docs = "authenticated"
-	b.Dashboard.SessionTTL = units.Duration(time.Hour)
 	five := 5
 	b.Defaults.Policy.MaxAttachments = &five
 	b.Defaults.Policy.RateLimit = &policy.RateLimit{PerHour: 1, PerDay: 2}
 	b.API.TrustedProxies = []string{}
-	want := "api.docs,dashboard.session_ttl,defaults.policy.max_attachments,defaults.policy.rate_limit,upstream.smtp.port"
+	want := "api.docs,defaults.policy.max_attachments,defaults.policy.rate_limit,upstream.smtp.port"
 	if d := config.DiffSettings(a, b); strings.Join(d, ",") != want {
 		t.Fatalf("diff = %v", d)
 	}
@@ -324,17 +336,80 @@ func TestValidateManagedRepeatable(t *testing.T) {
 	}
 }
 
-func TestRecipientsAreOptionalSeeds(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{DefaultsPolicy: "recipients: [ghost]"})
-	start := strings.Index(env.YAML, "recipients:\n")
-	end := strings.Index(env.YAML, "defaults:\n")
-	yaml := env.YAML[:start] + env.YAML[end:]
-	c, err := config.Load(writeConfig(t, yaml))
+func TestUnknownAliasesAreWarnings(t *testing.T) {
+	c, err := config.Load(writeConfig(t, "defaults:\n  policy:\n    recipients: [ghost]\nagents:\n  bot:\n    policy:\n      recipients: [phantom]\n"))
 	if err != nil {
-		t.Fatalf("no recipients and an unknown default alias must load: %v", err)
+		t.Fatalf("no recipients and unknown aliases must load: %v", err)
 	}
-	if len(c.Recipients) != 0 || (*c.Defaults.Policy.Recipients)[0] != "ghost" {
-		t.Fatalf("got %+v", c.Recipients)
+	joined := strings.Join(c.Warnings, "\n")
+	if !strings.Contains(joined, "defaults.policy.recipients names recipients that do not exist and are ignored: ghost") ||
+		!strings.Contains(joined, "agent bot: its policy names recipients that do not exist and are ignored: phantom") {
+		t.Fatalf("warnings: %s", joined)
+	}
+	bot, _ := c.Agent("bot")
+	if len(c.Effective(bot.Policy).Recipients) != 0 || !slices.Equal(c.UnknownAliases(bot.Policy), []string{"phantom"}) {
+		t.Fatal("unknown aliases are dropped from the effective policy")
+	}
+	if refs := c.ReferencingAgents("phantom"); len(refs) != 1 || refs[0].Name != "bot" || len(c.ReferencingAgents("ghost")) != 0 {
+		t.Fatal("ReferencingAgents counts the agents' own policies only")
+	}
+}
+
+func TestRecipientKeys(t *testing.T) {
+	key := testutil.NewKey(t, "K", "k@example.com")
+	expired, err := openpgp.NewEntity("E", "", "e@example.com", &packet.Config{
+		Algorithm: packet.PubKeyAlgoEdDSA, KeyLifetimeSecs: 3600,
+		Time: func() time.Time { return time.Now().Add(-48 * time.Hour) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := func(armor string) string {
+		return "|\n      " + strings.ReplaceAll(strings.TrimSpace(armor), "\n", "\n      ") + "\n"
+	}
+	recipient := func(key string) string {
+		return "recipients:\n  r:\n    address: r@example.com\n    pgp_public_key: " + key
+	}
+	c, err := config.Load(writeConfig(t, recipient(block(testutil.ArmorPublic(t, key)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := c.Recipient("r"); r.Fingerprint() != pgp.Fingerprint(key) {
+		t.Fatal("the key is parsed")
+	}
+	for armor, want := range map[string]string{
+		block(testutil.ArmorPrivate(t, key)): "is a private key",
+		"not a key\n":                        "recipients.r.pgp_public_key",
+	} {
+		if _, err := config.Load(writeConfig(t, recipient(armor))); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("want %q, got %v", want, err)
+		}
+	}
+	// A key that expired since it was added loads, with a warning.
+	c, err = config.Load(writeConfig(t, recipient(block(testutil.ArmorPublic(t, expired)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := c.Recipient("r"); r.Key == nil || r.KeyUsable(time.Now()) || !strings.Contains(strings.Join(c.Warnings, "\n"), "recipient r:") {
+		t.Fatalf("expired key: %v", c.Warnings)
+	}
+}
+
+func TestExampleConfig(t *testing.T) {
+	c, err := config.Parse(emailme.ExampleConfig, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "kek.file") {
+		t.Fatalf("the example needs its KEK file: %v", err)
+	}
+	p := writeConfig(t, string(emailme.ExampleConfig))
+	os.WriteFile(filepath.Join(filepath.Dir(p), "kek"), []byte(strings.Repeat("ab", 32)), 0o600)
+	if c, err = config.Load(p); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.Warnings, []string{config.UpstreamNotConfigured}) || len(c.Recipients) != 0 || len(c.Agents) != 0 {
+		t.Fatalf("example: %v", c.Warnings)
+	}
+	if !c.DefaultPolicy.RequireSigning || !c.DefaultPolicy.HasService(policy.SvcSign) {
+		t.Fatal("the example signs by default")
 	}
 }
 
@@ -346,21 +421,17 @@ func TestUnknownFieldRejected(t *testing.T) {
 }
 
 func TestDefaultsRejectE2EWithRequiredSigning(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{Signing: true})
-	yaml := env.YAML + "defaults:\n  policy:\n    services: [markdown, e2e]\n"
-	c, err := config.Load(writeConfig(t, yaml))
-	if err != nil {
-		t.Fatal(err)
+	load := func(policy string) error {
+		p := writeConfig(t, "defaults:\n  policy:\n"+policy)
+		os.WriteFile(filepath.Join(filepath.Dir(p), "kek"), []byte(strings.Repeat("ab", 32)), 0o600)
+		_, err := config.Load(p)
+		return err
 	}
-	if problems, _ := c.ValidateManaged(); len(problems) != 1 || !strings.Contains(problems[0], "mutually exclusive") {
-		t.Fatalf("e2e with default require_signing must be rejected: %v", problems)
+	if err := load("    services: [markdown, e2e]\n"); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("e2e with default require_signing must be rejected: %v", err)
 	}
-	ok := env.YAML + "defaults:\n  policy:\n    services: [markdown, e2e]\n    require_signing: false\n"
-	if c, err = config.Load(writeConfig(t, ok)); err != nil {
-		t.Fatal(err)
-	}
-	if problems, _ := c.ValidateManaged(); len(problems) != 0 {
-		t.Fatalf("e2e with require_signing false is valid: %v", problems)
+	if err := load("    services: [markdown, e2e]\n    require_signing: false\n"); err != nil {
+		t.Fatalf("e2e with require_signing false is valid: %v", err)
 	}
 }
 
@@ -427,15 +498,5 @@ func TestPlaintextOnlyToLocalhost(t *testing.T) {
 		if got := !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, "security none") }); got != ok || len(warnings) != 0 {
 			t.Errorf("security none to %s: %v %v", host, problems, warnings)
 		}
-	}
-	// Settings stored with the removed allow_plaintext override still
-	// decode, and no longer allow plaintext to a remote host.
-	s := c.Managed()
-	if err := json.Unmarshal([]byte(`{"upstream":{"smtp":{"host":"smtp.example.com","port":25,"security":"none","timeout":"5s","allow_plaintext":true},"from":"gw@example.com"}}`), &s); err != nil {
-		t.Fatal(err)
-	}
-	c.SetManaged(s)
-	if problems, _ := c.ValidateManaged(); !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, "security none is only allowed to localhost") }) {
-		t.Fatalf("allow_plaintext must be ignored: %v", problems)
 	}
 }

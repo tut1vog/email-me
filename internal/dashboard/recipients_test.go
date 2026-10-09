@@ -8,14 +8,12 @@ import (
 	"time"
 
 	"github.com/tut1vog/email-me/internal/pgp"
-	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
 func TestRecipientsCRUD(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	d.login()
-	ctx := context.Background()
 	if p := d.get("/recipients/new"); p.status != 200 || !strings.Contains(p.body, "export-minimal") {
 		t.Fatalf("new recipient page: %d", p.status)
 	}
@@ -37,7 +35,7 @@ func TestRecipientsCRUD(t *testing.T) {
 	if p := d.post("/recipients", d.form("alias", "pager", "address", "Pager <pager@example.net>")); !strings.Contains(p.body, "bare email address") {
 		t.Fatal("display names must be refused")
 	}
-	if _, ok := d.reg.Get("pager"); ok {
+	if _, ok := d.settings.Current().Recipient("pager"); ok {
 		t.Fatal("refused recipient must not be saved")
 	}
 
@@ -50,8 +48,11 @@ func TestRecipientsCRUD(t *testing.T) {
 	if rp.status != 200 || !strings.Contains(rp.body, "Recipient pager created") || !strings.Contains(rp.body, pgp.Fingerprint(k1)) {
 		t.Fatalf("recipient page: %d", rp.status)
 	}
-	if rc, ok := d.reg.Get("pager"); !ok || rc.Fingerprint() != pgp.Fingerprint(k1) || rc.Description != "On-call pager" {
-		t.Fatalf("registry: %+v", rc)
+	if rc, ok := d.settings.Current().Recipient("pager"); !ok || rc.Fingerprint() != pgp.Fingerprint(k1) || rc.Description != "On-call pager" {
+		t.Fatalf("current configuration: %+v", rc)
+	}
+	if f := read(t, d.env.Path); !strings.Contains(f, "  pager:\n    address: pager@example.net\n    description: On-call pager\n    pgp_public_key: |") {
+		t.Fatalf("config.yaml must hold the recipient:\n%s", f)
 	}
 	if l := d.get("/recipients").body; !strings.Contains(l, `href="/recipients/pager"`) || !strings.Contains(l, "On-call pager") {
 		t.Fatal("list must link the new recipient")
@@ -72,7 +73,7 @@ func TestRecipientsCRUD(t *testing.T) {
 	}
 	// Editing other fields keeps the key.
 	d.post("/recipients/pager", d.form("address", "pager2@example.net", "description", "Pager", "require_encryption", "on"))
-	if rc, _ := d.reg.Get("pager"); rc.Fingerprint() != pgp.Fingerprint(k2) || rc.Address != "pager2@example.net" || !rc.RequireEncryption {
+	if rc, _ := d.settings.Current().Recipient("pager"); rc.Fingerprint() != pgp.Fingerprint(k2) || rc.Address != "pager2@example.net" || !rc.RequireEncryption {
 		t.Fatalf("edit must keep the key: %+v", rc)
 	}
 	// Removing the key while encryption is required is refused.
@@ -81,7 +82,7 @@ func TestRecipientsCRUD(t *testing.T) {
 		t.Fatal("removing the key of a recipient that requires encryption must be refused")
 	}
 	d.post("/recipients/pager", d.form("address", "pager2@example.net", "remove_key", "on"))
-	if rc, _ := d.reg.Get("pager"); rc.Key != nil || !strings.Contains(d.get("/recipients/pager").body, "PGP key was removed") {
+	if rc, _ := d.settings.Current().Recipient("pager"); rc.Key != nil || !strings.Contains(d.get("/recipients/pager").body, "PGP key was removed") {
 		t.Fatal("key must be removed")
 	}
 
@@ -102,23 +103,23 @@ func TestRecipientsCRUD(t *testing.T) {
 	// keeps the alias, ignored and flagged.
 	a := d.createAgent("bench", "me", "pager")
 	dp := d.get("/recipients/pager/delete")
-	if dp.status != 200 || !strings.Contains(dp.body, `href="/agents/`+a.ID+`/policy"`) || !strings.Contains(dp.body, "recipient_not_allowed") {
+	if dp.status != 200 || !strings.Contains(dp.body, `href="/agents/`+a.Name+`/policy"`) || !strings.Contains(dp.body, "recipient_not_allowed") {
 		t.Fatalf("delete page: %d", dp.status)
 	}
 	d.post("/recipients/pager/delete", d.form("confirm", "wrong"))
-	if _, ok := d.reg.Get("pager"); !ok {
+	if _, ok := d.settings.Current().Recipient("pager"); !ok {
 		t.Fatal("wrong confirmation must not delete")
 	}
 	if p := d.post("/recipients/pager/delete", d.form("confirm", "pager")); p.header.Get("Location") != "/recipients" {
 		t.Fatalf("delete redirects to %q", p.header.Get("Location"))
 	}
-	if _, ok := d.reg.Get("pager"); ok {
+	if _, ok := d.settings.Current().Recipient("pager"); ok {
 		t.Fatal("recipient must be deleted")
 	}
-	if b := d.get("/agents/" + a.ID + "/policy").body; !strings.Contains(b, "no longer exist") || !strings.Contains(b, "pager") {
+	if b := d.get("/agents/" + a.Name + "/policy").body; !strings.Contains(b, "no longer exist") || !strings.Contains(b, "pager") {
 		t.Fatal("policy tab must flag the deleted alias")
 	}
-	got, _ := d.st.GetAgent(ctx, a.ID)
+	got := d.agent(a.Name)
 	if len(*got.Policy.Recipients) != 2 {
 		t.Fatal("deleting a recipient must not rewrite policies")
 	}
@@ -132,10 +133,10 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 	d.login()
 	ctx := context.Background()
 	if strings.Contains(d.get("/").body, "No recipients") {
-		t.Fatal("seeded recipients: no notice")
+		t.Fatal("with recipients: no notice")
 	}
-	for _, a := range d.reg.Aliases() {
-		if err := d.reg.Delete(ctx, a); err != nil {
+	for _, a := range d.settings.Current().Aliases() {
+		if err := d.settings.DeleteRecipient(ctx, a); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -160,33 +161,5 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 	g.login()
 	if b := g.get("/").body; !strings.Contains(b, "Default policy") || !strings.Contains(b, "ghost") || !strings.Contains(b, `href="/settings#policy"`) {
 		t.Error("unknown default alias must be flagged")
-	}
-}
-
-func TestDamagedRecipientKey(t *testing.T) {
-	d := newDash(t, testutil.Options{})
-	d.login()
-	ctx := context.Background()
-	if err := d.st.CreateRecipient(ctx, &store.Recipient{Alias: "bad", Address: "bad@example.com", PublicKey: "not a key", RequireEncryption: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := d.reg.Reload(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if p := d.get("/"); !strings.Contains(p.body, "Recipient bad") || !strings.Contains(p.body, "stored PGP key cannot be read") {
-		t.Fatal("overview must flag the unreadable key")
-	}
-	if p := d.get("/recipients"); !strings.Contains(p.body, "unreadable") {
-		t.Fatal("list must tag the unreadable key")
-	}
-	p := d.get("/recipients/bad")
-	if p.status != 200 || !strings.Contains(p.body, "cannot be read") || !strings.Contains(p.body, `name="remove_key"`) {
-		t.Fatalf("detail page must explain and offer removal: %d", p.status)
-	}
-	if p := d.post("/recipients/bad", d.form("address", "bad@example.com", "remove_key", "on")); !strings.Contains(d.get("/recipients/bad").body, "its PGP key was removed") {
-		t.Fatalf("removing the damaged key: %d", p.status)
-	}
-	if rc, _ := d.reg.Get("bad"); rc.KeyErr != nil || rc.PublicKey != "" {
-		t.Fatal("the damaged key must be gone")
 	}
 }

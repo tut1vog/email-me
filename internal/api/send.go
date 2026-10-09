@@ -22,7 +22,6 @@ import (
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
-	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
 )
@@ -89,9 +88,9 @@ type prepared struct {
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	c := callerFrom(r)
-	cfg := s.Config()
+	cfg := c.cfg
 	entry := &store.AuditEntry{
-		AgentID: c.agent.ID, TokenID: c.token.ID, SourceIP: c.ip.String(), Transport: c.transport,
+		Agent: c.agent.Name, TokenID: c.token.ID, SourceIP: c.ip.String(), Transport: c.transport,
 	}
 	fail := func(e *apiError) {
 		entry.Status = store.StatusRejected
@@ -104,7 +103,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, e)
 	}
 
-	done, ok := s.acquireSend(c.agent.ID)
+	done, ok := s.acquireSend(c.agent.Name)
 	if !ok {
 		e := newErr(http.StatusTooManyRequests, CodeRateLimited,
 			"Too many concurrent send requests from this agent (at most %d at a time). Wait for your other sends to finish, then retry after 1 second.", maxConcurrentSends).
@@ -153,7 +152,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	release, ok, wait, err := s.Limiter.Reserve(r.Context(), c.agent.ID, c.policy.RateLimit)
+	release, ok, wait, err := s.Limiter.Reserve(r.Context(), c.agent.Name, c.policy.RateLimit)
 	if err != nil {
 		fail(s.internalErr("rate limit check", err))
 		return
@@ -353,9 +352,9 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 	// --- recipients -----------------------------------------------------
 	// Resolved once: later steps use this snapshot, so a recipient edited or
 	// deleted in the dashboard mid-request cannot change this send.
-	rcs := make([]*recipients.Recipient, 0, len(p.aliases))
+	rcs := make([]*config.Recipient, 0, len(p.aliases))
 	for _, a := range p.aliases {
-		rc, ok := s.Recipients.Get(a)
+		rc, ok := c.cfg.Recipient(a)
 		if !ok || !pol.AllowsRecipient(a) {
 			return p, newErr(http.StatusForbidden, CodeRecipientNotAllow,
 				"Recipient alias %q is not permitted for this agent. Allowed: %s.", a, listOrNone(pol.Recipients)).
@@ -448,11 +447,6 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 	case encPGP:
 		for _, rc := range rcs {
 			a, k := rc.Alias, rc.Key
-			if rc.KeyErr != nil {
-				return p, newErr(http.StatusServiceUnavailable, CodeEncryptionUnavail,
-					"Recipient %q's stored PGP key cannot be read, so nothing can be encrypted to it. Tell your operator to replace the key; do not retry.", a).
-					with("alias", a)
-			}
 			if k == nil {
 				return p, newErr(http.StatusUnprocessableEntity, CodeValidation,
 					"Recipient %q has no PGP key configured, so options.encrypt \"pgp\" is unavailable for it (see encryption_available in GET /v1/capabilities).", a).
@@ -489,14 +483,14 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 	case req.Options.Sign != nil:
 		sign = *req.Options.Sign
 	default:
-		avail, _ := s.signingStatus(ctx, c.agent.ID)
+		avail, _ := s.signingStatus(ctx, c.agent.Name)
 		sign = avail && pol.HasService(policy.SvcSign)
 	}
 	var signer *openpgp.Entity
 	if sign {
 		var err error
 		var fpr string
-		signer, fpr, err = s.Keys.Signer(ctx, c.agent.ID)
+		signer, fpr, err = s.Keys.Signer(ctx, c.agent.Name)
 		if err != nil {
 			msg := "Signing is unavailable: the gateway could not load this agent's signing key. Tell your operator; do not retry."
 			switch {
@@ -526,7 +520,6 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 		Subject:      compose.CleanHeaderText(prefix+subject, 998),
 		OuterSubject: compose.CleanHeaderText(prefix+"Encrypted message", 998),
 		Agent:        c.agent.Name,
-		AgentID:      c.agent.ID,
 		TokenID:      c.token.ID,
 		MessageID:    compose.NewMessageID(),
 		Date:         s.now(),

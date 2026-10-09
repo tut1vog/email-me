@@ -41,7 +41,6 @@ type Message struct {
 	// encrypted (the real subject travels in the protected headers).
 	OuterSubject string
 	Agent        string
-	AgentID      string
 	TokenID      string
 	MessageID    string // without angle brackets
 	Date         time.Time
@@ -62,8 +61,8 @@ type Message struct {
 func NewMessageID() string { return "msg_" + ids.Random(20) + "@" + MessageIDDomain }
 
 // ThreadRoot returns the deterministic root Message-ID for an agent's thread key.
-func ThreadRoot(agentID, key string) string {
-	sum := sha256.Sum256([]byte(agentID + ":" + key))
+func ThreadRoot(agent, key string) string {
+	sum := sha256.Sum256([]byte(agent + ":" + key))
 	return "thread-" + hex.EncodeToString(sum[:])[:20] + "@" + MessageIDDomain
 }
 
@@ -180,7 +179,7 @@ func (m *Message) outerHeader() (hdr, error) {
 	h.add("Date", m.Date.Format(time.RFC1123Z))
 	h.add("Message-ID", "<"+m.MessageID+">")
 	if m.Thread != "" {
-		root := "<" + ThreadRoot(m.AgentID, m.Thread) + ">"
+		root := "<" + ThreadRoot(m.Agent, m.Thread) + ">"
 		h.add("In-Reply-To", root)
 		h.add("References", root)
 	}

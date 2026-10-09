@@ -1,4 +1,4 @@
-{{define "agent_header"}}{{$d := .Data}}{{$a := $d.Agent}}{{$base := printf "/agents/%s" $a.ID}}
+{{define "agent_header"}}{{$d := .Data}}{{$a := $d.Agent}}{{$base := printf "/agents/%s" $a.Name}}
 <div class="chips">
   {{if $a.Enabled}}<span class="tag ok">enabled</span>{{else}}<span class="tag">disabled</span>{{end}}
   <span class="tag {{if $d.ActiveTokens}}info{{else}}warn{{end}}">{{$d.ActiveTokens}} active token{{if ne $d.ActiveTokens 1}}s{{end}}</span>

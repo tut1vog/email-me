@@ -3,17 +3,8 @@
   <div class="brand"><svg class="icon" aria-hidden="true"><use href="#icon-mail"/></svg><span class="brand-name">email-me</span></div>
   <p class="muted">Operator dashboard</p>
   {{with .Data.Error}}<div class="flash error" role="alert"><svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg><div class="flash-text">{{.}}</div></div>{{end}}
-  {{if .Data.Setup}}<div class="banner info"><svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg><div><strong>First login:</strong> use the one-time setup password in email-me's log (<code>docker compose logs email-me</code>); every start prints a new one until you choose your own. Forgot your password? Run <code>email-me reset-admin-password</code>.</div></div>{{end}}
-  {{with .Data.SharedHost}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div><strong>Tip: open the dashboard at <a href="{{.}}/login">{{.}}</a> instead.</strong>
-    <details class="help"><summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Why?</summary><p>Browsers share <code>localhost</code> cookies with every local port, so a web server another local process runs could receive your session; a dedicated host name keeps the cookie to email-me.</p></details></div></div>{{end}}
-  <form method="post" action="/login">
-    <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
-    <input type="hidden" name="next" value="{{.Data.Next}}">
-    <div class="field">
-      <label for="password">Admin password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
-    </div>
-    <button type="submit">Log in</button>
-  </form>
+  <p>To sign in, run this on the host where email-me runs and open the link it prints:</p>
+  <pre><code>email-me console</code></pre>
+  <p class="small text-2">Each link works once. The dashboard stays open while the command runs; Ctrl-C closes it and signs everyone out.</p>
 </section>
 {{end}}

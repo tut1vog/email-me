@@ -143,20 +143,6 @@
 </form>
 
 <div class="card-grid">
-<form method="post" action="/settings/dashboard" class="card" id="dashboard">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <div class="card-header"><h2>Dashboard</h2></div>
-  <div class="card-body">
-    <div class="field">
-      <label for="session_ttl">Session lifetime</label>
-      <input id="session_ttl" name="session_ttl" value="{{$f.Dashboard.SessionTTL}}" placeholder="12h">
-      <p class="hint">How long a login lasts, e.g. <code>12h</code> or <code>7d</code>; at least <code>1m</code>. Applies to new logins; open sessions keep theirs.</p>
-    </div>
-    <p class="small text-2">The admin password is changed on the <a href="/password">Password</a> page.</p>
-  </div>
-  <div class="card-footer"><button type="submit">Save dashboard settings</button></div>
-</form>
-
 <form method="post" action="/settings/audit" class="card" id="audit">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <div class="card-header"><h2>Audit log</h2></div>
@@ -189,7 +175,7 @@
     </details>
     {{end}}
   {{else}}
-    <p class="muted">Signing is not configured. Set <code>kek.file</code> in config.yaml (with compose, the file named by <code>EMAIL_ME_KEK_FILE</code>) and recreate the container (<code>docker compose up -d --force-recreate</code>) to give every agent its own signing key.</p>
+    <p class="muted">Signing is not configured: the key-encryption key file (<code>kek.file</code>) is empty. Write a key to it (<code>openssl rand -hex 32</code>) and run <code>email-me restart</code> to give every agent its own signing key.</p>
   {{end}}
   </div>
   {{if $d.SigningEnabled}}
@@ -241,10 +227,9 @@
 </section>
 
 <section class="card" id="bootstrap">
-  <div class="card-header"><div><h2>From config.yaml</h2><p>Read-only. These keys are read from <code>config.yaml</code> at every start: edit the file, then restart. The key-encryption key is read from the file named here and never shown. The file's other sections only seeded the database on the first start and are ignored now: manage them above and on the <a href="/recipients">Recipients</a> page.</p></div></div>
+  <div class="card-header"><div><h2>From config.yaml</h2><p>Read-only. These keys apply when email-me starts: edit <code>config.yaml</code> in the configuration directory on the host, then run <code>email-me restart</code>. The key-encryption key is read from the file named here and never shown. Everything else in the file is managed here too, and saved back to it.</p></div></div>
   <div class="card-body">
     <dl class="grid">
-      <dt><code>data_dir</code></dt><dd><code>{{$c.DataDir}}</code></dd>
       <dt><code>api.listen</code></dt><dd><code>{{$c.API.Listen}}</code></dd>
       <dt><code>api.tls</code></dt><dd>{{if $c.API.TLS.Enabled}}certificate <code>{{$c.API.TLS.CertFile}}</code>, key <code>{{$c.API.TLS.KeyFile}}</code>{{else}}off{{end}}</dd>
       <dt><code>dashboard.listen</code></dt><dd><code>{{$c.Dashboard.Listen}}</code></dd>
@@ -255,15 +240,4 @@
   </div>
 </section>
 
-<section class="card" id="restart">
-  <div class="card-header"><div><h2>Restart</h2><p>Re-reads config.yaml (bootstrap keys: <code>data_dir</code>, listen addresses, <code>api.tls</code>, the key-encryption key, <code>log</code>), without leaving the container. A key-encryption key that changes without config.yaml changing is not detected: restart after replacing it too (with compose, <code>docker compose up -d --force-recreate</code>: secrets are fixed when the container is created).</p></div>{{if $d.ConfigChanged}}<span class="tag warn">changed</span>{{end}}</div>
-  <div class="card-body">
-    {{if $d.ConfigChanged}}<p class="small">config.yaml changed on disk since email-me started.</p>{{else}}<p class="small muted">config.yaml is unchanged since email-me started.</p>{{end}}
-    <p class="small text-2">Sends already in flight finish first; the API and the dashboard are down for a moment. Everyone is logged out of the dashboard, and the idempotency cache and the last SMTP test result are forgotten. If config.yaml no longer loads, or its key-encryption key does not open the stored credentials, nothing restarts. Sending <code>SIGHUP</code> to the process (<code>docker kill -s HUP</code>) does the same.</p>
-  </div>
-  <form method="post" action="/settings/restart" class="card-footer" data-confirm="Restart email-me now? Sends in flight finish first, and you will need to log in again.">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <button type="submit"{{if not $d.ConfigChanged}} class="secondary"{{end}}>Restart now</button>
-  </form>
-</section>
 {{end}}

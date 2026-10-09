@@ -2,22 +2,19 @@ package auth
 
 import (
 	"crypto/subtle"
-	"math"
 	"sync"
-	"time"
 
 	"github.com/tut1vog/email-me/internal/ids"
 )
 
-// Session is an authenticated dashboard session.
+// Session is an authenticated dashboard session. It lasts until the
+// console that opened the dashboard closes.
 type Session struct {
-	ID        string
-	CSRF      string
-	ExpiresAt time.Time
+	ID   string
+	CSRF string
 
-	mu         sync.Mutex
-	flash      []Flash
-	mustChange bool
+	mu    sync.Mutex
+	flash []Flash
 }
 
 // Flash is a one-shot message shown on the next page render.
@@ -42,60 +39,51 @@ func (s *Session) PopFlash() []Flash {
 	return f
 }
 
-// MustChange reports whether the session was opened with a setup password
-// that must be replaced before anything else.
-func (s *Session) MustChange() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.mustChange
-}
-
-// SetMustChange marks or clears the session's pending password change.
-func (s *Session) SetMustChange(v bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mustChange = v
-}
-
 // ValidCSRF compares a submitted CSRF token in constant time.
 func (s *Session) ValidCSRF(token string) bool {
 	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.CSRF)) == 1
 }
 
-// Sessions is an in-memory session store; sessions are lost on restart.
+// Sessions is an in-memory session store with the console's one-time login
+// links. Clear ends everything when the console closes.
 type Sessions struct {
-	mu  sync.Mutex
-	m   map[string]*Session
-	now func() time.Time
+	mu    sync.Mutex
+	m     map[string]*Session
+	links map[string]bool // unspent login link tokens
 }
 
 func NewSessions() *Sessions {
-	return &Sessions{m: map[string]*Session{}, now: time.Now}
+	return &Sessions{m: map[string]*Session{}, links: map[string]bool{}}
 }
 
-// Create starts a session that lasts ttl. Each session keeps the expiry it
-// was created with.
-func (s *Sessions) Create(ttl time.Duration) *Session {
+// NewLink mints a one-time login link token.
+func (s *Sessions) NewLink() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.gc()
-	sess := &Session{ID: ids.Random(52), CSRF: ids.Random(52), ExpiresAt: s.now().Add(ttl)}
+	tok := ids.Random(52)
+	s.links[tok] = true
+	return tok
+}
+
+// Redeem spends a login link token and starts a session, or returns false
+// for a spent or unknown token.
+func (s *Sessions) Redeem(token string) (*Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.links[token] {
+		return nil, false
+	}
+	delete(s.links, token)
+	sess := &Session{ID: ids.Random(52), CSRF: ids.Random(52)}
 	s.m[sess.ID] = sess
-	return sess
+	return sess, true
 }
 
 func (s *Sessions) Get(id string) (*Session, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.m[id]
-	if !ok {
-		return nil, false
-	}
-	if s.now().After(sess.ExpiresAt) {
-		delete(s.m, id)
-		return nil, false
-	}
-	return sess, true
+	return sess, ok
 }
 
 func (s *Sessions) Delete(id string) {
@@ -104,114 +92,10 @@ func (s *Sessions) Delete(id string) {
 	delete(s.m, id)
 }
 
-// DeleteOthers ends every session but keep's.
-func (s *Sessions) DeleteOthers(keep string) {
+// Clear ends every session and voids every unspent link.
+func (s *Sessions) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id := range s.m {
-		if id != keep {
-			delete(s.m, id)
-		}
-	}
-}
-
-func (s *Sessions) gc() {
-	now := s.now()
-	for id, sess := range s.m {
-		if now.After(sess.ExpiresAt) {
-			delete(s.m, id)
-		}
-	}
-}
-
-// LoginThrottle applies per-IP exponential backoff after repeated failures.
-type LoginThrottle struct {
-	mu   sync.Mutex
-	m    map[string]*throttleEntry
-	now  func() time.Time
-	free int
-	max  time.Duration
-}
-
-type throttleEntry struct {
-	failures    int
-	lockedUntil time.Time
-	last        time.Time
-}
-
-// NewLoginThrottle allows `free` failed attempts, then locks the IP out for
-// 1s, 2s, 4s… (up to max) after each further failure.
-func NewLoginThrottle(free int, max time.Duration) *LoginThrottle {
-	return NewLoginThrottleAt(free, max, time.Now)
-}
-
-// NewLoginThrottleAt is NewLoginThrottle with an injectable clock.
-func NewLoginThrottleAt(free int, max time.Duration, now func() time.Time) *LoginThrottle {
-	return &LoginThrottle{m: map[string]*throttleEntry{}, now: now, free: free, max: max}
-}
-
-// Allowed reports whether ip may attempt a login, and if not, for how long it must wait.
-func (t *LoginThrottle) Allowed(ip string) (bool, time.Duration) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.allowedLocked(ip)
-}
-
-func (t *LoginThrottle) allowedLocked(ip string) (bool, time.Duration) {
-	e, ok := t.m[ip]
-	if !ok {
-		return true, 0
-	}
-	if wait := e.lockedUntil.Sub(t.now()); wait > 0 {
-		return false, wait
-	}
-	return true, 0
-}
-
-// Begin atomically checks the throttle and, if allowed, records the attempt
-// as a failure up front; call Success if the password turns out correct.
-// Counting before verification stops parallel guesses from all passing the
-// check while the slow password hash runs.
-func (t *LoginThrottle) Begin(ip string) (bool, time.Duration) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if ok, wait := t.allowedLocked(ip); !ok {
-		return false, wait
-	}
-	t.failureLocked(ip)
-	return true, 0
-}
-
-// Failure records a failed attempt.
-func (t *LoginThrottle) Failure(ip string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.failureLocked(ip)
-}
-
-func (t *LoginThrottle) failureLocked(ip string) {
-	now := t.now()
-	for k, e := range t.m { // forget stale entries
-		if now.Sub(e.last) > 24*time.Hour {
-			delete(t.m, k)
-		}
-	}
-	e := t.m[ip]
-	if e == nil {
-		e = &throttleEntry{}
-		t.m[ip] = e
-	}
-	e.failures++
-	e.last = now
-	if over := e.failures - t.free + 1; over > 0 {
-		d := time.Duration(math.Min(float64(time.Second)*math.Pow(2, float64(over-1)), float64(t.max)))
-		e.lockedUntil = now.Add(d)
-	}
-}
-
-// Success clears the failure history for ip.
-func (t *LoginThrottle) Success(ip string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.m, ip)
+	s.m = map[string]*Session{}
+	s.links = map[string]bool{}
 }

@@ -8,7 +8,7 @@
     <tbody>
     {{range .Data.Rows}}
       <tr>
-        <td><a href="/agents/{{.Agent.ID}}"><strong>{{.Agent.Name}}</strong></a></td>
+        <td><a href="/agents/{{.Agent.Name}}"><strong>{{.Agent.Name}}</strong></a></td>
         <td class="text-2">{{.Agent.Description}}</td>
         <td>{{if .Effective.Recipients}}{{join .Effective.Recipients ", "}}{{else}}<span class="muted">none</span>{{end}}</td>
         <td class="num">{{.ActiveTokens}}</td>

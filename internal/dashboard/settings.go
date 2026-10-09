@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"slices"
@@ -14,7 +13,6 @@ import (
 	"unicode"
 
 	"github.com/tut1vog/email-me/internal/api/docs"
-	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/compose"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/pgp"
@@ -30,12 +28,11 @@ import (
 // settingsForms holds every card's form values as text, so a rejected
 // submission can be shown again exactly as typed.
 type settingsForms struct {
-	Upstream  upstreamForm
-	API       apiForm
-	Policy    policyForm
-	Dashboard dashboardForm
-	Audit     auditForm
-	Signing   signingForm
+	Upstream upstreamForm
+	API      apiForm
+	Policy   policyForm
+	Audit    auditForm
+	Signing  signingForm
 }
 
 type upstreamForm struct {
@@ -46,8 +43,6 @@ type apiForm struct {
 	PublicURL, Docs, TrustedProxies string
 	External                        bool
 }
-
-type dashboardForm struct{ SessionTTL string }
 
 type auditForm struct {
 	RetentionDays string
@@ -119,10 +114,9 @@ func (s *Server) settingsForms(cfg *config.Config) settingsForms {
 			PublicURL: cur.API.PublicURL, Docs: cur.API.Docs,
 			TrustedProxies: strings.Join(cur.API.TrustedProxies, ", "), External: cur.API.ExternalTransportEncryption,
 		},
-		Policy:    formFromPolicy(cur.Defaults.Policy, cur.Defaults.Policy.Apply(s.builtinPolicy())),
-		Dashboard: dashboardForm{SessionTTL: durationText(cur.Dashboard.SessionTTL)},
-		Audit:     auditForm{RetentionDays: strconv.Itoa(cur.Audit.RetentionDays), LogSubject: cur.Audit.LogSubject},
-		Signing:   signingForm{KeyValidity: durationText(cur.Signing.KeyValidity)},
+		Policy:  formFromPolicy(cur.Defaults.Policy, cur.Defaults.Policy.Apply(s.builtinPolicy())),
+		Audit:   auditForm{RetentionDays: strconv.Itoa(cur.Audit.RetentionDays), LogSubject: cur.Audit.LogSubject},
+		Signing: signingForm{KeyValidity: durationText(cur.Signing.KeyValidity)},
 	}
 	if u.SMTP.Port != 0 && u.SMTP.Port != defaultPort(u.SMTP.Security) {
 		f.Upstream.Port = strconv.Itoa(u.SMTP.Port)
@@ -152,12 +146,12 @@ func upstreamConfigured(c *config.Config) bool {
 }
 
 // configWarnings are cfg's warnings that the Needs-attention list and the
-// Settings page show as such. Problems with the saved settings and a
-// missing upstream are left out: they have their own notices and banner.
+// Settings page show as such. A missing upstream and an unsealed password
+// are left out: they have their own notices.
 func configWarnings(cfg *config.Config) []string {
 	var out []string
 	for _, w := range cfg.Warnings {
-		if strings.HasPrefix(w, settings.WarningPrefix) || w == config.UpstreamNotConfigured {
+		if w == config.UpstreamNotConfigured || w == settings.PasswordUnsealed {
 			continue
 		}
 		out = append(out, w)
@@ -206,7 +200,7 @@ func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request, status int
 		"Form": forms,
 		"Policy": map[string]any{
 			"Form": forms.Policy, "Defaults": s.builtinPolicy(),
-			"Recipients": s.Recipients.All(), "AllServices": policy.AllServices,
+			"Recipients": cfg.RecipientList(), "AllServices": policy.AllServices,
 		},
 		"SMTP":           s.lastSMTPCheck(),
 		"Configured":     upstreamConfigured(cfg),
@@ -214,12 +208,11 @@ func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request, status int
 		"Password":       passwordState(s.Settings.PasswordState()),
 		"HasPassword":    s.Settings.HasPassword(),
 		"Securities":     []string{"starttls", "tls", "none"},
-		"Aliases":        s.Recipients.Aliases(),
+		"Aliases":        cfg.Aliases(),
 		"SigningEnabled": s.Keys.Enabled(),
 		"MasterFpr":      master,
 		"Warnings":       configWarnings(cfg),
 		"Config":         cfg,
-		"ConfigChanged":  s.configChanged(),
 	})
 }
 
@@ -259,6 +252,8 @@ func (s *Server) saveCard(w http.ResponseWriter, r *http.Request, c cardSave) {
 		switch {
 		case errors.As(err, &ve):
 			problems = ve.Problems
+		case errors.Is(err, settings.ErrFileChanged):
+			problems = []string{err.Error()}
 		case err != nil:
 			s.fail(w, "saving settings", err)
 			return
@@ -271,7 +266,7 @@ func (s *Server) saveCard(w http.ResponseWriter, r *http.Request, c cardSave) {
 		s.settingsPage(w, r, http.StatusUnprocessableEntity, cfg, forms)
 		return
 	}
-	now := s.Settings.Saved()
+	now := s.Config().Managed()
 	changed := config.DiffSettings(prev, now)
 	if pw := c.password; pw.Set && (pw.Value != prev.Upstream.SMTP.Password || hadPassword != (pw.Value != "")) {
 		changed = append(changed, passwordKey)
@@ -338,7 +333,7 @@ func (s *Server) afterUpstream(r *http.Request, prev, now config.Settings, chang
 	if !s.Keys.Enabled() || prev.Upstream.From != "" || now.Upstream.From == "" {
 		return ""
 	}
-	n, err := s.Keys.EnsureAll(r.Context())
+	n, err := s.Keys.EnsureAll(r.Context(), s.Config().AgentNames())
 	if err != nil {
 		s.Log.Error("generating signing keys after setting the From address", "err", err)
 		s.flash(r, "error", "Signing keys for agents without one were not all generated: %v. Generate them on each agent's Signing tab.", err)
@@ -374,22 +369,10 @@ func (s *Server) saveDefaultPolicy(w http.ResponseWriter, r *http.Request) {
 		keep:  func(fs *settingsForms) { fs.Policy = policyFormFromPost(r.PostForm) },
 		apply: func(cur *config.Settings) []string { cur.Defaults.Policy = p; return nil },
 	}
-	if u := s.Recipients.UnknownAliases(p); len(u) > 0 {
+	if u := s.Config().UnknownAliases(p); len(u) > 0 {
 		c.warnings = append(c.warnings, "it names recipients that do not exist and are ignored: "+strings.Join(u, ", "))
 	}
 	s.saveCard(w, r, c)
-}
-
-func (s *Server) saveDashboard(w http.ResponseWriter, r *http.Request) {
-	form := dashboardForm{SessionTTL: strings.TrimSpace(r.PostForm.Get("session_ttl"))}
-	s.saveCard(w, r, cardSave{id: "dashboard", title: "Dashboard settings",
-		keep: func(fs *settingsForms) { fs.Dashboard = form },
-		apply: func(cur *config.Settings) []string {
-			var errs []string
-			cur.Dashboard.SessionTTL = parseDuration("Session lifetime", form.SessionTTL, &errs)
-			return errs
-		},
-	})
 }
 
 func (s *Server) saveAudit(w http.ResponseWriter, r *http.Request) {
@@ -484,13 +467,13 @@ func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
 	alias := r.PostForm.Get("alias")
-	rc, ok := s.Recipients.Get(alias)
+	cfg := s.Config()
+	rc, ok := cfg.Recipient(alias)
 	if !ok {
 		s.flash(r, "error", "Unknown recipient alias %q.", alias)
 		s.redirect(w, r, "/settings#upstream")
 		return
 	}
-	cfg := s.Config()
 	extendWriteDeadline(w, cfg)
 	now := s.now()
 	msg := &compose.Message{
@@ -512,40 +495,6 @@ func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
 		s.flash(r, "ok", "Test message sent to %s.", alias)
 	}
 	s.redirect(w, r, "/settings#upstream")
-}
-
-// up serves the boot id of this start, unauthenticated: the restarting
-// page polls it to see the next start come up. It reveals nothing else.
-func (s *Server) up(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.WriteString(w, s.bootID)
-}
-
-// restart asks the process to restart, which re-reads config.yaml.
-// Sessions live in memory and do not survive it, so this one ends now and
-// the restarting page sends the operator to the login page once the next
-// start is up.
-func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
-	if s.Restart == nil {
-		s.flash(r, "error", "Restarting from the dashboard is not available.")
-		s.redirect(w, r, "/settings#restart")
-		return
-	}
-	if err := s.Restart(); err != nil {
-		// A config.yaml problem lists every problem on one line.
-		msg := err.Error()
-		if ve := (*config.ValidationError)(nil); errors.As(err, &ve) {
-			msg = "config.yaml no longer loads: " + strings.Join(ve.Problems, "; ")
-		}
-		s.Log.Warn("restart refused", "err", err)
-		s.flash(r, "error", "Not restarted: %s.", strings.TrimSuffix(msg, "."))
-		s.redirect(w, r, "/settings#restart")
-		return
-	}
-	s.Log.Info("restart requested from the dashboard", "ip", clientIP(r))
-	s.endSession(w, r)
-	r = r.WithContext(context.WithValue(r.Context(), sessionKey, (*auth.Session)(nil)))
-	s.render(w, r, "restarting", "Restarting", map[string]any{"Boot": s.bootID})
 }
 
 func (s *Server) guidePreview(w http.ResponseWriter, r *http.Request) {

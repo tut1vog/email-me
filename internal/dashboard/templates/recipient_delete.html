@@ -9,7 +9,7 @@
     <div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div>
       <p>These agents' policies grant <strong>{{$r.Alias}}</strong>:</p>
       <ul>
-        {{range $d.Agents}}<li><a href="/agents/{{.ID}}/policy">{{.Name}}</a></li>{{end}}
+        {{range $d.Agents}}<li><a href="/agents/{{.Name}}/policy">{{.Name}}</a></li>{{end}}
       </ul>
     </div></div>
     {{end}}

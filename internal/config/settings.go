@@ -9,36 +9,31 @@ import (
 	"github.com/tut1vog/email-me/internal/units"
 )
 
-// Settings are the managed keys: stored in the state database as JSON,
-// edited on the dashboard and applied as soon as they are saved. Their
-// sections in config.yaml only seed an empty database. The SMTP password is not part
-// of the document (see SMTP).
+// Settings are the managed settings: the keys of config.yaml's sections
+// that the dashboard edits and applies as soon as they are saved
+// (recipients and agents aside). Field names follow config.yaml, so a
+// dotted key from DiffSettings names the same key in the file. The SMTP
+// password is not part of them (see SMTP).
 type Settings struct {
-	API       APISettings       `json:"api"`
-	Dashboard DashboardSettings `json:"dashboard"`
-	Upstream  Upstream          `json:"upstream"`
-	Signing   SigningSettings   `json:"signing"`
-	Defaults  Defaults          `json:"defaults"`
-	Audit     Audit             `json:"audit"`
+	API      APISettings     `yaml:"api" json:"api"`
+	Upstream Upstream        `yaml:"upstream" json:"upstream"`
+	Signing  SigningSettings `yaml:"signing" json:"signing"`
+	Defaults Defaults        `yaml:"defaults" json:"defaults"`
+	Audit    Audit           `yaml:"audit" json:"audit"`
 }
 
 // APISettings are the managed keys of the api section.
 type APISettings struct {
-	PublicURL                   string   `json:"public_url"`
-	Docs                        string   `json:"docs"`
-	TrustedProxies              []string `json:"trusted_proxies,omitempty"`
-	ExternalTransportEncryption bool     `json:"external_transport_encryption"`
-}
-
-// DashboardSettings are the managed keys of the dashboard section.
-type DashboardSettings struct {
-	SessionTTL units.Duration `json:"session_ttl"`
+	PublicURL                   string   `yaml:"public_url" json:"public_url"`
+	Docs                        string   `yaml:"docs" json:"docs"`
+	TrustedProxies              []string `yaml:"trusted_proxies" json:"trusted_proxies,omitempty"`
+	ExternalTransportEncryption bool     `yaml:"external_transport_encryption" json:"external_transport_encryption"`
 }
 
 // SigningSettings are the managed keys of the signing section. They are
 // kept without a key-encryption key and apply once one is set.
 type SigningSettings struct {
-	KeyValidity units.Duration `json:"key_validity"`
+	KeyValidity units.Duration `yaml:"key_validity" json:"key_validity"`
 }
 
 // Managed returns a copy of c's managed settings. The in-memory SMTP
@@ -51,11 +46,10 @@ func (c *Config) Managed() Settings {
 			TrustedProxies:              c.API.TrustedProxies,
 			ExternalTransportEncryption: c.API.ExternalTransportEncryption,
 		},
-		Dashboard: DashboardSettings{SessionTTL: c.Dashboard.SessionTTL},
-		Upstream:  c.Upstream,
-		Signing:   SigningSettings{KeyValidity: c.Signing.KeyValidity},
-		Defaults:  c.Defaults,
-		Audit:     c.Audit,
+		Upstream: c.Upstream,
+		Signing:  SigningSettings{KeyValidity: c.Signing.KeyValidity},
+		Defaults: c.Defaults,
+		Audit:    c.Audit,
 	}
 	return s.Clone()
 }
@@ -68,7 +62,6 @@ func (c *Config) SetManaged(s Settings) {
 	c.API.Docs = s.API.Docs
 	c.API.TrustedProxies = s.API.TrustedProxies
 	c.API.ExternalTransportEncryption = s.API.ExternalTransportEncryption
-	c.Dashboard.SessionTTL = s.Dashboard.SessionTTL
 	c.Upstream = s.Upstream
 	c.Signing.KeyValidity = s.Signing.KeyValidity
 	c.Defaults = s.Defaults
@@ -90,10 +83,6 @@ func (s Settings) Clone() Settings {
 	p.RequireSigning = clonePtr(p.RequireSigning)
 	return s
 }
-
-// IsZero reports whether no managed key is set, e.g. a config.yaml that
-// has only bootstrap keys.
-func (s Settings) IsZero() bool { return reflect.ValueOf(s).IsZero() }
 
 func clonePtr[T any](p *T) *T {
 	if p == nil {

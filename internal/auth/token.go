@@ -1,5 +1,5 @@
-// Package auth handles agent bearer tokens, the admin password, and
-// dashboard sessions.
+// Package auth handles agent bearer tokens, and dashboard sessions with the
+// console's one-time login links.
 package auth
 
 import (

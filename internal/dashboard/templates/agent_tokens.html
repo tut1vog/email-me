@@ -1,5 +1,5 @@
 {{define "crumbs"}}<a href="/agents">Agents</a>{{end}}
-{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.ID}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
+{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.Name}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}{{$a := $d.Agent}}
 {{template "agent_header" .}}
@@ -18,7 +18,7 @@
         <td>{{if .AllowedCIDRs}}{{join .AllowedCIDRs ", "}}{{else}}<span class="muted">anywhere</span>{{end}}</td>
         <td class="nowrap">{{with .LastUsedAt}}{{until .}}{{else}}<span class="muted">never</span>{{end}}{{with .LastUsedIP}}<div class="sub">from <code>{{.}}</code></div>{{end}}</td>
         <td class="actions">
-          <form method="post" action="/agents/{{$a.ID}}/tokens/{{.ID}}/revoke" data-confirm="Revoke token {{.ID}}? Agents using it will get 401 immediately.">
+          <form method="post" action="/agents/{{$a.Name}}/tokens/{{.ID}}/revoke" data-confirm="Revoke token {{.ID}}? Agents using it will get 401 immediately.">
             <input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="danger secondary sm">Revoke</button>
           </form>
         </td>
@@ -39,7 +39,7 @@
 <section class="card"><div class="card-body">
   <details class="disclosure mt-0" {{if not $d.Active}}open{{end}}>
     <summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Issue a token</summary>
-    <form method="post" action="/agents/{{$a.ID}}/tokens" class="inline-grid">
+    <form method="post" action="/agents/{{$a.Name}}/tokens" class="inline-grid">
       <input type="hidden" name="csrf" value="{{$.CSRF}}">
       <label>Label <input name="label" maxlength="100" placeholder="build-02"></label>
       <label>Expires in days <input name="expires_days" inputmode="numeric" placeholder="never"></label>

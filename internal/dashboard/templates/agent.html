@@ -1,7 +1,7 @@
 {{define "crumbs"}}<a href="/agents">Agents</a>{{end}}
-{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.ID}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
+{{define "actions"}}<a class="button danger secondary" href="/agents/{{.Data.Agent.Name}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
 {{define "content"}}
-{{$d := .Data}}{{$a := $d.Agent}}{{$e := $d.Effective}}{{$base := printf "/agents/%s" $a.ID}}
+{{$d := .Data}}{{$a := $d.Agent}}{{$e := $d.Effective}}{{$base := printf "/agents/%s" $a.Name}}
 {{template "agent_header" .}}
 
 <div class="card-grid">
@@ -18,7 +18,7 @@
         <label class="check"><input type="checkbox" name="enabled" {{if $a.Enabled}}checked{{end}}> Enabled</label>
         <p class="hint">Disabled agents get <code>403 agent_disabled</code>.</p>
       </div>
-      <p class="hint">Created {{ts $a.CreatedAt}} · ID <code>{{$a.ID}}</code></p>
+      <p class="hint">Name <code>{{$a.Name}}</code> (cannot be changed)</p>
     </div>
     <div class="card-footer"><button type="submit">Save</button></div>
   </form>
@@ -32,7 +32,7 @@
       <dd><span class="num">{{$d.Day.Sent}}</span> sent{{if $d.Day.Rejected}} · <span class="num">{{$d.Day.Rejected}}</span> rejected{{end}}{{if $d.Day.Failed}} · <span class="danger-text"><span class="num">{{$d.Day.Failed}}</span> failed</span>{{end}}</dd>
       <dt>Last 7 days</dt>
       <dd><span class="num">{{$d.Week.Sent}}</span> sent{{if $d.Week.Rejected}} · <span class="num">{{$d.Week.Rejected}}</span> rejected{{end}}{{if $d.Week.Failed}} · <span class="danger-text"><span class="num">{{$d.Week.Failed}}</span> failed</span>{{end}}
-        · <a href="/audit?agent={{$a.ID}}&amp;period=7d">Audit log</a></dd>
+        · <a href="/audit?agent={{$a.Name}}&amp;period=7d">Audit log</a></dd>
       <dt>Tokens</dt>
       <dd>{{$d.ActiveTokens}} active{{with $d.LastUsed}} · last used {{until .}}{{end}} · <a href="{{$base}}/tokens">Manage</a></dd>
       <dt>Signing key</dt>

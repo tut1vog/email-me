@@ -2,9 +2,8 @@ package dashboard_test
 
 import (
 	"context"
-	"errors"
 	"net/http"
-	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -100,7 +99,7 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 func TestSettingsCardsValidate(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
-	before, cur := d.settings.Saved(), d.settings.Current()
+	before, cur := d.settings.Current().Managed(), d.settings.Current()
 	for _, c := range []struct {
 		card string
 		kv   []string
@@ -109,8 +108,6 @@ func TestSettingsCardsValidate(t *testing.T) {
 		{"api", []string{"docs", "secret"}, "api.docs must be public or authenticated"},
 		{"api", []string{"docs", "public", "trusted_proxies", "10.0.0.0/8 nonsense"}, `api.trusted_proxies: &#34;nonsense&#34; is not an IP or CIDR`},
 		{"api", []string{"docs", "public", "public_url", "ftp://x"}, "api.public_url must be an absolute http(s) URL"},
-		{"dashboard", []string{"session_ttl", "30s"}, "dashboard.session_ttl must be at least 1m"},
-		{"dashboard", []string{"session_ttl", "soon"}, "Session lifetime: invalid duration"},
 		{"audit", []string{"retention_days", "-1"}, "audit.retention_days must be at least 1"},
 		{"audit", []string{"retention_days", "many"}, "Retention must be a number"},
 		{"signing", []string{"key_validity", "12h"}, "signing.key_validity must be between 1d and 50y"},
@@ -124,28 +121,27 @@ func TestSettingsCardsValidate(t *testing.T) {
 			t.Errorf("%s: the submitted value must be shown again", c.card)
 		}
 	}
-	if len(config.DiffSettings(d.settings.Saved(), before)) != 0 || d.settings.Current() != cur {
+	if len(config.DiffSettings(d.settings.Current().Managed(), before)) != 0 || d.settings.Current() != cur {
 		t.Fatal("rejected saves must not store or apply anything")
 	}
 
 	d.saved(d.post("/settings/api", d.form("docs", "authenticated", "trusted_proxies", "10.0.0.0/8, 192.168.1.1 172.16.0.0/12",
 		"public_url", "https://gw.example.com/", "external_transport_encryption", "on")), "api")
-	d.saved(d.post("/settings/dashboard", d.form("session_ttl", "2h")), "dashboard")
 	d.saved(d.post("/settings/audit", d.form("retention_days", "90", "log_subject", "on")), "audit")
 	body := d.saved(d.post("/settings/signing", d.form("key_validity", "3y")), "signing")
-	s := d.settings.Saved()
+	s := d.settings.Current().Managed()
 	if s.API.Docs != "authenticated" || strings.Join(s.API.TrustedProxies, ",") != "10.0.0.0/8,192.168.1.1,172.16.0.0/12" ||
 		s.API.PublicURL != "https://gw.example.com" || !s.API.ExternalTransportEncryption ||
-		s.Dashboard.SessionTTL.String() != "2h0m0s" || s.Audit.RetentionDays != 90 || !s.Audit.LogSubject || s.Signing.KeyValidity.String() != "3y" {
+		s.Audit.RetentionDays != 90 || !s.Audit.LogSubject || s.Signing.KeyValidity.String() != "3y" {
 		t.Fatalf("saved: %+v", s)
 	}
-	for _, want := range []string{`value="2h"`, `value="90"`, `value="3y"`, `value="10.0.0.0/8, 192.168.1.1, 172.16.0.0/12"`, `<option value="authenticated" selected>`} {
+	for _, want := range []string{`value="90"`, `value="3y"`, `value="10.0.0.0/8, 192.168.1.1, 172.16.0.0/12"`, `<option value="authenticated" selected>`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("settings page lacks saved value %q", want)
 		}
 	}
 	want := []string{"api.docs", "api.external_transport_encryption", "api.public_url", "api.trusted_proxies",
-		"audit.log_subject", "audit.retention_days", "dashboard.session_ttl", "signing.key_validity"}
+		"audit.log_subject", "audit.retention_days", "signing.key_validity"}
 	if got := config.DiffSettings(before, d.settings.Current().Managed()); !slices.Equal(got, want) {
 		t.Fatalf("applied = %v", got)
 	}
@@ -153,11 +149,13 @@ func TestSettingsCardsValidate(t *testing.T) {
 		t.Fatal("a save applies a new configuration; the boot one is never modified")
 	}
 
-	// The session lifetime applies to the next login.
-	d.post("/logout", d.form())
-	p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}, "next": {"/"}}))
-	if c := p.header.Get("Set-Cookie"); p.status != http.StatusSeeOther || !strings.Contains(c, "Max-Age=7200") {
-		t.Fatalf("login after session_ttl 2h: %d %q", p.status, c)
+	// config.yaml holds what was saved.
+	reloaded, err := config.Load(d.env.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.DiffSettings(reloaded.Managed(), d.settings.Current().Managed()); len(got) != 0 {
+		t.Fatalf("config.yaml differs: %v", got)
 	}
 
 	nd := newDash(t, testutil.Options{})
@@ -193,7 +191,7 @@ func TestSettingsDefaultPolicyCard(t *testing.T) {
 	if !strings.Contains(body, "Default policy saved and applied.") || !strings.Contains(body, "do not exist and are ignored: ghost") {
 		t.Fatal("unknown aliases must be noted")
 	}
-	pol := d.settings.Saved().Defaults.Policy
+	pol := d.settings.Current().Managed().Defaults.Policy
 	if pol.Recipients == nil || strings.Join(*pol.Recipients, ",") != "me,ghost" || pol.RateLimit.PerHour != 5 ||
 		pol.RequireSigning == nil || *pol.RequireSigning || pol.MaxAttachments != nil {
 		t.Fatalf("saved policy: %+v", pol)
@@ -203,7 +201,7 @@ func TestSettingsDefaultPolicyCard(t *testing.T) {
 		t.Fatal("the saved policy must round-trip into the form")
 	}
 	// Agents that inherit the default policy get it at once.
-	if eff := d.reg.Effective(policy.Policy{}); eff.RateLimit.PerHour != 5 || eff.RequireSigning || strings.Join(eff.Recipients, ",") != "me" {
+	if eff := d.settings.Current().Effective(policy.Policy{}); eff.RateLimit.PerHour != 5 || eff.RequireSigning || strings.Join(eff.Recipients, ",") != "me" {
 		t.Fatalf("effective default policy: %+v", eff)
 	}
 
@@ -216,53 +214,53 @@ func TestSettingsDefaultPolicyCard(t *testing.T) {
 	}
 }
 
-func TestSettingsLoadProblemsNotice(t *testing.T) {
-	d := newDashWith(t, testutil.Options{}, func(env *testutil.Env, st *store.Store) {
-		testutil.BootstrapSettings(t, env, st)
-		row, err := st.GetSettings(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		row.Doc = []byte(`{"api":{"docs":"maybe"}`)
-		if err := st.SaveSettings(context.Background(), row); err != nil {
-			t.Fatal(err)
-		}
-	})
+// A hand edit of config.yaml is applied by a restart; until then the
+// dashboard says so and refuses every save, which would overwrite it.
+func TestHandEditRefusesSaves(t *testing.T) {
+	d := newDash(t, testutil.Options{})
 	d.login()
-	if len(d.settings.LoadProblems()) != 1 {
-		t.Fatalf("load problems: %v", d.settings.LoadProblems())
+	d.saved(d.post("/settings/audit", d.form("retention_days", "60")), "audit")
+	if b := d.get("/agents").body; strings.Contains(b, `id="restart-banner"`) {
+		t.Fatal("dashboard saves never raise the banner")
 	}
-	for _, path := range []string{"/", "/agents", "/settings"} {
-		b := d.get(path).body
-		if !strings.Contains(b, "The saved settings have problems.") || !strings.Contains(b, "cannot be decoded") {
-			t.Errorf("%s lacks the load-problems banner", path)
-		}
-		if strings.Contains(b, "saved settings: ") {
-			t.Errorf("%s repeats the problems as config warnings", path)
-		}
+	edited := read(t, d.env.Path) + "# a hand edit\n"
+	os.WriteFile(d.env.Path, []byte(edited), 0o600)
+	banner := d.get("/agents").body
+	if !strings.Contains(banner, `id="restart-banner"`) || !strings.Contains(banner, "email-me restart") {
+		t.Fatal("every page names email-me restart")
 	}
-	if o := d.get("/").body; !strings.Contains(o, "Saved settings") {
-		t.Error("load problems must be on the attention list")
+	if o := d.get("/").body; !strings.Contains(o, "Restart to apply") {
+		t.Error("a hand edit must be on the attention list")
 	}
-
-	// A valid save replaces the broken settings: the problems are gone at once.
-	d.saved(d.post("/settings/api", d.form("docs", "public")), "api")
-	if len(d.settings.LoadProblems()) != 0 {
-		t.Fatalf("after a valid save: %v", d.settings.LoadProblems())
+	if p := d.post("/settings/audit", d.form("retention_days", "7")); p.status != http.StatusUnprocessableEntity || !strings.Contains(p.body, "run email-me restart") {
+		t.Fatalf("a settings save: %d", p.status)
 	}
-	for _, path := range []string{"/", "/settings"} {
-		if b := d.get(path).body; strings.Contains(b, "The saved settings have problems.") || strings.Contains(b, "cannot be decoded") {
-			t.Errorf("%s still shows the load problems", path)
-		}
+	if p := d.post("/agents", d.form("name", "late")); p.status != http.StatusSeeOther || !strings.Contains(d.get("/agents/new").body, "run email-me restart") {
+		t.Fatal("creating an agent must be refused")
+	}
+	if p := d.post("/recipients/ops/delete", d.form("confirm", "ops")); p.status != http.StatusSeeOther {
+		t.Fatalf("deleting a recipient: %d", p.status)
+	}
+	if _, ok := d.settings.Current().Recipient("ops"); !ok || read(t, d.env.Path) != edited {
+		t.Fatal("nothing may change while the edit is pending")
 	}
 }
 
+// withoutUpstream removes the upstream section from env's config.yaml.
+func withoutUpstream(t *testing.T, env *testutil.Env) {
+	t.Helper()
+	start, end := strings.Index(env.YAML, "upstream:\n"), strings.Index(env.YAML, "recipients:\n")
+	env.YAML = env.YAML[:start] + env.YAML[end:]
+	os.WriteFile(env.Path, []byte(env.YAML), 0o600)
+	c, err := config.Load(env.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Config = c
+}
+
 func TestSettingsUpstreamNotConfigured(t *testing.T) {
-	d := newDashWith(t, testutil.Options{Signing: true}, func(env *testutil.Env, st *store.Store) {
-		if _, err := st.SeedSettings(context.Background(), &store.Settings{Doc: []byte(`{}`)}); err != nil {
-			t.Fatal(err)
-		}
-	})
+	d := newDashWith(t, testutil.Options{Signing: true}, func(env *testutil.Env, _ *store.Store) { withoutUpstream(t, env) })
 	d.login()
 	o := d.get("/").body
 	for _, want := range []string{"Configure SMTP", `href="/settings#upstream"`, "not configured"} {
@@ -280,14 +278,14 @@ func TestSettingsUpstreamNotConfigured(t *testing.T) {
 
 	// No From address: no signing key with an empty user ID.
 	a := d.createAgent("bench", "me")
-	if _, err := d.st.ActiveKey(context.Background(), a.ID); err == nil {
+	if _, err := d.st.ActiveKey(context.Background(), a.Name); err == nil {
 		t.Fatal("no key may be generated without a From address")
 	}
-	sg := d.get("/agents/" + a.ID + "/signing").body
-	if !strings.Contains(sg, "none is set") || strings.Contains(sg, `action="/agents/`+a.ID+`/keys"`) {
+	sg := d.get("/agents/" + a.Name + "/signing").body
+	if !strings.Contains(sg, "none is set") || strings.Contains(sg, `action="/agents/`+a.Name+`/keys"`) {
 		t.Fatal("the signing tab must explain why no key can be generated")
 	}
-	if p := d.post("/agents/"+a.ID+"/keys", d.form()); p.status != http.StatusSeeOther || !strings.Contains(d.get("/agents/"+a.ID+"/signing").body, "no From address is configured") {
+	if p := d.post("/agents/"+a.Name+"/keys", d.form()); p.status != http.StatusSeeOther || !strings.Contains(d.get("/agents/"+a.Name+"/signing").body, "no From address is configured") {
 		t.Fatal("generating a key without a From address must be refused")
 	}
 	if o := d.get("/").body; !strings.Contains(o, "One can be generated once a From address is set") {
@@ -300,7 +298,7 @@ func TestSettingsUpstreamNotConfigured(t *testing.T) {
 	if !strings.Contains(body, "Upstream SMTP settings saved and applied. Generated a signing key for 1 agent.") {
 		t.Fatal("saving a From address must generate the missing keys")
 	}
-	if _, err := d.st.ActiveKey(context.Background(), a.ID); err != nil {
+	if _, err := d.st.ActiveKey(context.Background(), a.Name); err != nil {
 		t.Fatalf("no key after saving a From address: %v", err)
 	}
 	if o := d.get("/").body; strings.Contains(o, "Configure SMTP") || strings.Contains(o, "No signing key") {
@@ -319,13 +317,7 @@ func TestSettingsPasswordNotices(t *testing.T) {
 	}
 
 	lost := newDashWith(t, testutil.Options{Signing: true}, func(env *testutil.Env, st *store.Store) {
-		testutil.BootstrapSettings(t, env, st)
-		row, err := st.GetSettings(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		row.SMTPPassword, row.PasswordSealed = []byte(strings.Repeat("x", 40)), true
-		if err := st.SaveSettings(context.Background(), row); err != nil {
+		if err := st.SetSMTPPassword(context.Background(), &store.SMTPPassword{Value: []byte(strings.Repeat("x", 40)), Sealed: true}); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -335,77 +327,5 @@ func TestSettingsPasswordNotices(t *testing.T) {
 	}
 	if b := lost.get("/settings").body; !strings.Contains(b, "<strong>cannot be decrypted</strong>") {
 		t.Error("the upstream card must say the password cannot be decrypted")
-	}
-}
-
-func TestRestartFromDashboard(t *testing.T) {
-	d := newDash(t, testutil.Options{})
-	up := d.get("/up")
-	boot := up.body
-	if up.status != 200 || !strings.HasPrefix(up.header.Get("Content-Type"), "text/plain") || len(boot) < 16 || strings.ContainsAny(boot, "<\n") {
-		t.Fatalf("GET /up without login: %d %q", up.status, boot)
-	}
-	if d.get("/up").body != boot {
-		t.Fatal("the boot id is fixed for a start")
-	}
-	if p := d.post("/settings/restart", url.Values{}); p.status == http.StatusOK || d.restart.count() != 0 {
-		t.Fatal("restarting needs a session")
-	}
-	d.login()
-	d.saved(d.post("/settings/audit", d.form("retention_days", "60")), "audit")
-	if b := d.get("/agents").body; strings.Contains(b, `id="restart-banner"`) {
-		t.Fatal("no banner while config.yaml is unchanged")
-	}
-	if s := d.get("/settings").body; !strings.Contains(s, "config.yaml is unchanged since email-me started.") {
-		t.Fatal("the restart card says config.yaml is unchanged")
-	}
-
-	// config.yaml changes on disk: every page offers the restart.
-	d.configChanged.Store(true)
-	banner := d.get("/agents").body
-	if !strings.Contains(banner, `id="restart-banner"`) || !strings.Contains(banner, "changed on disk") ||
-		!strings.Contains(banner, `action="/settings/restart"`) || !strings.Contains(banner, "data-confirm=") {
-		t.Fatal("the restart banner offers Restart now, with a confirmation")
-	}
-	if o := d.get("/").body; !strings.Contains(o, "Restart to apply") {
-		t.Error("a changed config.yaml must be on the attention list")
-	}
-	if s := d.get("/settings").body; !strings.Contains(s, `<span class="tag warn">changed</span>`) || !strings.Contains(s, "config.yaml changed on disk since email-me started.") {
-		t.Fatal("the restart card says config.yaml changed")
-	}
-
-	// config.yaml no longer loads: nothing restarts and the session stays.
-	d.restart.fail(errors.New("config.yaml no longer loads: parsing config: yaml: line 3: did not find expected key"))
-	p := d.post("/settings/restart", d.form())
-	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/settings#restart" || d.restart.count() != 0 {
-		t.Fatalf("refused restart: %d %s", p.status, p.header.Get("Location"))
-	}
-	if s := d.get("/settings"); s.status != 200 || !strings.Contains(s.body, "Not restarted: config.yaml no longer loads: parsing config") {
-		t.Fatal("a refused restart is reported and keeps the session")
-	}
-
-	d.restart.fail(nil)
-	csrf := d.csrf()
-	p = d.post("/settings/restart", url.Values{"csrf": {csrf}})
-	if p.status != 200 || d.restart.count() != 1 {
-		t.Fatalf("restart: %d, %d calls", p.status, d.restart.count())
-	}
-	for _, want := range []string{`data-restart-poll="/up"`, `data-boot="` + boot + `"`, `data-next="/login?next=/settings"`,
-		`<meta http-equiv="refresh" content="8;url=/login?next=/settings">`, `href="/login?next=/settings"`, "log in again", "in flight finish first", `class="auth"`} {
-		if !strings.Contains(p.body, want) {
-			t.Errorf("restarting page lacks %q", want)
-		}
-	}
-	if strings.Contains(p.body, csrf) || strings.Contains(p.body, `action="/logout"`) {
-		t.Error("the restarting page is rendered logged out")
-	}
-	if c := p.header.Get("Set-Cookie"); !strings.Contains(c, "email_me_session=;") || !strings.Contains(c, "Max-Age=0") {
-		t.Errorf("the session cookie must be cleared: %q", c)
-	}
-	if strings.Contains(p.body, "<script>") || inlineStyle.MatchString(p.body) || inlineHandler.MatchString(p.body) {
-		t.Error("restarting page must be CSP-safe")
-	}
-	if g := d.get("/settings"); g.status != http.StatusSeeOther {
-		t.Fatal("the session must end with the restart")
 	}
 }

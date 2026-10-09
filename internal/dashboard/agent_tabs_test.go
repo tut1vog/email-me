@@ -1,7 +1,6 @@
 package dashboard_test
 
 import (
-	"context"
 	"net/http"
 	"regexp"
 	"strings"
@@ -14,7 +13,7 @@ import (
 func TestAgentTabs(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
-	base := "/agents/" + d.createAgent("bench", "me").ID
+	base := "/agents/" + d.createAgent("bench", "me").Name
 
 	for _, tab := range []string{base, base + "/tokens", base + "/policy", base + "/signing"} {
 		p := d.get(tab)
@@ -30,14 +29,14 @@ func TestAgentTabs(t *testing.T) {
 		}
 	}
 	for _, tab := range []string{"", "/tokens", "/policy", "/signing"} {
-		if p := d.get("/agents/ag_nope" + tab); p.status != http.StatusNotFound {
+		if p := d.get("/agents/nope" + tab); p.status != http.StatusNotFound {
 			t.Errorf("unknown agent %q: %d", tab, p.status)
 		}
 	}
 
 	f := d.form("name", "second")
 	p := d.post("/agents", f)
-	if loc := p.header.Get("Location"); !regexp.MustCompile(`^/agents/ag_[^/]+/tokens$`).MatchString(loc) {
+	if loc := p.header.Get("Location"); loc != "/agents/second/tokens" {
 		t.Errorf("create agent redirects to %q, want its tokens tab", loc)
 	}
 	if body := d.get(p.header.Get("Location")).body; !strings.Contains(body, "Agent second created") {
@@ -74,25 +73,24 @@ func TestPolicyDefaultSwitchClearsOverride(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	d.login()
 	a := d.createAgent("bench", "me")
-	ctx := context.Background()
 
-	d.post("/agents/"+a.ID+"/policy", d.form("ov_max_bytes", "on", "max_bytes", "2MiB"))
-	got, _ := d.st.GetAgent(ctx, a.ID)
+	d.post("/agents/"+a.Name+"/policy", d.form("ov_max_bytes", "on", "max_bytes", "2MiB"))
+	got := d.agent(a.Name)
 	if got.Policy.MaxMessageBytes == nil || int64(*got.Policy.MaxMessageBytes) != 2<<20 {
 		t.Fatalf("override not saved: %+v", got.Policy)
 	}
-	page := d.get("/agents/" + a.ID + "/policy").body
+	page := d.get("/agents/" + a.Name + "/policy").body
 	if !regexp.MustCompile(`name="ov_max_bytes" checked`).MatchString(page) || !strings.Contains(page, `name="max_bytes" value="2MiB"`) {
 		t.Fatal("policy tab must show the override switched on with its value")
 	}
 
 	// Switching back to Default omits ov_max_bytes; the value field is still posted.
-	d.post("/agents/"+a.ID+"/policy", d.form("max_bytes", "2MiB"))
-	got, _ = d.st.GetAgent(ctx, a.ID)
+	d.post("/agents/"+a.Name+"/policy", d.form("max_bytes", "2MiB"))
+	got = d.agent(a.Name)
 	if got.Policy.MaxMessageBytes != nil {
 		t.Fatalf("switch off must clear the override: %v", *got.Policy.MaxMessageBytes)
 	}
-	if strings.Contains(d.get("/agents/"+a.ID+"/policy").body, `name="ov_max_bytes" checked`) {
+	if strings.Contains(d.get("/agents/"+a.Name+"/policy").body, `name="ov_max_bytes" checked`) {
 		t.Fatal("cleared override must render with the switch off")
 	}
 }
@@ -101,7 +99,7 @@ func TestTokensTabSplitsRevoked(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	d.login()
 	a := d.createAgent("bench", "me")
-	tab := "/agents/" + a.ID + "/tokens"
+	tab := "/agents/" + a.Name + "/tokens"
 
 	if p := d.get(tab).body; !strings.Contains(p, "<details class=\"disclosure mt-0\" open>") || strings.Contains(p, `id="inactive-tokens"`) {
 		t.Fatal("with no tokens the issue form is open and there is no inactive list")
@@ -144,7 +142,7 @@ func TestAgentPagesAreCSPSafe(t *testing.T) {
 		d := newDash(t, testutil.Options{Signing: signing})
 		d.login()
 		a := d.createAgent("bench", "me")
-		base := "/agents/" + a.ID
+		base := "/agents/" + a.Name
 		pages := map[string]string{}
 		for _, path := range []string{base, base + "/tokens", base + "/policy", base + "/signing", base + "/delete", "/agents/new"} {
 			p := d.get(path)

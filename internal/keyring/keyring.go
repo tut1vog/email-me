@@ -45,9 +45,9 @@ const (
 
 var (
 	// ErrNoKEK: the database holds a keyring but no KEK is configured.
-	ErrNoKEK = errors.New("the state database holds credentials encrypted with a key-encryption key, but kek.file is not set (or empty): set it to that key. If the key is lost, `email-me reset-keyring` discards those credentials")
+	ErrNoKEK = errors.New("the state database holds credentials encrypted with a key-encryption key, but kek.file is empty: write that key to it. If the key is lost, `email-me reset-keyring --yes` discards those credentials")
 	// ErrWrongKEK: neither KEK opens the keyring.
-	ErrWrongKEK = errors.New("kek.file does not open the state database's keyring. To rotate the KEK, set kek.file to the new key and kek.previous_file to the old one for one start. If the key is lost, `email-me reset-keyring` discards the credentials it protected")
+	ErrWrongKEK = errors.New("kek.file does not open the state database's keyring. To rotate the KEK, keep the old key in kek.previous_file (previous_kek beside kek) for one start. If the key is lost, `email-me reset-keyring --yes` discards the credentials it protected")
 )
 
 // Open opens the keyring with kek, falling back to previous (and then

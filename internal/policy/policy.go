@@ -35,15 +35,15 @@ type RateLimit struct {
 // Policy is a partial policy: nil fields inherit from the next layer
 // (agent override → configured defaults → built-in defaults).
 type Policy struct {
-	Recipients             *[]string       `yaml:"recipients" json:"recipients,omitempty"`
-	Services               *[]string       `yaml:"services" json:"services,omitempty"`
-	MaxMessageBytes        *units.ByteSize `yaml:"max_message_bytes" json:"max_message_bytes,omitempty"`
-	MaxAttachments         *int            `yaml:"max_attachments" json:"max_attachments,omitempty"`
-	AllowedAttachmentTypes *[]string       `yaml:"allowed_attachment_types" json:"allowed_attachment_types,omitempty"`
-	RateLimit              *RateLimit      `yaml:"rate_limit" json:"rate_limit,omitempty"`
-	SubjectPrefix          *string         `yaml:"subject_prefix" json:"subject_prefix,omitempty"`
-	RequireEncryption      *bool           `yaml:"require_encryption" json:"require_encryption,omitempty"`
-	RequireSigning         *bool           `yaml:"require_signing" json:"require_signing,omitempty"`
+	Recipients             *[]string       `yaml:"recipients,omitempty" json:"recipients,omitempty"`
+	Services               *[]string       `yaml:"services,omitempty" json:"services,omitempty"`
+	MaxMessageBytes        *units.ByteSize `yaml:"max_message_bytes,omitempty" json:"max_message_bytes,omitempty"`
+	MaxAttachments         *int            `yaml:"max_attachments,omitempty" json:"max_attachments,omitempty"`
+	AllowedAttachmentTypes *[]string       `yaml:"allowed_attachment_types,omitempty" json:"allowed_attachment_types,omitempty"`
+	RateLimit              *RateLimit      `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
+	SubjectPrefix          *string         `yaml:"subject_prefix,omitempty" json:"subject_prefix,omitempty"`
+	RequireEncryption      *bool           `yaml:"require_encryption,omitempty" json:"require_encryption,omitempty"`
+	RequireSigning         *bool           `yaml:"require_signing,omitempty" json:"require_signing,omitempty"`
 }
 
 // Effective is a fully resolved policy.

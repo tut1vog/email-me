@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/tut1vog/email-me/internal/policy"
 )
 
 func openTest(t *testing.T) *Store {
@@ -33,155 +31,78 @@ func TestMigrationsIdempotent(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 4 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 1 {
 		t.Fatalf("user_version = %d, %v", v, err)
 	}
 }
 
-func TestSettings(t *testing.T) {
+func TestSMTPPassword(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
-	if _, err := s.GetSettings(ctx); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetSMTPPassword(ctx); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("empty table: %v", err)
 	}
-	seed := &Settings{Doc: []byte(`{"audit":{"retention_days":30}}`), SMTPPassword: []byte{0, 1, 2}, PasswordSealed: true}
-	if ok, err := s.SeedSettings(ctx, seed); !ok || err != nil {
-		t.Fatalf("seed empty table: %v %v", ok, err)
-	}
-	got, err := s.GetSettings(ctx)
-	if err != nil || string(got.Doc) != string(seed.Doc) || string(got.SMTPPassword) != "\x00\x01\x02" || !got.PasswordSealed || got.UpdatedAt.IsZero() {
-		t.Fatalf("GetSettings = %+v, %v", got, err)
-	}
-	// Seeding only fills an empty table.
-	if ok, err := s.SeedSettings(ctx, &Settings{Doc: []byte(`{}`)}); ok || err != nil {
-		t.Fatalf("seeded a non-empty table: %v %v", ok, err)
-	}
-	if err := s.SaveSettings(ctx, &Settings{Doc: []byte(`{"audit":{"retention_days":7}}`)}); err != nil {
+	if err := s.SetSMTPPassword(ctx, &SMTPPassword{Value: []byte{0, 1, 2}, Sealed: true}); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.GetSettings(ctx)
-	if string(got.Doc) != `{"audit":{"retention_days":7}}` || got.SMTPPassword != nil || got.PasswordSealed {
-		t.Fatalf("after save: %+v", got)
+	got, err := s.GetSMTPPassword(ctx)
+	if err != nil || string(got.Value) != "\x00\x01\x02" || !got.Sealed || got.UpdatedAt.IsZero() {
+		t.Fatalf("GetSMTPPassword = %+v, %v", got, err)
+	}
+	if err := s.SetSMTPPassword(ctx, &SMTPPassword{Value: []byte("raw")}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.GetSMTPPassword(ctx); string(got.Value) != "raw" || got.Sealed {
+		t.Fatalf("after replace: %+v", got)
 	}
 	var n int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM settings").Scan(&n); err != nil || n != 1 {
-		t.Fatalf("settings is a single row: %d %v", n, err)
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM credentials").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("credentials is a single row: %d %v", n, err)
+	}
+	if err := s.SetSMTPPassword(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSMTPPassword(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removed: %v", err)
 	}
 }
 
-func TestRecipientsCRUD(t *testing.T) {
+func TestAgentData(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
-	if n, _ := s.CountRecipients(ctx); n != 0 {
-		t.Fatal(n)
-	}
-	r := &Recipient{Alias: "me", Address: "me@example.com", Description: "Personal", PublicKey: "armor", RequireEncryption: true}
-	if err := s.CreateRecipient(ctx, r); err != nil {
+	if err := s.CreateToken(ctx, &Token{ID: "tok1", Agent: "bench", SecretHash: []byte{1}, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreateRecipient(ctx, &Recipient{Alias: "me", Address: "x@example.com"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("duplicate alias: %v", err)
+	for _, k := range []*AgentKey{
+		{Fingerprint: "F1", Agent: "bench", PublicKey: "p", PrivateKeyEnc: []byte{1}, RevocationCert: "r", RevocationCertCompromised: "rc", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)},
+		{Fingerprint: "F2", Agent: "keys-only", PublicKey: "p", PrivateKeyEnc: []byte{1}, RevocationCert: "r", RevocationCertCompromised: "rc", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)},
+	} {
+		if err := s.InsertKey(ctx, k); err != nil {
+			t.Fatal(err)
+		}
 	}
-	got, err := s.GetRecipient(ctx, "me")
-	if err != nil || got.Address != "me@example.com" || got.PublicKey != "armor" || !got.RequireEncryption || got.CreatedAt.IsZero() {
-		t.Fatalf("GetRecipient = %+v, %v", got, err)
+	if names, err := s.AgentsWithData(ctx); err != nil || len(names) != 2 || names[0] != "bench" || names[1] != "keys-only" {
+		t.Fatalf("AgentsWithData = %v, %v", names, err)
 	}
-	if err := s.CreateRecipient(ctx, &Recipient{Alias: "aa", Address: "aa@example.com"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.UpdateRecipient(ctx, &Recipient{Alias: "me", Address: "new@example.com", Description: "d"}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = s.GetRecipient(ctx, "me")
-	if got.Address != "new@example.com" || got.PublicKey != "" || got.RequireEncryption {
-		t.Fatalf("after update: %+v", got)
-	}
-	if err := s.UpdateRecipient(ctx, &Recipient{Alias: "ghost"}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("update missing: %v", err)
-	}
-	list, _ := s.ListRecipients(ctx)
-	if len(list) != 2 || list[0].Alias != "aa" || list[1].Alias != "me" {
-		t.Fatalf("ListRecipients must sort by alias: %+v", list)
-	}
-	if err := s.DeleteRecipient(ctx, "aa"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.GetRecipient(ctx, "aa"); !errors.Is(err, ErrNotFound) {
-		t.Fatal("deleted recipient still there")
-	}
-	if err := s.DeleteRecipient(ctx, "aa"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("delete missing: %v", err)
-	}
-	// Seeding only fills an empty table.
-	if ok, err := s.SeedRecipients(ctx, []*Recipient{{Alias: "seed", Address: "s@example.com"}}); ok || err != nil {
-		t.Fatalf("seeded a non-empty table: %v %v", ok, err)
-	}
-	s.DeleteRecipient(ctx, "me")
-	if ok, err := s.SeedRecipients(ctx, []*Recipient{{Alias: "seed", Address: "s@example.com"}}); !ok || err != nil {
-		t.Fatalf("seed empty table: %v %v", ok, err)
-	}
-	if n, _ := s.CountRecipients(ctx); n != 1 {
-		t.Fatal(n)
-	}
-}
-
-func TestAgentsCRUD(t *testing.T) {
-	s := openTest(t)
-	ctx := context.Background()
-	rc := []string{"me"}
-	a, err := s.CreateAgent(ctx, "bench", "desc", policy.Policy{Recipients: &rc})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CreateAgent(ctx, "bench", "", policy.Policy{}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("duplicate name: %v", err)
-	}
-	got, err := s.GetAgent(ctx, a.ID)
-	if err != nil || got.Name != "bench" || !got.Enabled || got.Policy.Recipients == nil || (*got.Policy.Recipients)[0] != "me" {
-		t.Fatalf("GetAgent = %+v, %v", got, err)
-	}
-	if err := s.UpdateAgent(ctx, a.ID, "new", false); err != nil {
-		t.Fatal(err)
-	}
-	f := false
-	if err := s.UpdateAgentPolicy(ctx, a.ID, policy.Policy{RequireSigning: &f}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = s.GetAgent(ctx, a.ID)
-	if got.Enabled || got.Description != "new" || got.Policy.Recipients != nil || got.Policy.RequireSigning == nil {
-		t.Fatalf("after update: %+v", got)
-	}
-	if err := s.UpdateAgent(ctx, "ag_missing", "", true); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("update missing: %v", err)
-	}
-	list, _ := s.ListAgents(ctx)
-	if len(list) != 1 {
-		t.Fatal(list)
-	}
-	// Deleting cascades to tokens and keys.
-	if err := s.CreateToken(ctx, &Token{ID: "tok1", AgentID: a.ID, SecretHash: []byte{1}, CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.InsertKey(ctx, &AgentKey{Fingerprint: "F1", AgentID: a.ID, PublicKey: "p", PrivateKeyEnc: []byte{1}, RevocationCert: "r", RevocationCertCompromised: "rc", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.DeleteAgent(ctx, a.ID); err != nil {
+	if err := s.DeleteAgentData(ctx, "bench"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.GetToken(ctx, "tok1"); !errors.Is(err, ErrNotFound) {
-		t.Fatal("token must cascade")
+		t.Fatal("tokens must be deleted")
 	}
 	if _, err := s.GetKey(ctx, "F1"); !errors.Is(err, ErrNotFound) {
-		t.Fatal("key must cascade")
+		t.Fatal("keys must be deleted")
+	}
+	if names, _ := s.AgentsWithData(ctx); len(names) != 1 || names[0] != "keys-only" {
+		t.Fatalf("other agents are kept: %v", names)
 	}
 }
 
 func TestTokens(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
-	a, _ := s.CreateAgent(ctx, "a", "", policy.Policy{})
 	exp := time.Now().Add(time.Hour).Truncate(time.Second)
-	tok := &Token{ID: "abc", AgentID: a.ID, SecretHash: []byte("h"), Label: "l", AllowedCIDRs: []string{"10.0.0.0/8"}, CreatedAt: time.Now(), ExpiresAt: &exp}
+	tok := &Token{ID: "abc", Agent: "a", SecretHash: []byte("h"), Label: "l", AllowedCIDRs: []string{"10.0.0.0/8"}, CreatedAt: time.Now(), ExpiresAt: &exp}
 	if err := s.CreateToken(ctx, tok); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +119,7 @@ func TestTokens(t *testing.T) {
 	if err := s.RevokeToken(ctx, "other-agent", "abc"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("revoking via another agent must fail")
 	}
-	if err := s.RevokeToken(ctx, a.ID, "abc"); err != nil {
+	if err := s.RevokeToken(ctx, "a", "abc"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = s.GetToken(ctx, "abc")
@@ -210,9 +131,8 @@ func TestTokens(t *testing.T) {
 func TestKeysOneActive(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
-	a, _ := s.CreateAgent(ctx, "a", "", policy.Policy{})
 	mk := func(fpr string) *AgentKey {
-		return &AgentKey{Fingerprint: fpr, AgentID: a.ID, PublicKey: "pub-" + fpr, PrivateKeyEnc: []byte("secret"), RevocationCert: "rev", RevocationCertCompromised: "rev-c", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+		return &AgentKey{Fingerprint: fpr, Agent: "a", PublicKey: "pub-" + fpr, PrivateKeyEnc: []byte("secret"), RevocationCert: "rev", RevocationCertCompromised: "rev-c", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
 	}
 	if err := s.InsertKey(ctx, mk("K1")); err != nil {
 		t.Fatal(err)
@@ -223,7 +143,7 @@ func TestKeysOneActive(t *testing.T) {
 	if err := s.RotateKey(ctx, mk("K2")); err != nil {
 		t.Fatal(err)
 	}
-	act, _ := s.ActiveKey(ctx, a.ID)
+	act, _ := s.ActiveKey(ctx, "a")
 	if act.Fingerprint != "K2" {
 		t.Fatal(act.Fingerprint)
 	}
@@ -231,7 +151,7 @@ func TestKeysOneActive(t *testing.T) {
 	if old.RetiredAt == nil || len(old.PrivateKeyEnc) != 0 || old.PublicKey != "pub-K1" || old.RevocationCert != "rev" || old.RevocationCertCompromised != "rev-c" {
 		t.Fatalf("retired key: %+v", old)
 	}
-	ks, _ := s.ListKeys(ctx, a.ID)
+	ks, _ := s.ListKeys(ctx, "a")
 	if len(ks) != 2 {
 		t.Fatal(len(ks))
 	}
@@ -246,18 +166,14 @@ func TestResetKeyring(t *testing.T) {
 	if err := s.CreateKeyring(ctx, []byte("again")); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a second keyring must conflict: %v", err)
 	}
-	if err := s.SaveSettings(ctx, &Settings{Doc: []byte(`{}`), SMTPPassword: []byte("sealed"), PasswordSealed: true}); err != nil {
+	if err := s.SetSMTPPassword(ctx, &SMTPPassword{Value: []byte("sealed"), Sealed: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetCertifyKey(ctx, &CertifyKey{Fingerprint: "M", PublicKey: "pub-M", PrivateKeyEnc: []byte("sealed")}); err != nil {
 		t.Fatal(err)
 	}
-	a, _ := s.CreateAgent(ctx, "a", "", policy.Policy{})
-	key := &AgentKey{Fingerprint: "K1", AgentID: a.ID, PublicKey: "pub-K1", PrivateKeyEnc: []byte("sealed"), RevocationCert: "rev", RevocationCertCompromised: "rev-c", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+	key := &AgentKey{Fingerprint: "K1", Agent: "a", PublicKey: "pub-K1", PrivateKeyEnc: []byte("sealed"), RevocationCert: "rev", RevocationCertCompromised: "rev-c", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
 	if err := s.InsertKey(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetAdmin(ctx, "hash", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -268,23 +184,20 @@ func TestResetKeyring(t *testing.T) {
 	if _, err := s.GetKeyring(ctx); !errors.Is(err, ErrNotFound) {
 		t.Fatal("keyring kept")
 	}
-	if got, _ := s.GetSettings(ctx); got.SMTPPassword != nil || got.PasswordSealed || string(got.Doc) != "{}" {
-		t.Fatalf("settings: %+v", got)
+	if _, err := s.GetSMTPPassword(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatal("sealed SMTP password kept")
 	}
 	if _, err := s.GetCertifyKey(ctx); !errors.Is(err, ErrNotFound) {
 		t.Fatal("certification key kept")
 	}
-	if _, err := s.ActiveKey(ctx, a.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := s.ActiveKey(ctx, "a"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("the agent key must be retired")
 	}
 	if old, _ := s.GetKey(ctx, "K1"); old.RetiredAt == nil || len(old.PrivateKeyEnc) != 0 || old.RevocationCert != "rev" {
 		t.Fatalf("retired key: %+v", old)
 	}
-	if adm, err := s.GetAdmin(ctx); err != nil || adm.PasswordHash != "hash" {
-		t.Fatal("the admin password is not sealed and stays")
-	}
 	// A raw password (no keyring) is not the keyring's to discard.
-	s.SaveSettings(ctx, &Settings{Doc: []byte(`{}`), SMTPPassword: []byte("raw")})
+	s.SetSMTPPassword(ctx, &SMTPPassword{Value: []byte("raw")})
 	if d, _ := s.ResetKeyring(ctx); d.SMTPPassword {
 		t.Fatal("a raw password is kept")
 	}
@@ -295,7 +208,7 @@ func TestAudit(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	add := func(agent, status string, ago time.Duration, transport string) {
-		if err := s.InsertAudit(ctx, &AuditEntry{TS: now.Add(-ago), AgentID: agent, Status: status, Recipients: []string{"me"}, Transport: transport}); err != nil {
+		if err := s.InsertAudit(ctx, &AuditEntry{TS: now.Add(-ago), Agent: agent, Status: status, Recipients: []string{"me"}, Transport: transport}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -322,7 +235,7 @@ func TestAudit(t *testing.T) {
 	if len(ins) != 1 || ins[0] != "a1" {
 		t.Fatalf("insecure = %v", ins)
 	}
-	rows, _ := s.ListAudit(ctx, AuditFilter{AgentID: "a1", Status: StatusSent, Limit: 10})
+	rows, _ := s.ListAudit(ctx, AuditFilter{Agent: "a1", Status: StatusSent, Limit: 10})
 	if len(rows) != 3 || rows[0].Recipients[0] != "me" || !rows[0].TS.After(rows[1].TS) {
 		t.Fatalf("ListAudit = %d rows", len(rows))
 	}

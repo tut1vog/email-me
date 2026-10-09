@@ -1,23 +1,29 @@
-// Package settings holds the managed settings (config.Settings). They live
-// in the state database and are edited on the dashboard; the managed
-// sections of config.yaml only seed an empty database. Saved settings apply
-// at once: a Manager serves the current configuration (Current), the
-// bootstrap keys read from config.yaml completed with the saved settings,
-// and every successful Save replaces it with a new one.
+// Package settings applies the dashboard's changes to the configuration.
+// config.yaml is the source of truth for the managed settings, the
+// recipients and the agents; a Manager serves the current configuration
+// (Current) and every successful change validates the configuration with
+// the change merged in, writes config.yaml and replaces the current
+// configuration, so it applies at once.
 //
-// Stored settings never block startup: a row that cannot be decoded or
-// fails validation is reported (LoadProblems, config warnings) and the
-// gateway still comes up, so the operator can fix it on the dashboard. The
-// next successful save clears the problems.
+// Only the keys a change touches are written: the rest of the file stays as
+// the operator wrote it. A hand edit is not applied until the next start,
+// and while one is pending every change is refused (ErrFileChanged), since
+// writing the loaded configuration back would discard it.
+//
+// The SMTP password is the one managed value that is a secret, so it is not
+// in config.yaml: it is kept sealed in the state database.
 package settings
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -27,10 +33,14 @@ import (
 )
 
 // passwordAAD binds a sealed SMTP password to its column.
-const passwordAAD = "settings.smtp_password"
+const passwordAAD = "credentials.smtp_password"
 
-// WarningPrefix starts the config warnings that repeat LoadProblems.
-const WarningPrefix = "saved settings: "
+// ErrFileChanged refuses a change while config.yaml differs from the file
+// the gateway runs with.
+var ErrFileChanged = errors.New("config.yaml was edited since email-me started; run email-me restart to apply the edit, then make this change")
+
+// PasswordUnsealed is the warning for a password stored without a KEK.
+const PasswordUnsealed = "the SMTP password is stored unencrypted in the state database; set kek.file in config.yaml to encrypt it"
 
 // PasswordState says how the saved SMTP password is stored.
 type PasswordState int
@@ -55,139 +65,70 @@ type PasswordChange struct {
 	Value string
 }
 
-// Manager serves the current configuration and saves new settings.
+// Manager serves the current configuration and applies changes to it.
 type Manager struct {
-	st           *store.Store
-	kr           *keyring.Keyring // nil: passwords are stored raw
-	base         *config.Config   // bootstrap keys that saved settings are validated against
-	bootWarnings []string         // base's own warnings (config.yaml), kept by every snapshot
+	path string
+	st   *store.Store
+	kr   *keyring.Keyring // nil: the password is stored raw
 
 	// cur is the current configuration. A stored snapshot is never
-	// modified: Save stores a new one, so a reader that holds one sees a
-	// consistent configuration however long it keeps it.
+	// modified: a change stores a new one, so a reader that holds one sees
+	// a consistent configuration however long it keeps it.
 	cur atomic.Pointer[config.Config]
 
-	mu           sync.RWMutex // serializes Save and guards everything below
-	savedBlob    []byte       // stored password column, kept as-is when a Save does not change it
-	savedSealed  bool
-	pwState      PasswordState
-	loadProblems []string
+	mu      sync.RWMutex // serializes changes and guards pwState
+	pwState PasswordState
 }
 
-// Bootstrap loads the stored settings into cfg, seeding the store from
-// cfg's managed keys if it has none yet (the first boot, or the first after
-// upgrading). It reports whether it seeded.
-//
-// Problems in the seed are fatal (*config.ValidationError), as they were
-// when config.yaml was the source of truth. Problems in stored settings
-// are not: they are reported by LoadProblems and added to cfg.Warnings.
-// Only a store error fails a boot with stored settings.
-//
-// kr seals the SMTP password; nil (no key-encryption key) stores it raw.
-func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, kr *keyring.Keyring, log *slog.Logger) (*Manager, bool, error) {
-	m := &Manager{st: st, kr: kr, base: cfg, bootWarnings: slices.Clone(cfg.Warnings)}
-	fileManaged := !cfg.Managed().IsZero()
-	row, err := st.GetSettings(ctx)
-	seeded := false
+// Open makes cfg, loaded from path, the current configuration, completed
+// with the SMTP password from the store. A password that cannot be
+// decrypted is dropped with a warning, never a failure; one stored raw is
+// sealed now if a keyring has appeared. kr nil (no key-encryption key)
+// stores the password raw.
+func Open(ctx context.Context, path string, cfg *config.Config, st *store.Store, kr *keyring.Keyring, log *slog.Logger) (*Manager, error) {
+	m := &Manager{path: path, st: st, kr: kr}
+	pw, state, err := m.openPassword(ctx, log)
+	if err != nil {
+		return nil, err
+	}
+	c := clone(cfg)
+	c.Upstream.SMTP.Password = pw
+	// Validated again for the warnings that depend on the password.
+	_, warnings := c.ValidateManaged()
+	c.Warnings = m.warnings(c, warnings, state)
+	m.pwState = state
+	m.cur.Store(c)
+	return m, nil
+}
+
+func (m *Manager) openPassword(ctx context.Context, log *slog.Logger) (string, PasswordState, error) {
+	p, err := m.st.GetSMTPPassword(ctx)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		if seeded, err = m.seed(ctx, cfg); err != nil {
-			return nil, false, err
-		}
-		if row, err = st.GetSettings(ctx); err != nil {
-			return nil, false, fmt.Errorf("loading settings: %w", err)
-		}
-		switch {
-		case seeded && fileManaged:
-			log.Info("imported settings from config.yaml into the state database; manage them on the dashboard's Settings page from now on")
-		case seeded:
-			log.Info("stored default settings in the state database; manage them on the dashboard's Settings page")
-		}
-	case err != nil:
-		return nil, false, fmt.Errorf("loading settings: %w", err)
-	case fileManaged:
-		log.Info("settings in config.yaml are ignored after the first boot; they are managed on the dashboard's Settings page, and only the bootstrap keys are read from the file")
-	}
-	if err := m.load(ctx, row, cfg, log); err != nil {
-		return nil, false, err
-	}
-	return m, seeded, nil
-}
-
-// seed validates cfg's managed keys and stores them if the store has no
-// settings. The SMTP password is never seeded: it is entered on the
-// dashboard.
-func (m *Manager) seed(ctx context.Context, cfg *config.Config) (bool, error) {
-	c := scratch(cfg)
-	if problems, _ := c.ValidateManaged(); len(problems) > 0 {
-		return false, &config.ValidationError{Problems: problems}
-	}
-	row, err := m.row(c.Managed())
-	if err != nil {
-		return false, err
-	}
-	ok, err := m.st.SeedSettings(ctx, row)
-	if err != nil {
-		return false, fmt.Errorf("seeding settings from config: %w", err)
-	}
-	return ok, nil
-}
-
-// load applies a stored row to cfg and makes cfg the current configuration.
-func (m *Manager) load(ctx context.Context, row *store.Settings, cfg *config.Config, log *slog.Logger) error {
-	var problems []string
-	var s config.Settings
-	if err := json.Unmarshal(row.Doc, &s); err != nil {
-		s = cfg.Managed()
-		problems = append(problems, fmt.Sprintf("the stored settings cannot be decoded (%v); running with the values in config.yaml and defaults until settings are saved again", err))
-	}
-	cfg.SetManaged(s)
-	pw, state, err := m.openPassword(ctx, row, log)
-	if err != nil {
-		return err
-	}
-	cfg.Upstream.SMTP.Password = pw
-	invalid, warnings := cfg.ValidateManaged()
-	problems = append(problems, invalid...)
-	cfg.Warnings = append(cfg.Warnings, warnings...)
-	for _, p := range problems {
-		cfg.Warnings = append(cfg.Warnings, WarningPrefix+p)
-	}
-
-	m.savedBlob, m.savedSealed, m.pwState = row.SMTPPassword, row.PasswordSealed, state
-	m.loadProblems = problems
-	m.cur.Store(cfg)
-	return nil
-}
-
-// openPassword reads the stored password. One that cannot be decrypted is
-// dropped with a warning; a raw one is sealed now if a keyring has appeared.
-func (m *Manager) openPassword(ctx context.Context, row *store.Settings, log *slog.Logger) (string, PasswordState, error) {
-	switch {
-	case len(row.SMTPPassword) == 0:
 		return "", None, nil
-	case !row.PasswordSealed && m.kr == nil:
+	case err != nil:
+		return "", None, fmt.Errorf("loading the SMTP password: %w", err)
+	case !p.Sealed && m.kr == nil:
 		log.Warn("the upstream SMTP password is stored unencrypted in the state database; set kek.file to encrypt it")
-		return string(row.SMTPPassword), Unsealed, nil
-	case !row.PasswordSealed:
-		pw := string(row.SMTPPassword)
-		blob, err := m.kr.Seal(row.SMTPPassword, passwordAAD)
+		return string(p.Value), Unsealed, nil
+	case !p.Sealed:
+		pw := string(p.Value)
+		blob, err := m.kr.Seal(p.Value, passwordAAD)
 		if err != nil {
 			return "", None, err
 		}
-		row.SMTPPassword, row.PasswordSealed = blob, true
-		if err := m.st.SaveSettings(ctx, row); err != nil {
+		if err := m.st.SetSMTPPassword(ctx, &store.SMTPPassword{Value: blob, Sealed: true}); err != nil {
 			return "", None, fmt.Errorf("encrypting the stored SMTP password: %w", err)
 		}
 		log.Info("encrypted the stored upstream SMTP password with the keyring")
 		return pw, Sealed, nil
 	case m.kr == nil:
-		// Not reached from serve: a sealed password implies a keyring,
-		// which cannot be opened without a KEK.
+		// Not reached from run: a sealed password implies a keyring, which
+		// cannot be opened without a KEK.
 		log.Warn("the stored upstream SMTP password is encrypted but no key-encryption key is set; re-enter the password on the Settings page")
 		return "", Undecryptable, nil
 	}
-	plain, err := m.kr.Unseal(row.SMTPPassword, passwordAAD)
+	plain, err := m.kr.Unseal(p.Value, passwordAAD)
 	if err != nil {
 		log.Warn("the stored upstream SMTP password cannot be decrypted; re-enter it on the Settings page")
 		return "", Undecryptable, nil
@@ -195,94 +136,27 @@ func (m *Manager) openPassword(ctx context.Context, row *store.Settings, log *sl
 	return string(plain), Sealed, nil
 }
 
-// row encodes settings for the store, without the password.
-func (m *Manager) row(s config.Settings) (*store.Settings, error) {
-	doc, err := json.Marshal(s)
-	if err != nil {
-		return nil, err
+// warnings is a snapshot's warning list: the bootstrap keys' and the
+// managed configuration's, and the password's state.
+func (m *Manager) warnings(c *config.Config, managed []string, state PasswordState) []string {
+	out := append(slices.Clone(c.BootstrapWarnings), managed...)
+	if state == Unsealed {
+		out = append(out, PasswordUnsealed)
 	}
-	return &store.Settings{Doc: doc}, nil
+	return out
 }
 
-// seal returns the password column for pw: nil for none, sealed under the
-// keyring if there is one, raw otherwise.
-func (m *Manager) seal(pw string) ([]byte, bool, error) {
-	if pw == "" {
-		return nil, false, nil
-	}
-	if m.kr == nil {
-		return []byte(pw), false, nil
-	}
-	blob, err := m.kr.Seal([]byte(pw), passwordAAD)
-	return blob, true, err
-}
-
-// Save validates s against the bootstrap keys, stores it normalized
-// (defaults applied) and makes it current: it applies at once. It returns
-// the settings' warnings, and a *config.ValidationError listing every
-// problem if s is invalid, in which case nothing changes.
-func (m *Manager) Save(ctx context.Context, s config.Settings, pw PasswordChange) ([]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	c := scratch(m.base)
-	c.SetManaged(s)
-	password := m.cur.Load().Upstream.SMTP.Password
-	if pw.Set {
-		password = pw.Value
-	}
-	c.Upstream.SMTP.Password = password
-	problems, warnings := c.ValidateManaged()
-	if len(problems) > 0 {
-		return warnings, &config.ValidationError{Problems: problems}
-	}
-	// The snapshot's warnings: config.yaml's and these settings'. Problems
-	// found at boot are gone with the settings that had them.
-	c.Warnings = append(slices.Clone(m.bootWarnings), warnings...)
-	row, err := m.row(c.Managed())
-	if err != nil {
-		return nil, err
-	}
-	row.SMTPPassword, row.PasswordSealed = m.savedBlob, m.savedSealed
-	state := m.pwState
-	if pw.Set {
-		if row.SMTPPassword, row.PasswordSealed, err = m.seal(pw.Value); err != nil {
-			return nil, err
-		}
-		switch {
-		case pw.Value == "":
-			state = None
-		case row.PasswordSealed:
-			state = Sealed
-		default:
-			state = Unsealed
-			warnings = append(warnings, "the SMTP password is stored unencrypted in the state database; set kek.file in config.yaml to encrypt it")
-		}
-	}
-	if err := m.st.SaveSettings(ctx, row); err != nil {
-		return nil, fmt.Errorf("saving settings: %w", err)
-	}
-	m.savedBlob, m.savedSealed, m.pwState = row.SMTPPassword, row.PasswordSealed, state
-	m.loadProblems = nil
-	m.cur.Store(c)
-	return warnings, nil
-}
-
-// Current returns the current configuration: config.yaml's bootstrap keys
-// with the saved settings. The caller must not modify it. A request should
-// read it once and use that snapshot throughout, so a concurrent save
-// cannot mix two configurations in one response.
+// Current returns the current configuration. The caller must not modify
+// it. A request should read it once and use that snapshot throughout, so a
+// concurrent change cannot mix two configurations in one response.
 func (m *Manager) Current() *config.Config { return m.cur.Load() }
 
-// Saved returns the saved settings, the ones in effect, with the SMTP
-// password in memory.
-func (m *Manager) Saved() config.Settings { return m.Current().Managed() }
-
-// LoadProblems returns what was wrong with the stored settings at boot.
-// The process runs regardless; the next successful save clears them.
-func (m *Manager) LoadProblems() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return slices.Clone(m.loadProblems)
+// Changed reports whether config.yaml on disk differs from the file the
+// current configuration was loaded from or last written as. An unreadable
+// file counts as changed.
+func (m *Manager) Changed() bool {
+	fp, err := config.FileFingerprint(m.path)
+	return err != nil || fp != m.Current().Fingerprint
 }
 
 // HasPassword reports whether an SMTP password is stored, usable or not.
@@ -295,10 +169,264 @@ func (m *Manager) PasswordState() PasswordState {
 	return m.pwState
 }
 
-// scratch copies c so managed settings can be set and validated on it
-// without touching c. SetManaged writes through no pointer of c.
-func scratch(c *config.Config) *config.Config {
+// Save replaces the managed settings with s and applies them. It returns
+// the configuration's warnings, and a *config.ValidationError listing every
+// problem if s is invalid, in which case nothing changes.
+func (m *Manager) Save(ctx context.Context, s config.Settings, pw PasswordChange) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := m.pwState
+	return m.commit(ctx, func(c *config.Config) error {
+		c.SetManaged(s)
+		if pw.Set {
+			c.Upstream.SMTP.Password = pw.Value
+		}
+		return nil
+	}, func(d *config.Document, prev, next *config.Config) error {
+		ns := next.Managed()
+		for _, key := range config.DiffSettings(prev.Managed(), ns) {
+			path := strings.Split(key, ".")
+			n, ok, err := config.ValueAt(ns, path)
+			switch {
+			case err != nil:
+				return err
+			case ok:
+				d.SetNode(path, n)
+			default:
+				d.Delete(path)
+			}
+		}
+		return nil
+	}, func(ctx context.Context) (PasswordState, error) {
+		if !pw.Set {
+			return state, nil
+		}
+		return m.storePassword(ctx, pw.Value)
+	})
+}
+
+// storePassword stores pw, sealed when there is a keyring; "" removes it.
+func (m *Manager) storePassword(ctx context.Context, pw string) (PasswordState, error) {
+	if pw == "" {
+		return None, m.st.SetSMTPPassword(ctx, nil)
+	}
+	p := &store.SMTPPassword{Value: []byte(pw)}
+	state := Unsealed
+	if m.kr != nil {
+		blob, err := m.kr.Seal(p.Value, passwordAAD)
+		if err != nil {
+			return m.pwState, err
+		}
+		p.Value, p.Sealed, state = blob, true, Sealed
+	}
+	if err := m.st.SetSMTPPassword(ctx, p); err != nil {
+		return m.pwState, fmt.Errorf("saving the SMTP password: %w", err)
+	}
+	return state, nil
+}
+
+// PutRecipient adds a recipient (create) or replaces an existing one, and
+// applies the change. It returns store.ErrConflict when creating an alias
+// that exists, store.ErrNotFound when replacing one that does not, and a
+// *config.ValidationError when the configuration would be invalid.
+func (m *Manager) PutRecipient(ctx context.Context, r *config.Recipient, create bool) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.commit(ctx, func(c *config.Config) error {
+		if err := exists(c.Recipients, r.Alias, create); err != nil {
+			return err
+		}
+		cp := *r
+		c.Recipients[r.Alias] = &cp
+		return nil
+	}, func(d *config.Document, _, next *config.Config) error {
+		return d.Set([]string{"recipients", r.Alias}, next.Recipients[r.Alias])
+	}, nil)
+}
+
+// DeleteRecipient removes a recipient. Policies naming it are not edited:
+// the alias is ignored (and flagged on the dashboard) wherever it appears.
+func (m *Manager) DeleteRecipient(ctx context.Context, alias string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, err := m.commit(ctx, func(c *config.Config) error {
+		if err := exists(c.Recipients, alias, false); err != nil {
+			return err
+		}
+		delete(c.Recipients, alias)
+		return nil
+	}, func(d *config.Document, _, _ *config.Config) error {
+		d.Delete([]string{"recipients", alias})
+		return nil
+	}, nil)
+	return err
+}
+
+// PutAgent adds an agent (create) or replaces an existing one, and applies
+// the change. Errors are as for PutRecipient.
+func (m *Manager) PutAgent(ctx context.Context, a *config.Agent, create bool) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.commit(ctx, func(c *config.Config) error {
+		if err := exists(c.Agents, a.Name, create); err != nil {
+			return err
+		}
+		cp := *a
+		c.Agents[a.Name] = &cp
+		return nil
+	}, func(d *config.Document, _, next *config.Config) error {
+		return d.Set([]string{"agents", a.Name}, next.Agents[a.Name])
+	}, nil)
+}
+
+// DeleteAgent removes an agent from the configuration, then deletes its
+// tokens and signing keys from the store.
+func (m *Manager) DeleteAgent(ctx context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, err := m.commit(ctx, func(c *config.Config) error {
+		if err := exists(c.Agents, name, false); err != nil {
+			return err
+		}
+		delete(c.Agents, name)
+		return nil
+	}, func(d *config.Document, _, _ *config.Config) error {
+		d.Delete([]string{"agents", name})
+		return nil
+	}, nil)
+	if err != nil {
+		return err
+	}
+	if err := m.st.DeleteAgentData(ctx, name); err != nil {
+		return fmt.Errorf("deleting the agent's tokens and keys: %w", err)
+	}
+	return nil
+}
+
+func exists[V any](m map[string]V, key string, create bool) error {
+	_, ok := m[key]
+	switch {
+	case create && ok:
+		return store.ErrConflict
+	case !create && !ok:
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// commit applies a change under m.mu: mutate changes a copy of the current
+// configuration, which is validated; edit writes the change into the file's
+// document; after, if set, stores what the change keeps outside the file
+// and returns the password's state. Then the copy becomes current.
+func (m *Manager) commit(ctx context.Context, mutate func(*config.Config) error,
+	edit func(d *config.Document, prev, next *config.Config) error,
+	after func(context.Context) (PasswordState, error)) ([]string, error) {
+	if m.Changed() {
+		return nil, ErrFileChanged
+	}
+	prev := m.cur.Load()
+	next := clone(prev)
+	if err := mutate(next); err != nil {
+		return nil, err
+	}
+	problems, warnings := next.ValidateManaged()
+	if len(problems) > 0 {
+		return warnings, &config.ValidationError{Problems: problems}
+	}
+	doc, err := config.ParseDocument(prev.Raw)
+	if err != nil {
+		return nil, fmt.Errorf("reading config.yaml: %w", err)
+	}
+	unedited, err := doc.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	if err := edit(doc, prev, next); err != nil {
+		return nil, err
+	}
+	data, err := doc.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	// Only a change to the configuration rewrites the file, not a change
+	// that touches no key (e.g. the password alone).
+	if !slices.Equal(data, unedited) {
+		if err := writeFile(m.path, data); err != nil {
+			return nil, fmt.Errorf("writing config.yaml: %w", err)
+		}
+		next.Raw, next.Fingerprint = data, config.Fingerprint(data)
+	}
+	state := m.pwState
+	if after != nil {
+		if state, err = after(ctx); err != nil {
+			return nil, err
+		}
+	}
+	next.Warnings = m.warnings(next, warnings, state)
+	m.pwState = state
+	m.cur.Store(next)
+	if state == Unsealed {
+		warnings = append(warnings, PasswordUnsealed)
+	}
+	return warnings, nil
+}
+
+// clone copies c deeply enough to change and validate the copy: the
+// managed settings, and the recipient and agent entries, which validation
+// annotates.
+func clone(c *config.Config) *config.Config {
 	cp := *c
+	cp.SetManaged(c.Managed())
+	cp.Recipients = maps.Clone(c.Recipients)
+	if cp.Recipients == nil {
+		cp.Recipients = map[string]*config.Recipient{}
+	}
+	for k, r := range cp.Recipients {
+		if r != nil {
+			v := *r
+			cp.Recipients[k] = &v
+		}
+	}
+	cp.Agents = maps.Clone(c.Agents)
+	if cp.Agents == nil {
+		cp.Agents = map[string]*config.Agent{}
+	}
+	for k, a := range cp.Agents {
+		if a != nil {
+			v := *a
+			cp.Agents[k] = &v
+		}
+	}
 	cp.Warnings = nil
 	return &cp
+}
+
+// writeFile replaces path with data atomically: a temporary file in the
+// same directory is renamed over it, keeping the old file's mode.
+func writeFile(path string, data []byte) error {
+	mode := os.FileMode(0o644)
+	if fi, err := os.Stat(path); err == nil {
+		mode = fi.Mode().Perm()
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".config.yaml.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // after a successful rename, a no-op
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
