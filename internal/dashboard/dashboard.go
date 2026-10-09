@@ -5,6 +5,7 @@ package dashboard
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"fmt"
 	"html/template"
@@ -37,6 +38,7 @@ var staticFS embed.FS
 
 const (
 	sessionCookie = "email_me_session"
+	loginCookie   = "email_me_login" // the login form's CSRF token
 	maxFormBytes  = 64 << 10
 )
 
@@ -211,7 +213,7 @@ func (s *Server) sameOrigin(r *http.Request) bool {
 	if origin == "" {
 		ref := r.Header.Get("Referer")
 		if ref == "" {
-			return true // non-browser client; CSRF token still required
+			return true // non-browser client; the CSRF token is still required
 		}
 		u, err := url.Parse(ref)
 		if err != nil {
@@ -290,10 +292,37 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 
 // renderLogin renders the login page. While the admin password is a setup
 // password, the page says where to find it.
+//
+// There is no session yet to hold a CSRF token, so each render issues one
+// in a SameSite=Strict cookie and in the form, and login compares the two:
+// another site can neither read the token nor make the browser send the
+// cookie, so it cannot log the browser in.
 func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int, next, errMsg string) {
+	tok := ids.Random(52)
+	http.SetCookie(w, &http.Cookie{
+		Name: loginCookie, Value: tok, Path: "/login", HttpOnly: true, Secure: secureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+	})
 	s.renderStatus(w, r, status, "login", "Log in", map[string]any{
 		"Next": next, "Error": errMsg, "SharedHost": sharedHostHint(r.Host), "Setup": admin.Pending(r.Context(), s.Store),
+		"CSRF": tok,
 	})
+}
+
+// validLoginCSRF reports whether the login form's token matches its cookie.
+func validLoginCSRF(r *http.Request) bool {
+	c, err := r.Cookie(loginCookie)
+	tok := r.PostForm.Get("csrf")
+	return err == nil && tok != "" && subtle.ConstantTimeCompare([]byte(c.Value), []byte(tok)) == 1
+}
+
+// secureRequest reports whether the browser reached the dashboard over
+// HTTPS. The dashboard itself serves plain HTTP, so that means a TLS proxy in
+// front of it. X-Forwarded-Proto is trusted from anyone: it only decides
+// whether cookies are marked Secure, and a client that lies about it only
+// loses its own cookies.
+func secureRequest(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // sharedHostHint returns a dedicated-host URL suggestion when the dashboard
@@ -324,6 +353,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := safeNext(r.PostForm.Get("next"))
+	if !validLoginCSRF(r) {
+		s.renderLogin(w, r, http.StatusForbidden, next, "The login form expired. Log in again.")
+		return
+	}
 	// Begin counts the attempt before the expensive password check, so
 	// parallel guesses cannot all slip past the throttle.
 	if ok, wait := s.throttle.Begin(ip); !ok {
@@ -346,9 +379,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	ttl := s.Config().Dashboard.SessionTTL.D()
 	sess := s.sessions.Create(ttl)
 	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: sess.ID, Path: "/", HttpOnly: true, Secure: r.TLS != nil,
+		Name: sessionCookie, Value: sess.ID, Path: "/", HttpOnly: true, Secure: secureRequest(r),
 		SameSite: http.SameSiteStrictMode, MaxAge: int(ttl.Seconds()),
 	})
+	http.SetCookie(w, &http.Cookie{Name: loginCookie, Value: "", Path: "/login", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	s.Log.Info("dashboard login", "ip", ip, "setup_password", mustChange)
 	if mustChange {
 		sess.SetMustChange(true)

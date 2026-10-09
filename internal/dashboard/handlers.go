@@ -211,12 +211,20 @@ func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*stor
 			Link: "/settings#policy"})
 	}
 	for _, rc := range s.Recipients.All() {
+		title := "Recipient " + rc.Alias
+		link := "/recipients/" + rc.Alias
+		if rc.KeyErr != nil {
+			msg := "Its stored PGP key cannot be read: encrypted sends fail"
+			if rc.RequireEncryption {
+				msg += ", and it requires encryption, so nothing is delivered"
+			}
+			out = append(out, notice{Kind: "danger", Title: title, Text: msg + ". Replace or remove the key.", Link: link})
+			continue
+		}
 		if rc.Key == nil {
 			continue
 		}
 		exp := rc.KeyExpiry()
-		title := "Recipient " + rc.Alias
-		link := "/recipients/" + rc.Alias
 		switch {
 		case !rc.KeyUsable(now):
 			msg := "PGP key expired or revoked: encrypted sends fail"
@@ -891,10 +899,13 @@ type recipientRow struct {
 }
 
 // recipientKeyState summarises a recipient's PGP key like keyState does for
-// signing keys: "" without a key, else expired (or revoked), expiring or ok.
+// signing keys: "" without a key, else damaged (unreadable), expired (or
+// revoked), expiring or ok.
 func recipientKeyState(rc *recipients.Recipient, now time.Time) string {
 	exp := rc.KeyExpiry()
 	switch {
+	case rc.KeyErr != nil:
+		return "damaged"
 	case rc.Key == nil:
 		return ""
 	case !rc.KeyUsable(now):
@@ -983,6 +994,8 @@ func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
 		"KeyFpr":     rc.Fingerprint(),
 		"KeyExpiry":  exp,
 		"KeyUsable":  state == "ok" || state == "expiring",
+		"KeyDamaged": state == "damaged",
+		"KeyErr":     rc.KeyErr,
 		"KeyExpired": !exp.IsZero() && !now.Before(exp),
 		"Expiring":   state == "expiring",
 	})
@@ -1027,7 +1040,7 @@ func (s *Server) updateRecipient(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case armor != "":
 		msg = "Recipient saved with the new PGP key." + keyExpiryNote(updated, s.now())
-	case remove && rc.Key != nil:
+	case remove && rc.PublicKey != "":
 		msg = "Recipient saved; its PGP key was removed."
 	}
 	s.Log.Info("recipient updated", "alias", rc.Alias, "key", updated.Fingerprint())

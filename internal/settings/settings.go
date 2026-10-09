@@ -296,13 +296,9 @@ func (m *Manager) PasswordState() PasswordState {
 }
 
 // scratch copies c so managed settings can be set and validated on it
-// without touching c. Signing is the only pointer SetManaged writes through.
+// without touching c. SetManaged writes through no pointer of c.
 func scratch(c *config.Config) *config.Config {
 	cp := *c
-	if c.Signing != nil {
-		s := *c.Signing
-		cp.Signing = &s
-	}
 	cp.Warnings = nil
 	return &cp
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tut1vog/email-me/internal/pgp"
+	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
@@ -159,5 +160,33 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 	g.login()
 	if b := g.get("/").body; !strings.Contains(b, "Default policy") || !strings.Contains(b, "ghost") || !strings.Contains(b, `href="/settings#policy"`) {
 		t.Error("unknown default alias must be flagged")
+	}
+}
+
+func TestDamagedRecipientKey(t *testing.T) {
+	d := newDash(t, testutil.Options{})
+	d.login()
+	ctx := context.Background()
+	if err := d.st.CreateRecipient(ctx, &store.Recipient{Alias: "bad", Address: "bad@example.com", PublicKey: "not a key", RequireEncryption: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.reg.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := d.get("/"); !strings.Contains(p.body, "Recipient bad") || !strings.Contains(p.body, "stored PGP key cannot be read") {
+		t.Fatal("overview must flag the unreadable key")
+	}
+	if p := d.get("/recipients"); !strings.Contains(p.body, "unreadable") {
+		t.Fatal("list must tag the unreadable key")
+	}
+	p := d.get("/recipients/bad")
+	if p.status != 200 || !strings.Contains(p.body, "cannot be read") || !strings.Contains(p.body, `name="remove_key"`) {
+		t.Fatalf("detail page must explain and offer removal: %d", p.status)
+	}
+	if p := d.post("/recipients/bad", d.form("address", "bad@example.com", "remove_key", "on")); !strings.Contains(d.get("/recipients/bad").body, "its PGP key was removed") {
+		t.Fatalf("removing the damaged key: %d", p.status)
+	}
+	if rc, _ := d.reg.Get("bad"); rc.KeyErr != nil || rc.PublicKey != "" {
+		t.Fatal("the damaged key must be gone")
 	}
 }

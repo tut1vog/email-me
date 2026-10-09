@@ -415,7 +415,7 @@ components:
           schema: {$ref: "#/components/schemas/Error"}
           example: {error: upstream_failed, message: "The upstream mail server did not accept the message. Retry later with the same idempotency_key.", details: {upstream_code: 451}}
     Unavailable:
-      description: "`signing_unavailable` (signing requested or required but not possible: not configured, or your key expired) or `encryption_unavailable` (the recipient's PGP key expired or was revoked). Tell your operator; do not retry."
+      description: "`signing_unavailable` (signing requested or required but not possible: not configured, or your key expired) or `encryption_unavailable` (the recipient's PGP key expired, was revoked or cannot be read). Tell your operator; do not retry."
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}

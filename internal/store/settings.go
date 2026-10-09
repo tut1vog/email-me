@@ -9,7 +9,7 @@ import (
 
 // Settings is the single row of managed settings. Doc is the JSON settings
 // document; the SMTP password is kept apart so the document can be shown
-// and compared. SMTPPassword is sealed under the KEK when PasswordSealed,
+// and compared. SMTPPassword is sealed under the keyring's data key when PasswordSealed,
 // raw otherwise, and empty when there is none.
 type Settings struct {
 	Doc            []byte

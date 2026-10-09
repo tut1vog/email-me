@@ -36,6 +36,10 @@ var reserved = []string{"new"}
 type Recipient struct {
 	store.Recipient
 	Key *openpgp.Entity
+	// KeyErr is set when the stored key no longer parses (Key is then nil).
+	// Such a recipient still loads, so a damaged row never blocks boot and
+	// can be fixed on the dashboard; nothing can be encrypted to it.
+	KeyErr error
 }
 
 // KeyUsable reports whether the recipient's PGP key can encrypt right now.
@@ -143,11 +147,11 @@ func (r *Registry) reload(ctx context.Context) error {
 		if row.PublicKey != "" {
 			// Not ParsePublicKey: a key that expired since it was saved must
 			// still load, so it can be reported and replaced.
-			e, err := pgp.ReadPublicKey([]byte(row.PublicKey))
-			if err != nil {
-				return fmt.Errorf("recipient %s: stored PGP key: %w", row.Alias, err)
+			if e, err := pgp.ReadPublicKey([]byte(row.PublicKey)); err != nil {
+				rc.KeyErr = err
+			} else {
+				rc.Key = e
 			}
-			rc.Key = e
 		}
 		byAlias[row.Alias] = rc
 		aliases = append(aliases, row.Alias)

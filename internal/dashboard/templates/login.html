@@ -7,6 +7,7 @@
   {{with .Data.SharedHost}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div><strong>Tip: open the dashboard at <a href="{{.}}/login">{{.}}</a> instead.</strong>
     <details class="help"><summary><svg class="icon" aria-hidden="true"><use href="#icon-chevron-right"/></svg>Why?</summary><p>Browsers share <code>localhost</code> cookies with every local port, so a web server another local process runs could receive your session; a dedicated host name keeps the cookie to email-me.</p></details></div></div>{{end}}
   <form method="post" action="/login">
+    <input type="hidden" name="csrf" value="{{.Data.CSRF}}">
     <input type="hidden" name="next" value="{{.Data.Next}}">
     <div class="field">
       <label for="password">Admin password</label>

@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 
@@ -127,7 +128,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	var finish func(*idempotency.Result)
 	if req.IdempotencyKey != "" {
-		if len(req.IdempotencyKey) > maxKeyLen {
+		if utf8.RuneCountInString(req.IdempotencyKey) > maxKeyLen {
 			fail(newErr(http.StatusUnprocessableEntity, CodeValidation, "idempotency_key must be at most %d characters.", maxKeyLen))
 			return
 		}
@@ -294,7 +295,7 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 	}
 	thread := ""
 	if req.Options.Thread != "" {
-		if len(req.Options.Thread) > 200 {
+		if utf8.RuneCountInString(req.Options.Thread) > 200 {
 			return p, newErr(http.StatusUnprocessableEntity, CodeValidation, "options.thread must be at most 200 characters.")
 		}
 		thread = req.Options.Thread
@@ -322,6 +323,9 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 		}
 		if req.Subject == nil {
 			return p, newErr(http.StatusUnprocessableEntity, CodeValidation, "\"subject\" is required.")
+		}
+		if utf8.RuneCountInString(*req.Subject) > maxSubjectRunes {
+			return p, newErr(http.StatusUnprocessableEntity, CodeValidation, "\"subject\" must be at most %d characters.", maxSubjectRunes)
 		}
 		subject = compose.CleanHeaderText(*req.Subject, maxSubjectRunes)
 		if subject == "" {
@@ -444,6 +448,11 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 	case encPGP:
 		for _, rc := range rcs {
 			a, k := rc.Alias, rc.Key
+			if rc.KeyErr != nil {
+				return p, newErr(http.StatusServiceUnavailable, CodeEncryptionUnavail,
+					"Recipient %q's stored PGP key cannot be read, so nothing can be encrypted to it. Tell your operator to replace the key; do not retry.", a).
+					with("alias", a)
+			}
 			if k == nil {
 				return p, newErr(http.StatusUnprocessableEntity, CodeValidation,
 					"Recipient %q has no PGP key configured, so options.encrypt \"pgp\" is unavailable for it (see encryption_available in GET /v1/capabilities).", a).

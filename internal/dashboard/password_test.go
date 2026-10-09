@@ -45,10 +45,10 @@ func TestSetupPasswordMustBeReplaced(t *testing.T) {
 	if b := d.get("/login").body; !strings.Contains(b, "one-time setup password") || !strings.Contains(b, "docker compose logs email-me") {
 		t.Fatal("the login page says where the setup password is")
 	}
-	if p := d.post("/login", url.Values{"password": {d.env.AdminPW}}); p.status != http.StatusUnauthorized {
+	if p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}})); p.status != http.StatusUnauthorized {
 		t.Fatalf("the reset password applies at once: %d", p.status)
 	}
-	p := d.post("/login", url.Values{"password": {setup}, "next": {"/agents"}})
+	p := d.post("/login", d.loginForm(url.Values{"password": {setup}, "next": {"/agents"}}))
 	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/password?next=%2Fagents" {
 		t.Fatalf("setup login: %d %s", p.status, p.header.Get("Location"))
 	}
@@ -124,10 +124,10 @@ func TestChangePassword(t *testing.T) {
 	if g := other.get("/"); g.status != http.StatusSeeOther {
 		t.Fatal("other sessions end")
 	}
-	if p := d.post("/login", url.Values{"password": {d.env.AdminPW}}); p.status != http.StatusUnauthorized {
+	if p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}})); p.status != http.StatusUnauthorized {
 		t.Fatal("the old password stops working")
 	}
-	if p := other.post("/login", url.Values{"password": {"a brand new password"}}); p.status != http.StatusSeeOther || p.header.Get("Location") != "/" {
+	if p := other.post("/login", other.loginForm(url.Values{"password": {"a brand new password"}})); p.status != http.StatusSeeOther || p.header.Get("Location") != "/" {
 		t.Fatalf("the new password logs in without a forced change: %d %s", p.status, p.header.Get("Location"))
 	}
 }

@@ -41,7 +41,7 @@ func boot(t *testing.T, path string, st *store.Store, mod ...func(*config.Config
 }
 
 // noKEK boots as if kek.file were not set.
-func noKEK(c *config.Config) { c.Signing, c.KEK.Key = nil, nil }
+func noKEK(c *config.Config) { c.KEK.Key = nil }
 
 // enterPassword saves the SMTP password, as the operator does on the
 // dashboard: it is never seeded.

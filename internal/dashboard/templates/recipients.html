@@ -12,7 +12,7 @@
         <td>{{.R.Address}}</td>
         <td class="text-2">{{.R.Description}}</td>
         <td>{{if .R.RequireEncryption}}<span class="tag info">required</span>{{else if or (eq .KeyState "ok") (eq .KeyState "expiring")}}<span class="tag ok">available</span>{{else}}<span class="tag">unavailable</span>{{end}}</td>
-        <td>{{if .KeyFpr}}<code class="fpr" title="{{.KeyFpr}}">{{short .KeyFpr}}</code>{{if eq .KeyState "expired"}} <span class="tag danger">expired</span>{{else if eq .KeyState "expiring"}} <span class="tag warn">expiring</span>{{end}}{{if not .KeyExpiry.IsZero}}<span class="sub">expires {{ts .KeyExpiry}}</span>{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
+        <td>{{if eq .KeyState "damaged"}}<span class="tag danger">unreadable</span>{{else if .KeyFpr}}<code class="fpr" title="{{.KeyFpr}}">{{short .KeyFpr}}</code>{{if eq .KeyState "expired"}} <span class="tag danger">expired</span>{{else if eq .KeyState "expiring"}} <span class="tag warn">expiring</span>{{end}}{{if not .KeyExpiry.IsZero}}<span class="sub">expires {{ts .KeyExpiry}}</span>{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
       </tr>
     {{end}}
     </tbody>

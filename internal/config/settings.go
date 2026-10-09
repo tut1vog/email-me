@@ -35,8 +35,8 @@ type DashboardSettings struct {
 	SessionTTL units.Duration `json:"session_ttl"`
 }
 
-// SigningSettings are the managed keys of the signing section. They apply
-// only while signing is configured (a key-encryption key is set).
+// SigningSettings are the managed keys of the signing section. They are
+// kept without a key-encryption key and apply once one is set.
 type SigningSettings struct {
 	KeyValidity units.Duration `json:"key_validity"`
 }
@@ -53,19 +53,15 @@ func (c *Config) Managed() Settings {
 		},
 		Dashboard: DashboardSettings{SessionTTL: c.Dashboard.SessionTTL},
 		Upstream:  c.Upstream,
+		Signing:   SigningSettings{KeyValidity: c.Signing.KeyValidity},
 		Defaults:  c.Defaults,
 		Audit:     c.Audit,
-	}
-	if c.Signing != nil {
-		s.Signing.KeyValidity = c.Signing.KeyValidity
 	}
 	return s.Clone()
 }
 
-// SetManaged replaces every managed key of c with a copy of s. It never
-// creates c.Signing: a nil Signing means signing is not configured, and
-// s.Signing is then ignored. Derived fields (API.TrustedNets,
-// DefaultPolicy) are refreshed by ValidateManaged.
+// SetManaged replaces every managed key of c with a copy of s. Derived
+// fields (API.TrustedNets, DefaultPolicy) are refreshed by ValidateManaged.
 func (c *Config) SetManaged(s Settings) {
 	s = s.Clone()
 	c.API.PublicURL = s.API.PublicURL
@@ -74,9 +70,7 @@ func (c *Config) SetManaged(s Settings) {
 	c.API.ExternalTransportEncryption = s.API.ExternalTransportEncryption
 	c.Dashboard.SessionTTL = s.Dashboard.SessionTTL
 	c.Upstream = s.Upstream
-	if c.Signing != nil {
-		c.Signing.KeyValidity = s.Signing.KeyValidity
-	}
+	c.Signing.KeyValidity = s.Signing.KeyValidity
 	c.Defaults = s.Defaults
 	c.Audit = s.Audit
 }

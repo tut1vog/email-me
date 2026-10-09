@@ -45,9 +45,9 @@ A `200` response means the upstream mail server accepted the message.
 | 413, 415 | Too large, or attachment type not allowed | Shrink or drop attachments. |
 | 429 | Rate limited | Wait `Retry-After` seconds, then retry. |
 | 502 | Upstream mail server failed | Retry later with the same `idempotency_key`. |
-| 503 | Signing or encryption unavailable (key expired or not configured) | Tell your operator. Do not retry. |
+| 503 | Signing or encryption unavailable (a key expired or is unusable, or signing is not configured) | Tell your operator. Do not retry. |
 
-Every error body is `{"error": "<code>", "message": "<explanation>", "details": {...}}`.
+Every error body is `{"error": "<code>", "message": "<explanation>", "details": {...}, "docs": "<where to read more>"}`.
 
 ## End-to-end encryption (optional)
 

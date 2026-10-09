@@ -30,6 +30,7 @@ import (
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
+	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/units"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -117,6 +118,9 @@ func TestHealthNotFoundAndMethods(t *testing.T) {
 	}
 	if r.header.Get("X-Content-Type-Options") != "nosniff" || r.header.Get("Cache-Control") != "no-store" {
 		t.Fatal("security headers missing")
+	}
+	if r := h.do("POST", "/", "", nil); r.status != 405 || r.code(t) != "method_not_allowed" {
+		t.Fatalf("POST / = %d %s", r.status, r.body)
 	}
 }
 
@@ -558,6 +562,7 @@ func TestRejections(t *testing.T) {
 		{"email instead of alias", with("to", []string{"me@example.com"}), 422, "validation_failed"},
 		{"missing subject", map[string]any{"to": []string{"me"}, "body": map[string]any{"text": "b"}}, 422, "validation_failed"},
 		{"blank subject", with("subject", " \r\n "), 422, "validation_failed"},
+		{"long subject", with("subject", strings.Repeat("é", 256)), 422, "validation_failed"},
 		{"bad encrypt", with("options", map[string]any{"encrypt": "rot13"}), 422, "validation_failed"},
 		{"bad base64", with("attachments", []any{att("a.txt", "text/plain", "!!!")}), 422, "validation_failed"},
 		{"bad content type", with("attachments", []any{att("a.txt", "nonsense", b64("x"))}), 422, "validation_failed"},
@@ -843,6 +848,32 @@ func TestExpiredRecipientKey(t *testing.T) {
 	}
 	if r := h.do("GET", "/v1/recipients/me/pgp-key", tok, nil); r.status != 503 {
 		t.Fatalf("expired key must not be served for e2e: %d", r.status)
+	}
+}
+
+func TestDamagedRecipientKey(t *testing.T) {
+	h := newHarness(t, testutil.Options{})
+	ctx := context.Background()
+	if err := h.st.CreateRecipient(ctx, &store.Recipient{Alias: "bad", Address: "bad@example.com", PublicKey: "not a key", RequireEncryption: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.reg.Reload(ctx); err != nil {
+		t.Fatalf("a damaged stored key must not fail the reload: %v", err)
+	}
+	_, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"bad"}), Services: ptr([]string{policy.SvcEncrypt, policy.SvcE2E})})
+	body := map[string]any{"to": []string{"bad"}, "subject": "s", "body": map[string]any{"text": "b"}, "options": map[string]any{"encrypt": "pgp"}}
+	if r := h.do("POST", "/v1/messages", tok, body); r.status != 503 || r.code(t) != "encryption_unavailable" {
+		t.Fatalf("pgp to a damaged key: %d %s", r.status, r.body)
+	}
+	plain := map[string]any{"to": []string{"bad"}, "subject": "s", "body": map[string]any{"text": "b"}}
+	if r := h.do("POST", "/v1/messages", tok, plain); r.status != 403 || r.code(t) != "encryption_required" {
+		t.Fatalf("require_encryption must still hold: %d %s", r.status, r.body)
+	}
+	if r := h.do("GET", "/v1/recipients/bad/pgp-key", tok, nil); r.status != 503 {
+		t.Fatalf("a damaged key must not be served: %d", r.status)
+	}
+	if h.env.SMTP.Count() != 0 {
+		t.Fatal("nothing may be delivered")
 	}
 }
 

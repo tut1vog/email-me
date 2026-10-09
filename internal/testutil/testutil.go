@@ -363,9 +363,6 @@ func Keys(t testing.TB, env *Env, st *store.Store, m *settings.Manager) *keys.Ma
 	t.Helper()
 	km := keys.NewManager(st, keys.Options{Keyring: Keyring(t, env, st), From: func() (string, time.Duration) {
 		c := m.Current()
-		if c.Signing == nil {
-			return c.Upstream.From, 0
-		}
 		return c.Upstream.From, c.Signing.KeyValidity.D()
 	}})
 	if env.Master != nil {

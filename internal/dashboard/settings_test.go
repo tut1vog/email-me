@@ -155,7 +155,7 @@ func TestSettingsCardsValidate(t *testing.T) {
 
 	// The session lifetime applies to the next login.
 	d.post("/logout", d.form())
-	p := d.post("/login", url.Values{"password": {d.env.AdminPW}, "next": {"/"}})
+	p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}, "next": {"/"}}))
 	if c := p.header.Get("Set-Cookie"); p.status != http.StatusSeeOther || !strings.Contains(c, "Max-Age=7200") {
 		t.Fatalf("login after session_ttl 2h: %d %q", p.status, c)
 	}

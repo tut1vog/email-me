@@ -151,9 +151,21 @@ func (d *dash) csrf() string {
 	return m[1]
 }
 
+// loginForm adds the login page's CSRF token to form; the page also sets
+// the cookie the token must match.
+func (d *dash) loginForm(form url.Values) url.Values {
+	d.t.Helper()
+	m := csrfRe.FindStringSubmatch(d.get("/login").body)
+	if m == nil {
+		d.t.Fatal("no CSRF token on the login page")
+	}
+	form.Set("csrf", m[1])
+	return form
+}
+
 func (d *dash) login() {
 	d.t.Helper()
-	p := d.post("/login", url.Values{"password": {d.env.AdminPW}, "next": {"/"}})
+	p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}, "next": {"/"}}))
 	if p.status != http.StatusSeeOther {
 		d.t.Fatalf("login: %d %s", p.status, p.body)
 	}
@@ -216,16 +228,16 @@ func TestLoginFlowAndThrottle(t *testing.T) {
 	// slowly under -race load.
 	dashboard.FreezeThrottle(d.srv, time.Now())
 	for i := 0; i < 5; i++ {
-		if p := d.post("/login", url.Values{"password": {"wrong"}}); p.status != http.StatusUnauthorized {
+		if p := d.post("/login", d.loginForm(url.Values{"password": {"wrong"}})); p.status != http.StatusUnauthorized {
 			t.Fatalf("attempt %d: %d", i, p.status)
 		}
 	}
-	if p := d.post("/login", url.Values{"password": {d.env.AdminPW}}); p.status != http.StatusTooManyRequests {
+	if p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}})); p.status != http.StatusTooManyRequests {
 		t.Fatalf("throttled login must be refused even with the right password: %d", p.status)
 	}
 
 	d2 := newDash(t, testutil.Options{})
-	p := d2.post("/login", url.Values{"password": {d2.env.AdminPW}, "next": {"//evil.example/"}})
+	p := d2.post("/login", d2.loginForm(url.Values{"password": {d2.env.AdminPW}, "next": {"//evil.example/"}}))
 	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/" {
 		t.Fatalf("open redirect: %s", p.header.Get("Location"))
 	}
@@ -473,7 +485,7 @@ func TestLoginRedirectTargets(t *testing.T) {
 		"/%0a/evil.example":     "/%0a/evil.example", // percent-encoded stays a local path
 		"":                      "/",
 	} {
-		p := d.post("/login", url.Values{"password": {d.env.AdminPW}, "next": {next}})
+		p := d.post("/login", d.loginForm(url.Values{"password": {d.env.AdminPW}, "next": {next}}))
 		if got := p.header.Get("Location"); got != want {
 			t.Errorf("next=%q redirected to %q, want %q", next, got, want)
 		}
@@ -484,11 +496,12 @@ func TestParallelGuessesAreThrottled(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	const n = 20
 	codes := make(chan int, n)
+	form := d.loginForm(url.Values{"password": {"wrong guess"}}).Encode()
 	for i := 0; i < n; i++ {
 		go func() {
-			req, _ := http.NewRequest("POST", d.ts.URL+"/login", strings.NewReader(url.Values{"password": {"wrong guess"}}.Encode()))
+			req, _ := http.NewRequest("POST", d.ts.URL+"/login", strings.NewReader(form))
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			res, err := http.DefaultClient.Do(req)
+			res, err := d.c.Do(req)
 			if err != nil {
 				codes <- 0
 				return
@@ -505,6 +518,46 @@ func TestParallelGuessesAreThrottled(t *testing.T) {
 	}
 	if verified > 5 {
 		t.Fatalf("%d parallel guesses reached the password check; the throttle allows 5", verified)
+	}
+}
+
+func TestLoginCSRF(t *testing.T) {
+	d := newDash(t, testutil.Options{})
+	// Without the token, or with a token but not the cookie it came with
+	// (a cross-site form cannot make the browser send that cookie), the
+	// password is never checked.
+	if p := d.post("/login", url.Values{"password": {d.env.AdminPW}}); p.status != http.StatusForbidden || !strings.Contains(p.body, "login form expired") {
+		t.Fatalf("login without a token: %d", p.status)
+	}
+	stranger := d.session()
+	form := d.loginForm(url.Values{"password": {d.env.AdminPW}})
+	if p := stranger.post("/login", form); p.status != http.StatusForbidden {
+		t.Fatalf("token without its cookie: %d", p.status)
+	}
+	if p := d.post("/login", form); p.status != http.StatusSeeOther {
+		t.Fatalf("token with its cookie: %d %s", p.status, p.body)
+	}
+}
+
+func TestSessionCookieSecureBehindTLS(t *testing.T) {
+	d := newDash(t, testutil.Options{})
+	secure := func(proto string) bool {
+		t.Helper()
+		form := d.loginForm(url.Values{"password": {d.env.AdminPW}})
+		p := d.post("/login", form, func(r *http.Request) { r.Header.Set("X-Forwarded-Proto", proto) })
+		for _, c := range (&http.Response{Header: p.header}).Cookies() {
+			if c.Name == "email_me_session" {
+				return c.Secure
+			}
+		}
+		t.Fatalf("no session cookie: %d", p.status)
+		return false
+	}
+	if secure("http") {
+		t.Fatal("plain HTTP must not get a Secure cookie")
+	}
+	if !secure("https") {
+		t.Fatal("behind a TLS proxy the session cookie must be Secure")
 	}
 }
 

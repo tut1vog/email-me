@@ -190,9 +190,13 @@ func TestKEKFiles(t *testing.T) {
 	}
 	// An empty file is no KEK (compose mounts an empty variable), which
 	// also leaves signing off; a missing previous file is no previous KEK.
+	// The signing settings are kept for when a KEK is set.
 	c, err = load(fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("empty", "\n"), filepath.Join(dir, "absent")))
-	if err != nil || c.KEK.Key != nil || c.KEK.Previous != nil || c.Signing != nil || c.SigningConfigured() {
+	if err != nil || c.KEK.Key != nil || c.KEK.Previous != nil || c.SigningConfigured() {
 		t.Fatalf("empty: %+v %v", c, err)
+	}
+	if got := c.Managed().Signing.KeyValidity.D(); got != 365*24*time.Hour {
+		t.Fatalf("key_validity without a KEK: %v, want the file's 1y", got)
 	}
 	for kek, want := range map[string]string{
 		fmt.Sprintf("  file: %q\n", filepath.Join(dir, "absent")):                              "kek.file",
@@ -211,8 +215,8 @@ func TestManagedRoundTrip(t *testing.T) {
 	c, _ := config.Load(env.Path)
 	c.ValidateManaged()
 	s := c.Managed()
-	if c.Signing != nil || s.Signing.KeyValidity != 0 {
-		t.Fatal("no signing configured")
+	if c.SigningConfigured() || s.Signing.KeyValidity.D() != 2*365*24*time.Hour {
+		t.Fatalf("no signing configured, key_validity defaulted: %v", s.Signing.KeyValidity)
 	}
 	// The copy is deep: changing it does not touch c.
 	(*s.Defaults.Policy.Recipients)[0] = "changed"
@@ -226,15 +230,10 @@ func TestManagedRoundTrip(t *testing.T) {
 	s.Upstream.SMTP.Password = env.SMTP.Pass
 	other, _ := config.Load(env.Path)
 	other.SetManaged(s)
-	if other.Signing != nil {
-		t.Fatal("SetManaged must not create Signing")
-	}
 	if other.Audit.RetentionDays != 7 || (*other.Defaults.Policy.Recipients)[0] != "changed" || other.Upstream.SMTP.Password != env.SMTP.Pass {
 		t.Fatalf("SetManaged: %+v", other.Managed())
 	}
-	got := other.Managed()
-	got.Signing.KeyValidity = 0
-	if d := config.DiffSettings(s, got); len(d) != 1 || d[0] != "signing.key_validity" {
+	if d := config.DiffSettings(s, other.Managed()); len(d) != 0 {
 		t.Fatalf("round trip differs: %v", d)
 	}
 
@@ -259,7 +258,7 @@ func TestManagedRoundTrip(t *testing.T) {
 	ss := sc.Managed()
 	ss.Signing.KeyValidity = units.Duration(48 * time.Hour)
 	sc.SetManaged(ss)
-	if sc.Signing == nil || sc.Signing.KeyValidity.D() != 48*time.Hour || !sc.KEK.Configured() {
+	if sc.Signing.KeyValidity.D() != 48*time.Hour || !sc.KEK.Configured() {
 		t.Fatalf("signing: %+v", sc.Signing)
 	}
 }

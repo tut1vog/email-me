@@ -118,6 +118,21 @@ func (g *gateway) post(path string, form url.Values) (int, string) {
 	return g.do(req)
 }
 
+var loginCSRFRe = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
+
+// loginForm adds the login page's CSRF token to form; the page also sets
+// the cookie the token must match.
+func (g *gateway) loginForm(form url.Values) url.Values {
+	g.t.Helper()
+	_, body := g.get(g.dash + "/login")
+	m := loginCSRFRe.FindStringSubmatch(body)
+	if m == nil {
+		g.t.Fatal("no CSRF token on the login page")
+	}
+	form.Set("csrf", m[1])
+	return form
+}
+
 func (g *gateway) bootID() string {
 	g.t.Helper()
 	status, id := g.get(g.dash + "/up")
@@ -129,7 +144,7 @@ func (g *gateway) bootID() string {
 
 func (g *gateway) login() {
 	g.t.Helper()
-	if status, _ := g.post("/login", url.Values{"password": {g.env.AdminPW}, "next": {"/settings"}}); status != http.StatusSeeOther {
+	if status, _ := g.post("/login", g.loginForm(url.Values{"password": {g.env.AdminPW}, "next": {"/settings"}})); status != http.StatusSeeOther {
 		g.t.Fatalf("login: %d", status)
 	}
 }
@@ -299,7 +314,7 @@ func TestRestartRefusedWhenConfigBroken(t *testing.T) {
 func TestFirstStartAndResetAdminPassword(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
 	g := startFresh(t, env)
-	if status, _ := g.post("/login", url.Values{"password": {env.AdminPW}}); status != http.StatusUnauthorized {
+	if status, _ := g.post("/login", g.loginForm(url.Values{"password": {env.AdminPW}})); status != http.StatusUnauthorized {
 		t.Fatal("a fresh install has only a setup password")
 	}
 	if _, body := g.get(g.dash + "/login"); !strings.Contains(body, "one-time setup password") {
@@ -315,7 +330,7 @@ func TestFirstStartAndResetAdminPassword(t *testing.T) {
 	if m == nil {
 		t.Fatalf("output: %s", out.String())
 	}
-	status, _ := g.post("/login", url.Values{"password": {m[1]}, "next": {"/settings"}})
+	status, _ := g.post("/login", g.loginForm(url.Values{"password": {m[1]}, "next": {"/settings"}}))
 	if status != http.StatusSeeOther {
 		t.Fatalf("setup login: %d", status)
 	}

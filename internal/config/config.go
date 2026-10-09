@@ -46,7 +46,7 @@ type Config struct {
 	Upstream   Upstream              `yaml:"upstream"`
 	Recipients map[string]*Recipient `yaml:"recipients"`
 	KEK        KEK                   `yaml:"kek"`
-	Signing    *Signing              `yaml:"signing"`
+	Signing    Signing               `yaml:"signing"`
 	Defaults   Defaults              `yaml:"defaults"`
 	Audit      Audit                 `yaml:"audit"`
 	Log        Log                   `yaml:"log"`
@@ -133,8 +133,8 @@ type KEK struct {
 // Configured reports whether a KEK is set.
 func (k KEK) Configured() bool { return len(k.Key) == 32 }
 
-// Signing is the signing section. It is set exactly when a KEK is
-// configured, which is what signing needs.
+// Signing is the signing section. Its settings are kept whether or not a
+// KEK is configured; signing itself exists exactly when one is.
 type Signing struct {
 	KeyValidity units.Duration `yaml:"key_validity"`
 }
@@ -153,7 +153,7 @@ type Log struct {
 }
 
 // SigningConfigured reports whether the sign service can work at all.
-func (c *Config) SigningConfigured() bool { return c.Signing != nil && c.KEK.Configured() }
+func (c *Config) SigningConfigured() bool { return c.KEK.Configured() }
 
 // FromName renders the From display name for an agent.
 func (c *Config) FromName(agent string) string {
@@ -281,7 +281,7 @@ func (c *Config) ApplyManagedDefaults() {
 	if c.Upstream.FromNameTemplate == "" {
 		c.Upstream.FromNameTemplate = "{agent} via email-me"
 	}
-	if c.Signing != nil && c.Signing.KeyValidity == 0 {
+	if c.Signing.KeyValidity == 0 {
 		c.Signing.KeyValidity = units.Duration(2 * 365 * 24 * time.Hour)
 	}
 	if c.Audit.RetentionDays == 0 {
@@ -308,7 +308,7 @@ func (c *Config) validateManaged(v *validator) {
 		v.add("dashboard.session_ttl must be at least 1m")
 	}
 	c.validateUpstream(v)
-	if s := c.Signing; s != nil && (s.KeyValidity.D() < 24*time.Hour || s.KeyValidity.D() > 50*365*24*time.Hour) {
+	if d := c.Signing.KeyValidity.D(); d < 24*time.Hour || d > 50*365*24*time.Hour {
 		v.add("signing.key_validity must be between 1d and 50y")
 	}
 	c.validateDefaults(v)
@@ -492,12 +492,6 @@ func (c *Config) validateKEK(v *validator) {
 	if k.Previous != nil && k.Key == nil {
 		v.add("kek.previous_file is set but kek.file is not: a rotation needs the new KEK in kek.file")
 	}
-	switch {
-	case k.Key == nil:
-		c.Signing = nil
-	case c.Signing == nil:
-		c.Signing = &Signing{}
-	}
 }
 
 func (c *Config) validateDefaults(v *validator) {
@@ -505,7 +499,7 @@ func (c *Config) validateDefaults(v *validator) {
 	for _, e := range p.Validate() {
 		v.add("defaults.policy: %s", e)
 	}
-	signing := c.Signing != nil
+	signing := c.SigningConfigured()
 	if p.RequireSigning != nil && *p.RequireSigning && !signing {
 		v.add("defaults.policy.require_signing is true but signing is not configured")
 	}

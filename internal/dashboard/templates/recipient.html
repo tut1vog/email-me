@@ -2,7 +2,8 @@
 {{define "actions"}}<a class="button danger secondary" href="/recipients/{{.Data.Recipient.Alias}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}{{$r := $d.Recipient}}
-{{if $d.KeyFpr}}
+{{if $d.KeyDamaged}}<div class="banner danger"><svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg><div>The stored PGP key cannot be read ({{$d.KeyErr}}). Encrypted sends to {{$r.Alias}} fail{{if $r.RequireEncryption}}, and it requires encryption, so nothing is delivered{{end}} until you replace or remove it.</div></div>
+{{else if $d.KeyFpr}}
 {{if not $d.KeyUsable}}<div class="banner danger"><svg class="icon" aria-hidden="true"><use href="#icon-alert-octagon"/></svg><div>This PGP key {{if $d.KeyExpired}}expired on {{ts $d.KeyExpiry}}{{else}}is revoked or can no longer encrypt{{end}}. Encrypted sends to {{$r.Alias}} fail{{if $r.RequireEncryption}}, and it requires encryption, so nothing is delivered{{end}} until you replace it.</div></div>
 {{else if $d.Expiring}}<div class="banner warn"><svg class="icon" aria-hidden="true"><use href="#icon-alert-triangle"/></svg><div>This PGP key expires {{until $d.KeyExpiry}} ({{ts $d.KeyExpiry}}). Replace it soon.</div></div>{{end}}
 {{end}}
@@ -31,13 +32,13 @@
   </section>
 
   <section class="card">
-    <div class="card-header"><h2>PGP key</h2>{{if $d.KeyFpr}}{{if not $d.KeyUsable}}<span class="tag danger">expired</span>{{else if $d.Expiring}}<span class="tag warn">expiring</span>{{else}}<span class="tag ok">usable</span>{{end}}{{else}}<span class="tag">none</span>{{end}}</div>
+    <div class="card-header"><h2>PGP key</h2>{{if $d.KeyDamaged}}<span class="tag danger">unreadable</span>{{else if $d.KeyFpr}}{{if not $d.KeyUsable}}<span class="tag danger">expired</span>{{else if $d.Expiring}}<span class="tag warn">expiring</span>{{else}}<span class="tag ok">usable</span>{{end}}{{else}}<span class="tag">none</span>{{end}}</div>
     <div class="card-body">
-    {{if $d.KeyFpr}}
-      <dl class="grid">
+    {{if or $d.KeyFpr $d.KeyDamaged}}
+      {{if $d.KeyFpr}}<dl class="grid">
         <dt>Fingerprint</dt><dd><code>{{$d.KeyFpr}}</code></dd>
         <dt>Expires</dt><dd>{{if $d.KeyExpiry.IsZero}}never{{else}}{{ts $d.KeyExpiry}} <span class="muted">({{until $d.KeyExpiry}})</span>{{end}}</dd>
-      </dl>
+      </dl>{{end}}
       <div class="field wide">
         <label for="pgp_public_key">Replace with a new key <span class="muted">(optional)</span></label>
         <textarea id="pgp_public_key" name="pgp_public_key" class="mono" rows="6" spellcheck="false" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea>

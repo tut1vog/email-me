@@ -241,6 +241,31 @@ func TestKeyUsableAndExpiredStoredKey(t *testing.T) {
 	}
 }
 
+func TestDamagedStoredKeyLoads(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	st, reg := testutil.Bootstrap(t, env)
+	ctx := context.Background()
+	if err := st.CreateRecipient(ctx, &store.Recipient{Alias: "bad", Address: "bad@example.com", PublicKey: "not a key", RequireEncryption: true}); err != nil {
+		t.Fatal(err)
+	}
+	// A damaged row must not block boot: the recipient loads, flagged, and
+	// can be fixed on the dashboard.
+	if err := reg.Reload(ctx); err != nil {
+		t.Fatalf("damaged stored key must load: %v", err)
+	}
+	rc, ok := reg.Get("bad")
+	if !ok || rc.KeyErr == nil || rc.Key != nil || rc.KeyUsable(time.Now()) {
+		t.Fatalf("damaged key: ok %v, err %v, key %v", ok, rc.KeyErr, rc.Key)
+	}
+	if _, err := reg.Update(ctx, "bad", recipients.Input{Address: "bad@example.com", KeepKey: true, RequireEncryption: true}); err != nil {
+		t.Fatalf("other fields stay editable: %v", err)
+	}
+	fixed, err := reg.Update(ctx, "bad", recipients.Input{Address: "bad@example.com"})
+	if err != nil || fixed.KeyErr != nil || fixed.PublicKey != "" {
+		t.Fatalf("removing the damaged key: %v %v", err, fixed)
+	}
+}
+
 func TestReferencingAgents(t *testing.T) {
 	rc := []string{"me", "ops"}
 	none := []string{}

@@ -198,6 +198,11 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	if reg.Len() == 0 {
 		log.Warn("no recipients: agents cannot send until you add one in the dashboard")
 	}
+	for _, rc := range reg.All() {
+		if rc.KeyErr != nil {
+			log.Warn("recipient's stored PGP key cannot be read: replace or remove it in the dashboard", "alias", rc.Alias, "err", rc.KeyErr)
+		}
+	}
 	if u := reg.UnknownAliases(cfg.Defaults.Policy); len(u) > 0 {
 		log.Warn("defaults.policy.recipients names recipients that do not exist; they are ignored", "aliases", u)
 	}
@@ -374,11 +379,7 @@ wait:
 func keysOptions(sm *settings.Manager, kr *keyring.Keyring) keys.Options {
 	return keys.Options{Keyring: kr, From: func() (string, time.Duration) {
 		c := sm.Current()
-		var validity time.Duration
-		if c.Signing != nil {
-			validity = c.Signing.KeyValidity.D()
-		}
-		return c.Upstream.From, validity
+		return c.Upstream.From, c.Signing.KeyValidity.D()
 	}}
 }
 

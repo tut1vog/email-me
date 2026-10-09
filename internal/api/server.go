@@ -88,7 +88,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/capabilities", s.requireAgent(http.HandlerFunc(s.handleCapabilities)))
 	mux.Handle("GET /v1/recipients/{alias}/pgp-key", s.requireAgent(http.HandlerFunc(s.handleRecipientKey)))
 	mux.Handle("POST /v1/messages", s.requireAgent(http.HandlerFunc(s.handleSend)))
-	for _, p := range []string{"/healthz", "/llms.txt", "/openapi.json", "/v1/capabilities", "/v1/recipients/{alias}/pgp-key", "/v1/messages"} {
+	for _, p := range []string{"/{$}", "/healthz", "/llms.txt", "/openapi.json", "/v1/capabilities", "/v1/recipients/{alias}/pgp-key", "/v1/messages"} {
 		mux.HandleFunc(p, methodNotAllowed)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -337,6 +337,11 @@ func (s *Server) handleRecipientKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, newErr(http.StatusForbidden, CodeRecipientNotAllow,
 			"Recipient alias %q is not permitted for this agent. Allowed: %s.", alias, strings.Join(c.policy.Recipients, ", ")).
 			with("allowed", nonNil(c.policy.Recipients)))
+		return
+	}
+	if rc.KeyErr != nil {
+		writeError(w, newErr(http.StatusServiceUnavailable, CodeEncryptionUnavail,
+			"Recipient %q's stored PGP key cannot be read. Tell your operator to replace it; do not retry.", alias))
 		return
 	}
 	if rc.Key == nil {
