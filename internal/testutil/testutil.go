@@ -282,7 +282,7 @@ func NewEnv(t testing.TB, o Options) *Env {
 		}
 	}
 	fmt.Fprintf(&b, "audit:\n  retention_days: 30\n  log_subject: %v\n", o.LogSubject)
-	fmt.Fprintf(&b, "log:\n  level: error\n  format: text\n")
+	fmt.Fprintf(&b, "log:\n  level: error\n")
 
 	env.YAML = b.String()
 	env.Path = write("config.yaml", env.YAML)

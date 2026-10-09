@@ -99,13 +99,12 @@ type Upstream struct {
 // settings document: it is read from password_file when seeding and kept
 // in its own column afterwards.
 type SMTP struct {
-	Host           string         `yaml:"host" json:"host"`
-	Port           int            `yaml:"port" json:"port"`
-	Security       string         `yaml:"security" json:"security"`
-	Username       string         `yaml:"username" json:"username"`
-	PasswordFile   string         `yaml:"password_file" json:"-"`
-	Timeout        units.Duration `yaml:"timeout" json:"timeout"`
-	AllowPlaintext bool           `yaml:"allow_plaintext" json:"allow_plaintext"`
+	Host         string         `yaml:"host" json:"host"`
+	Port         int            `yaml:"port" json:"port"`
+	Security     string         `yaml:"security" json:"security"`
+	Username     string         `yaml:"username" json:"username"`
+	PasswordFile string         `yaml:"password_file" json:"-"`
+	Timeout      units.Duration `yaml:"timeout" json:"timeout"`
 
 	Password string `yaml:"-" json:"-"`
 }
@@ -150,8 +149,7 @@ type Audit struct {
 }
 
 type Log struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
+	Level string `yaml:"level"`
 }
 
 // SigningConfigured reports whether the sign service can work at all.
@@ -264,9 +262,6 @@ func (c *Config) applyBootstrapDefaults() {
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
-	if c.Log.Format == "" {
-		c.Log.Format = "json"
-	}
 }
 
 // ApplyManagedDefaults fills unset managed settings with their defaults.
@@ -313,9 +308,6 @@ func (c *Config) validateBootstrap(v *validator) {
 	c.validateSigning(v)
 	if !slices.Contains([]string{"debug", "info", "warn", "error"}, c.Log.Level) {
 		v.add("log.level must be one of debug, info, warn, error")
-	}
-	if !slices.Contains([]string{"json", "text"}, c.Log.Format) {
-		v.add("log.format must be json or text")
 	}
 }
 
@@ -443,13 +435,8 @@ func (c *Config) validateUpstream(v *validator, seed bool) {
 	switch s.Security {
 	case "starttls", "tls":
 	case "none":
-		if s.Host == "" || IsLoopbackHost(s.Host) {
-			break
-		}
-		if !s.AllowPlaintext {
-			v.add("upstream.smtp.security none is only allowed to localhost; set allow_plaintext: true to override (development only)")
-		} else {
-			v.warn("upstream.smtp uses plaintext SMTP to a non-localhost host (allow_plaintext: true); use this for development only")
+		if s.Host != "" && !IsLoopbackHost(s.Host) {
+			v.add("upstream.smtp.security none is only allowed to localhost")
 		}
 	default:
 		v.add("upstream.smtp.security must be starttls, tls or none")

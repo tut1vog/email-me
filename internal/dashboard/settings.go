@@ -40,7 +40,6 @@ type settingsForms struct {
 
 type upstreamForm struct {
 	Host, Port, Security, Username, Timeout, From, FromNameTemplate string
-	AllowPlaintext                                                  bool
 }
 
 type apiForm struct {
@@ -114,7 +113,7 @@ func (s *Server) settingsForms(cfg *config.Config) settingsForms {
 	f := settingsForms{
 		Upstream: upstreamForm{
 			Host: u.SMTP.Host, Security: u.SMTP.Security, Username: u.SMTP.Username, Timeout: durationText(u.SMTP.Timeout),
-			From: u.From, FromNameTemplate: u.FromNameTemplate, AllowPlaintext: u.SMTP.AllowPlaintext,
+			From: u.From, FromNameTemplate: u.FromNameTemplate,
 		},
 		API: apiForm{
 			PublicURL: cur.API.PublicURL, Docs: cur.API.Docs,
@@ -305,7 +304,6 @@ func (s *Server) saveUpstream(w http.ResponseWriter, r *http.Request) {
 		Host: strings.TrimSpace(f.Get("host")), Port: strings.TrimSpace(f.Get("port")), Security: f.Get("security"),
 		Username: strings.TrimSpace(f.Get("username")), Timeout: strings.TrimSpace(f.Get("timeout")),
 		From: strings.TrimSpace(f.Get("from")), FromNameTemplate: f.Get("from_name_template"),
-		AllowPlaintext: f.Get("allow_plaintext") == "on",
 	}
 	c := cardSave{id: "upstream", title: "Upstream SMTP settings", keep: func(fs *settingsForms) { fs.Upstream = form }, after: s.afterUpstream}
 	switch pw, remove := f.Get("password"), f.Get("remove_password") == "on"; {
@@ -322,7 +320,6 @@ func (s *Server) saveUpstream(w http.ResponseWriter, r *http.Request) {
 		u.SMTP.Host, u.SMTP.Security, u.SMTP.Username = form.Host, form.Security, form.Username
 		u.SMTP.Port = parseInt("Port", form.Port, &errs)
 		u.SMTP.Timeout = parseDuration("Timeout", form.Timeout, &errs)
-		u.SMTP.AllowPlaintext = form.AllowPlaintext
 		u.From, u.FromNameTemplate = form.From, form.FromNameTemplate
 		return errs
 	}

@@ -89,10 +89,7 @@ The defaults keep everything on localhost. To accept agents from other machines,
 ## Development
 
 ```sh
-go test ./...                                  # unit + integration tests (fake SMTP server in-process)
-docker compose -f compose.dev.yml up --build   # email-me + Mailpit
+go test ./...   # unit + integration tests (fake SMTP server in-process)
 ```
-
-The dev stack delivers to Mailpit (`http://localhost:8027`); the dashboard password is `dev-password-change-me`. The secrets in `dev/` are throwaway values.
 
 Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/recipients` (recipient registry), `internal/settings` (managed settings), `internal/store` (SQLite), `internal/config`, `internal/policy`.

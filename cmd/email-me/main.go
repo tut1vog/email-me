@@ -64,11 +64,7 @@ func main() {
 func newLogger(c config.Log) *slog.Logger {
 	var level slog.Level
 	_ = level.UnmarshalText([]byte(c.Level))
-	opts := &slog.HandlerOptions{Level: level}
-	if c.Format == "text" {
-		return slog.New(slog.NewTextHandler(os.Stderr, opts))
-	}
-	return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
 // errRestart ends a run that should be followed by the next one.

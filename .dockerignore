@@ -2,7 +2,6 @@
 config
 secrets
 data
-dev
 email-me
 *.md
 !internal/**/*.md

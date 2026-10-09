@@ -53,10 +53,6 @@
           {{if $d.HasPassword}}<label class="check"><input type="checkbox" name="remove_password"> Remove the stored password</label>{{end}}
         </div>
       </div>
-      <div class="field">
-        <label class="check"><input type="checkbox" name="allow_plaintext" {{if $u.AllowPlaintext}}checked{{end}}> Allow plaintext SMTP to a non-localhost server</label>
-        <p class="hint">Only with security <code>none</code>, for development: credentials and mail cross the network unencrypted.</p>
-      </div>
       <div class="field-grid">
         <div class="field">
           <label for="smtp_from">From address</label>
@@ -229,7 +225,7 @@
       {{with $c.Signing}}{{with .CertifyWith}}
       <dt><code>signing.certify_with</code></dt><dd>private key <code>{{.PGPPrivateKeyFile}}</code>{{with .PassphraseFile}}, passphrase <code>{{.}}</code>{{end}}</dd>
       {{end}}{{end}}
-      <dt><code>log</code></dt><dd>level <code>{{$c.Log.Level}}</code>, format <code>{{$c.Log.Format}}</code></dd>
+      <dt><code>log</code></dt><dd>level <code>{{$c.Log.Level}}</code></dd>
     </dl>
   </div>
 </section>

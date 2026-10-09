@@ -417,3 +417,29 @@ func TestIsLoopbackHost(t *testing.T) {
 		}
 	}
 }
+
+func TestPlaintextOnlyToLocalhost(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	c, err := config.Load(env.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.ValidateSeed()
+	for host, ok := range map[string]bool{"127.0.0.1": true, "localhost": true, "smtp.example.com": false, "10.0.0.1": false} {
+		c.Upstream.SMTP.Host = host
+		problems, warnings := c.ValidateManaged()
+		if got := !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, "security none") }); got != ok || len(warnings) != 0 {
+			t.Errorf("security none to %s: %v %v", host, problems, warnings)
+		}
+	}
+	// Settings stored with the removed allow_plaintext override still
+	// decode, and no longer allow plaintext to a remote host.
+	s := c.Managed()
+	if err := json.Unmarshal([]byte(`{"upstream":{"smtp":{"host":"smtp.example.com","port":25,"security":"none","timeout":"5s","allow_plaintext":true},"from":"gw@example.com"}}`), &s); err != nil {
+		t.Fatal(err)
+	}
+	c.SetManaged(s)
+	if problems, _ := c.ValidateManaged(); !slices.ContainsFunc(problems, func(p string) bool { return strings.Contains(p, "security none is only allowed to localhost") }) {
+		t.Fatalf("allow_plaintext must be ignored: %v", problems)
+	}
+}

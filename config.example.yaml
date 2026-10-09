@@ -36,7 +36,7 @@ upstream:
   smtp:
     host: smtp.gmail.com
     port: 587
-    security: starttls              # starttls | tls | none (none only to localhost unless allow_plaintext)
+    security: starttls              # starttls | tls | none (none only to localhost)
     username: you@gmail.com
     password_file: /run/secrets/smtp_password         # e.g. a Gmail app password
     timeout: 30s
@@ -85,4 +85,3 @@ audit:
 
 log:
   level: info                       # debug | info | warn | error
-  format: json                      # json | text
