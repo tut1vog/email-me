@@ -222,7 +222,6 @@ func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request, status int
 		"Password":       passwordState(s.Settings.PasswordState()),
 		"HasPassword":    s.Settings.HasPassword(),
 		"Securities":     []string{"starttls", "tls", "none"},
-		"Aliases":        cfg.Aliases(),
 		"SigningEnabled": s.Keys.Enabled(),
 		"MasterFpr":      master,
 		"Warnings":       configWarnings(cfg),
@@ -488,13 +487,17 @@ func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
 	s.redirect(w, r, safeNext(r.PostForm.Get("back")))
 }
 
-func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
-	alias := r.PostForm.Get("alias")
-	cfg := s.Config()
-	rc, ok := cfg.Recipient(alias)
-	if !ok {
-		s.flash(r, "error", "Unknown recipient alias %q.", alias)
-		s.redirect(w, r, "/settings#upstream")
+// testSendRecipient sends the recipient named in the path a test message
+// through the running sender, then returns to its page.
+func (s *Server) testSendRecipient(w http.ResponseWriter, r *http.Request) {
+	rc := s.loadRecipient(w, r)
+	if rc == nil {
+		return
+	}
+	alias, back, cfg := rc.Alias, "/recipients/"+rc.Alias, s.Config()
+	if !upstreamConfigured(cfg) {
+		s.flash(r, "error", "Test message not sent: %s Set it on the Settings page.", missingUpstreamNote(cfg))
+		s.redirect(w, r, back)
 		return
 	}
 	extendWriteDeadline(w, cfg)
@@ -517,7 +520,7 @@ func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
 		s.Log.Info("dashboard test message sent", "alias", alias)
 		s.flash(r, "ok", "Test message sent to %s.", alias)
 	}
-	s.redirect(w, r, "/settings#upstream")
+	s.redirect(w, r, back)
 }
 
 func (s *Server) guidePreview(w http.ResponseWriter, r *http.Request) {

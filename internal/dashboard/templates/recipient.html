@@ -1,5 +1,8 @@
 {{define "crumbs"}}<a href="/recipients">Recipients</a>{{end}}
-{{define "actions"}}<a class="button danger secondary" href="/recipients/{{.Data.Recipient.Alias}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
+{{define "actions"}}{{if .Data.Configured}}<form method="post" action="/recipients/{{.Data.Recipient.Alias}}/test" class="inline">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button type="submit" class="secondary"><svg class="icon" aria-hidden="true"><use href="#icon-mail"/></svg>Send test message</button>
+</form>{{end}}<a class="button danger secondary" href="/recipients/{{.Data.Recipient.Alias}}/delete"><svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>Delete…</a>{{end}}
 {{define "content"}}
 {{$d := .Data}}{{$r := $d.Recipient}}
 {{if $d.KeyFpr}}
@@ -27,6 +30,7 @@
         <p class="hint">Refuse unencrypted messages to this alias. Needs a PGP key.</p>
       </div>
       <p class="hint">Alias <code>{{$r.Alias}}</code> (cannot be changed)</p>
+      {{if not $d.Configured}}<p class="hint">{{$d.Missing}} <a href="/settings#upstream">Set it on the Settings page</a> to send a test message.</p>{{end}}
     </div>
   </section>
 

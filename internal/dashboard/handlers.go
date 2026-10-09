@@ -1008,7 +1008,7 @@ func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
 	if rc == nil {
 		return
 	}
-	now := s.now()
+	now, cfg := s.now(), s.Config()
 	state, exp := recipientKeyState(rc, now), rc.KeyExpiry()
 	s.render(w, r, "recipient", rc.Alias, map[string]any{
 		"Recipient":  rc,
@@ -1017,6 +1017,8 @@ func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
 		"KeyUsable":  state == "ok" || state == "expiring",
 		"KeyExpired": !exp.IsZero() && !now.Before(exp),
 		"Expiring":   state == "expiring",
+		"Configured": upstreamConfigured(cfg),
+		"Missing":    missingUpstreamNote(cfg),
 	})
 }
 

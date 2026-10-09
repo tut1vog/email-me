@@ -78,15 +78,7 @@
         <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings#upstream">
         <button type="submit" class="secondary">Test connection</button>
       </form>
-      {{if $d.Aliases}}
-      <form method="post" action="/settings/test-send" class="inline">
-        <input type="hidden" name="csrf" value="{{.CSRF}}">
-        <label>Send a test message to <select name="alias">{{range $d.Aliases}}<option>{{.}}</option>{{end}}</select></label>
-        <button type="submit" class="secondary">Send test</button>
-      </form>
-      {{else}}
-      <span class="small muted"><a href="/recipients/new">Add a recipient</a> to send a test message.</span>
-      {{end}}
+      <span class="small muted">Send a test message from a <a href="/recipients">recipient's page</a>.</span>
     </div>
     {{else}}
     <p class="small muted">Save a host and From address to send, and to test them.</p>

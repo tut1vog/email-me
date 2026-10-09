@@ -371,7 +371,7 @@ func TestKEKRotation(t *testing.T) {
 	if _, body := g.get(g.dash + "/"); !strings.Contains(body, "previous key-encryption key is still there") {
 		t.Fatal("the overview asks to delete the previous KEK")
 	}
-	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 1 {
+	if status, _ := g.post("/recipients/me/test", g.form()); status != http.StatusSeeOther || env.SMTP.Count() != 1 {
 		t.Fatal("the SMTP password still decrypts")
 	}
 	g.stop()
@@ -384,7 +384,7 @@ func TestKEKRotation(t *testing.T) {
 	if _, body := g.get(g.dash + "/"); strings.Contains(body, "previous key-encryption key") {
 		t.Fatal("no previous KEK any more")
 	}
-	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 2 {
+	if status, _ := g.post("/recipients/me/test", g.form()); status != http.StatusSeeOther || env.SMTP.Count() != 2 {
 		t.Fatal("the SMTP password decrypts with the new KEK alone")
 	}
 }

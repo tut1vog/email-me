@@ -1044,7 +1044,8 @@ legend {
 .card-section { border-top: 1px solid var(--border); }
 
 /* A form laid out on one line (settings: test buttons, spaced by the .row
-   around them; the restart banner sets its own margin). */
+   around them; a recipient's test button in the page actions; the restart
+   banner sets its own margin). */
 form.inline {
   display: inline-flex;
   flex-wrap: wrap;

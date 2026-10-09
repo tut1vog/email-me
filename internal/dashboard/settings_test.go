@@ -57,7 +57,7 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 	if b := d.get("/settings").body; !strings.Contains(b, "Connected and authenticated to 127.0.0.1:"+port) {
 		t.Fatal("the connection test must reach the new server")
 	}
-	d.post("/settings/test-send", d.form("alias", "me"))
+	d.post("/recipients/me/test", d.form())
 	if env.SMTP.Count() != 0 || other.Count() != 1 {
 		t.Fatalf("test send: old server %d, new server %d", env.SMTP.Count(), other.Count())
 	}
@@ -90,7 +90,7 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 	if !strings.Contains(body, "Upstream SMTP settings saved; nothing changed.") {
 		t.Fatal("an unchanged save must say so")
 	}
-	d.post("/settings/test-send", d.form("alias", "me"))
+	d.post("/recipients/me/test", d.form())
 	if env.SMTP.Count() != 1 || other.Count() != 1 {
 		t.Fatalf("after reverting: old server %d, new server %d", env.SMTP.Count(), other.Count())
 	}

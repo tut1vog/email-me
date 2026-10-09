@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tut1vog/email-me/internal/pgp"
+	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
@@ -123,8 +124,8 @@ func TestRecipientsCRUD(t *testing.T) {
 	if len(*got.Policy.Recipients) != 2 {
 		t.Fatal("deleting a recipient must not rewrite policies")
 	}
-	if s := d.get("/settings").body; strings.Contains(s, "<option>pager</option>") || !strings.Contains(s, "<option>me</option>") {
-		t.Fatal("test-send must offer only existing recipients")
+	if p := d.post("/recipients/pager/test", d.form()); p.status != http.StatusNotFound {
+		t.Fatalf("test send to a deleted recipient: %d", p.status)
 	}
 }
 
@@ -146,8 +147,8 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 			t.Errorf("overview lacks %q", want)
 		}
 	}
-	if s := d.get("/settings").body; strings.Contains(s, `action="/settings/test-send"`) || !strings.Contains(s, "Add a recipient") {
-		t.Error("settings must hide test-send without recipients")
+	if s := d.get("/settings").body; strings.Contains(s, "/settings/test-send") || !strings.Contains(s, `<a href="/recipients">recipient's page</a>`) {
+		t.Error("settings must point at the recipient pages for test messages")
 	}
 	if r := d.get("/recipients"); r.status != 200 || !strings.Contains(r.body, "No recipients") {
 		t.Error("recipients page needs an empty state")
@@ -161,5 +162,25 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 	g.login()
 	if b := g.get("/").body; !strings.Contains(b, "Default policy") || !strings.Contains(b, "ghost") || !strings.Contains(b, `href="/settings#policy"`) {
 		t.Error("unknown default alias must be flagged")
+	}
+}
+
+func TestRecipientTestSendWithoutUpstream(t *testing.T) {
+	d := newDashWith(t, testutil.Options{}, func(env *testutil.Env, _ *store.Store) { withoutUpstream(t, env) })
+	d.login()
+	b := d.get("/recipients/me").body
+	if strings.Contains(b, `action="/recipients/me/test"`) ||
+		!strings.Contains(b, "No SMTP host or From address is set") || !strings.Contains(b, `href="/settings#upstream"`) {
+		t.Fatal("without upstream the recipient page must say what is missing instead of offering a test")
+	}
+	sent := d.env.SMTP.Count()
+	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients/me" {
+		t.Fatalf("test send without upstream: %d to %q", p.status, p.header.Get("Location"))
+	}
+	if d.env.SMTP.Count() != sent {
+		t.Fatal("nothing may be sent without upstream")
+	}
+	if b := d.get("/recipients/me").body; !strings.Contains(b, "Test message not sent: No SMTP host or From address is set") {
+		t.Fatal("the refusal must say what is missing")
 	}
 }
