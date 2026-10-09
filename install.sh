@@ -1,8 +1,10 @@
 #!/bin/sh
 # Installs or updates the email-me binary on macOS or Linux from the GitHub
-# releases. Run it again to update:
+# releases:
 #
 #   curl -fsSL https://github.com/tut1vog/email-me/releases/latest/download/install.sh | sh
+#
+# Once installed, email-me update does the same and restarts the gateway.
 #
 # Environment:
 #   EMAIL_ME_VERSION      release tag to install, e.g. v1.2.3 (default: the latest release)

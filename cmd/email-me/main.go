@@ -8,6 +8,7 @@
 //	email-me restart                stop, then start: applies config.yaml and a new version
 //	email-me console                open the dashboard until Ctrl-C
 //	email-me reset-keyring [--yes]  lost key-encryption key: discard the sealed credentials
+//	email-me update [--version V]   replace this binary with the latest release, then restart a running gateway
 //	email-me version
 //
 // In the container, or directly on a host without Docker:
@@ -50,6 +51,7 @@ import (
 	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/ratelimit"
+	"github.com/tut1vog/email-me/internal/selfupdate"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -67,6 +69,7 @@ Commands:
   restart         stop, then start: applies config.yaml and a new version
   console         open the dashboard and print a login link; Ctrl-C closes it
   reset-keyring   lost key-encryption key: discard the credentials sealed with it
+  update          install the latest release and restart a running gateway on it
   version         print the version
 
   run             run the gateway in the foreground (the container's command)
@@ -162,6 +165,16 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 		return newHost(configDir, dataDir, stdout, stderr).ResetKeyring(ctx, *yes)
 
+	case "update":
+		want := fs.String("version", "", "release tag to install, e.g. v1.2.3 (default: the latest release)")
+		if err := parse(fs, args); err != nil {
+			return err
+		}
+		if inContainer() {
+			return errors.New("update runs on the host, not in the container")
+		}
+		return update(ctx, selfupdate.New(), *want, newHost(configDir, dataDir, stdout, stderr), stdout, stderr)
+
 	case "start", "stop", "restart":
 		if err := parse(fs, args); err != nil {
 			return err
@@ -180,6 +193,47 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	fmt.Fprintf(stderr, "email-me: unknown command %q\n\n%s", cmd, usage)
 	return errUsage
+}
+
+// update replaces this binary with the release want (default: the
+// latest), then restarts a running gateway with the new binary, whose
+// version picks the new image.
+func update(ctx context.Context, u *selfupdate.Updater, want string, h *host.Host, stdout, stderr io.Writer) error {
+	if want == "" {
+		if version == "dev" {
+			return errors.New("this is a development build; pass --version to replace it with a release")
+		}
+		latest, err := u.Latest(ctx)
+		if err != nil {
+			return err
+		}
+		want = latest
+	}
+	if want == version {
+		fmt.Fprintf(stdout, "email-me %s is the latest release.\n", version)
+		return nil
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.EvalSymlinks(exe)
+	}
+	if err != nil {
+		return fmt.Errorf("finding this binary: %w", err)
+	}
+	fmt.Fprintf(stderr, "Downloading email-me %s for %s/%s...\n", want, u.OS, u.Arch)
+	if err := u.Install(ctx, want, exe); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Updated %s from %s to %s.\n  Release notes: https://github.com/%s/releases/tag/%s\n",
+		exe, version, want, selfupdate.Repo, want)
+	if running, err := h.Running(ctx); err != nil || !running {
+		fmt.Fprintln(stdout, "Run email-me start to run it.")
+		return nil
+	}
+	fmt.Fprintln(stdout, "Restarting the gateway on the new version.")
+	cmd := exec.CommandContext(ctx, exe, "restart")
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return cmd.Run()
 }
 
 func parse(fs *flag.FlagSet, args []string) error {

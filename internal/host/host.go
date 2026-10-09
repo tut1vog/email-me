@@ -180,6 +180,12 @@ func (h *Host) state(ctx context.Context) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
+// Running reports whether the gateway's container is running.
+func (h *Host) Running(ctx context.Context) (bool, error) {
+	st, err := h.state(ctx)
+	return st == "running", err
+}
+
 // Start creates and starts the container from the current configuration
 // and waits until the gateway answers. A running container is left alone.
 func (h *Host) Start(ctx context.Context) error {

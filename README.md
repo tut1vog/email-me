@@ -69,7 +69,7 @@ email-me version
 
 The gateway starts again by itself after a reboot.
 
-**Upgrade**: run the install command again, then `email-me restart`.
+**Upgrade**: run `email-me update`. It installs the latest release over the binary, checking its checksum, and restarts the gateway on it if it is running.
 
 ## Agents on other machines
 

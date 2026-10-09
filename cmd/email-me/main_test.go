@@ -474,9 +474,15 @@ func TestDispatch(t *testing.T) {
 	if _, _, err := run("start", "extra"); err != errUsage {
 		t.Fatalf("stray argument: %v", err)
 	}
+	if _, _, err := run("update"); err == nil || !strings.Contains(err.Error(), "development build") {
+		t.Fatalf("update of a development build: %v", err)
+	}
 	t.Setenv("EMAIL_ME_CONTAINER", "1")
 	if _, _, err := run("start"); err == nil || !strings.Contains(err.Error(), "runs on the host") {
 		t.Fatalf("start in the container: %v", err)
+	}
+	if _, _, err := run("update"); err == nil || !strings.Contains(err.Error(), "runs on the host") {
+		t.Fatalf("update in the container: %v", err)
 	}
 	if _, _, err := run("console", "--data-dir", t.TempDir()); err == nil || !strings.Contains(err.Error(), "not running") {
 		t.Fatalf("console without a gateway: %v", err)
