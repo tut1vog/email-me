@@ -145,6 +145,20 @@ func upstreamConfigured(c *config.Config) bool {
 	return c.Upstream.SMTP.Host != "" && c.Upstream.From != ""
 }
 
+// missingUpstreamNote names what c's upstream still lacks before agents can
+// send, or is empty when nothing is missing.
+func missingUpstreamNote(c *config.Config) string {
+	switch noHost, noFrom := c.Upstream.SMTP.Host == "", c.Upstream.From == ""; {
+	case noHost && noFrom:
+		return "No SMTP host or From address is set, so agents cannot send yet."
+	case noHost:
+		return "No SMTP host is set, so agents cannot send yet."
+	case noFrom:
+		return "No From address is set, so agents cannot send yet."
+	}
+	return ""
+}
+
 // configWarnings are cfg's warnings that the Needs-attention list and the
 // Settings page show as such. A missing upstream and an unsealed password
 // are left out: they have their own notices.
@@ -284,7 +298,7 @@ func (s *Server) saveCard(w http.ResponseWriter, r *http.Request, c cardSave) {
 	// Warnings the previous settings already had are on the Needs-attention
 	// list; a save only mentions new ones.
 	for _, w := range append(warnings, c.warnings...) {
-		if !slices.Contains(cfg.Warnings, w) && (w != config.UpstreamNotConfigured || c.id == "upstream") {
+		if !slices.Contains(cfg.Warnings, w) && w != config.UpstreamNotConfigured {
 			msg += " Note: " + w + "."
 		}
 	}
@@ -322,29 +336,34 @@ func (s *Server) saveUpstream(w http.ResponseWriter, r *http.Request) {
 }
 
 // afterUpstream follows an upstream save: the last connection test was of
-// other settings, and agents left without a signing key for want of a From
-// address get one now that it is set.
+// other settings, agents left without a signing key for want of a From
+// address get one now that it is set, and the flash says what is still
+// missing before agents can send.
 func (s *Server) afterUpstream(r *http.Request, prev, now config.Settings, changed []string) string {
 	if len(changed) > 0 {
 		s.smtpMu.Lock()
 		s.smtpCheck = nil
 		s.smtpMu.Unlock()
 	}
-	if !s.Keys.Enabled() || prev.Upstream.From != "" || now.Upstream.From == "" {
-		return ""
+	cfg := s.Config()
+	var notes []string
+	if s.Keys.Enabled() && prev.Upstream.From == "" && now.Upstream.From != "" {
+		n, err := s.Keys.EnsureAll(r.Context(), cfg.AgentNames())
+		if err != nil {
+			s.Log.Error("generating signing keys after setting the From address", "err", err)
+			s.flash(r, "error", "Signing keys for agents without one were not all generated: %v. Generate them on each agent's Signing tab.", err)
+		}
+		switch {
+		case n == 1:
+			notes = append(notes, "Generated a signing key for 1 agent.")
+		case n > 1:
+			notes = append(notes, fmt.Sprintf("Generated signing keys for %d agents.", n))
+		}
 	}
-	n, err := s.Keys.EnsureAll(r.Context(), s.Config().AgentNames())
-	if err != nil {
-		s.Log.Error("generating signing keys after setting the From address", "err", err)
-		s.flash(r, "error", "Signing keys for agents without one were not all generated: %v. Generate them on each agent's Signing tab.", err)
+	if note := missingUpstreamNote(cfg); note != "" {
+		notes = append(notes, note)
 	}
-	switch {
-	case n == 1:
-		return "Generated a signing key for 1 agent."
-	case n > 1:
-		return fmt.Sprintf("Generated signing keys for %d agents.", n)
-	}
-	return ""
+	return strings.Join(notes, " ")
 }
 
 func (s *Server) saveAPI(w http.ResponseWriter, r *http.Request) {
@@ -457,7 +476,11 @@ func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
 		st.Err = err.Error()
 		s.flash(r, "error", "SMTP connection test failed: %v", err)
 	} else {
-		s.flash(r, "ok", "Connected and authenticated to %s.", cfg.Upstream.SMTP.Addr())
+		msg := fmt.Sprintf("Connected and authenticated to %s.", cfg.Upstream.SMTP.Addr())
+		if note := missingUpstreamNote(cfg); note != "" {
+			msg += " " + note
+		}
+		s.flash(r, "ok", "%s", msg)
 	}
 	s.smtpMu.Lock()
 	s.smtpCheck = st

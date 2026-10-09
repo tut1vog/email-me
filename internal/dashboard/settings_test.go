@@ -306,6 +306,38 @@ func TestSettingsUpstreamNotConfigured(t *testing.T) {
 	}
 }
 
+func TestSettingsUpstreamWithoutFrom(t *testing.T) {
+	d := newDashWith(t, testutil.Options{}, func(env *testutil.Env, _ *store.Store) { withoutUpstream(t, env) })
+	d.login()
+	const note = "No From address is set, so agents cannot send yet."
+
+	// A host and credentials without a From address save, and the flash says
+	// what is still missing rather than repeating the raw warning.
+	body := d.saved(d.post("/settings/upstream", d.form("host", d.env.SMTP.Host, "port", strconv.Itoa(d.env.SMTP.Port), "security", "none",
+		"username", d.env.SMTP.User, "password", d.env.SMTP.Pass)), "upstream")
+	if !strings.Contains(body, "Upstream SMTP settings saved and applied. "+note) {
+		t.Fatal("saving without a From address must say it is missing")
+	}
+	if strings.Contains(body, config.UpstreamNotConfigured) {
+		t.Error("the raw config warning must not be shown as well")
+	}
+
+	// The connection test succeeds but says sends still fail.
+	if p := d.post("/settings/test-smtp", d.form("back", "/")); p.status != http.StatusSeeOther {
+		t.Fatalf("test-smtp: %d", p.status)
+	}
+	o := d.get("/").body
+	if !strings.Contains(o, "Connected and authenticated") || !strings.Contains(o, note) {
+		t.Fatal("a passing connection test without a From address must say agents cannot send yet")
+	}
+
+	// With no host either, the note names both.
+	body = d.saved(d.post("/settings/upstream", d.form("security", "none", "remove_password", "on")), "upstream")
+	if !strings.Contains(body, "No SMTP host or From address is set, so agents cannot send yet.") {
+		t.Fatal("saving without a host or From address must name both")
+	}
+}
+
 func TestSettingsPasswordNotices(t *testing.T) {
 	raw := newDash(t, testutil.Options{})
 	raw.login()

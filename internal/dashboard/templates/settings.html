@@ -25,7 +25,7 @@
       <div class="field-grid">
         <div class="field">
           <label for="smtp_host">Host</label>
-          <input id="smtp_host" name="host" value="{{$u.Host}}" placeholder="smtp.example.com" autocomplete="off" spellcheck="false">
+          <input id="smtp_host" name="host" value="{{$u.Host}}" required placeholder="smtp.example.com" autocomplete="off" spellcheck="false">
         </div>
         <div class="field">
           <label for="smtp_port">Port <span class="muted">(optional)</span></label>
@@ -56,7 +56,7 @@
       <div class="field-grid">
         <div class="field">
           <label for="smtp_from">From address</label>
-          <input id="smtp_from" name="from" type="email" value="{{$u.From}}" placeholder="gateway@example.com" autocomplete="off">
+          <input id="smtp_from" name="from" type="email" value="{{$u.From}}" required placeholder="gateway@example.com" autocomplete="off">
           <p class="hint">Every message is sent from it; agents' signing keys carry it too.</p>
         </div>
         <div class="field">
