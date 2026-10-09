@@ -42,6 +42,30 @@ func TestEffectiveDropsUnknownDefaultAliases(t *testing.T) {
 	}
 }
 
+// defaults is the env's default policy, as it was loaded.
+func defaults(env *testutil.Env) func() policy.Effective {
+	return func() policy.Effective { return env.Config.DefaultPolicy }
+}
+
+func TestEffectiveFollowsDefaults(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	st := testutil.OpenStore(t, env)
+	cur := policy.Builtin(false)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, env.Config, func() policy.Effective { return cur })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := reg.Effective(policy.Policy{}); len(e.Recipients) != 0 || e.RateLimit.PerHour != cur.RateLimit.PerHour {
+		t.Fatalf("built-in defaults: %+v", e)
+	}
+	// The defaults change (a saved default policy): the next resolution
+	// uses them, without a new registry.
+	cur.Recipients, cur.RateLimit.PerHour = []string{"me", "ops"}, 1
+	if e := reg.Effective(policy.Policy{}); strings.Join(e.Recipients, ",") != "me,ops" || e.RateLimit.PerHour != 1 {
+		t.Fatalf("changed defaults: %+v", e)
+	}
+}
+
 func TestSeedOnlyWhenEmpty(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
 	ctx := context.Background()
@@ -50,7 +74,7 @@ func TestSeedOnlyWhenEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	reg, seeded, err := recipients.Bootstrap(ctx, st, env.Config)
+	reg, seeded, err := recipients.Bootstrap(ctx, st, env.Config, defaults(env))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +92,7 @@ func TestSeedOnlyWhenEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A restart with the same config must not bring the deleted alias back.
-	again, seeded, err := recipients.Bootstrap(ctx, st, env.Config)
+	again, seeded, err := recipients.Bootstrap(ctx, st, env.Config, defaults(env))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +177,7 @@ func TestCreateUpdateDeleteReload(t *testing.T) {
 		t.Fatal("alias is immutable")
 	}
 	// Another registry on the same store sees the same state.
-	other := recipients.New(st, env.Config.DefaultPolicy)
+	other := recipients.New(st, defaults(env))
 	if err := other.Reload(ctx); err != nil {
 		t.Fatal(err)
 	}

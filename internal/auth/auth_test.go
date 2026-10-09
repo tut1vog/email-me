@@ -65,10 +65,11 @@ func TestPasswordHash(t *testing.T) {
 }
 
 func TestSessions(t *testing.T) {
-	s := NewSessions(time.Hour)
+	s := NewSessions()
 	now := time.Now()
 	s.now = func() time.Time { return now }
-	sess := s.Create()
+	sess := s.Create(time.Hour)
+	long := s.Create(3 * time.Hour)
 	if got, ok := s.Get(sess.ID); !ok || got != sess {
 		t.Fatal("session must be found")
 	}
@@ -86,7 +87,10 @@ func TestSessions(t *testing.T) {
 	if _, ok := s.Get(sess.ID); ok {
 		t.Fatal("expired session must not be found")
 	}
-	sess2 := s.Create()
+	if _, ok := s.Get(long.ID); !ok {
+		t.Fatal("each session keeps the lifetime it was created with")
+	}
+	sess2 := s.Create(time.Hour)
 	s.Delete(sess2.ID)
 	if _, ok := s.Get(sess2.ID); ok {
 		t.Fatal("deleted session must not be found")

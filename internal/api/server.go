@@ -26,7 +26,9 @@ import (
 )
 
 type Deps struct {
-	Config     *config.Config
+	// Config returns the current configuration. Saved settings replace it,
+	// so a handler reads it once and uses that snapshot throughout.
+	Config     func() *config.Config
 	Store      *store.Store
 	Recipients *recipients.Registry
 	Keys       *keys.Manager
@@ -38,7 +40,6 @@ type Deps struct {
 
 type Server struct {
 	Deps
-	net  netInfo
 	idem *idempotency.Cache
 	now  func() time.Time
 
@@ -71,7 +72,6 @@ func (s *Server) acquireSend(agentID string) (release func(), ok bool) {
 func New(d Deps) *Server {
 	return &Server{
 		Deps: d,
-		net:  netInfo{trusted: d.Config.API.TrustedNets, external: d.Config.API.ExternalTransportEncryption},
 		idem: idempotency.New(24 * time.Hour),
 		now:  time.Now,
 		busy: map[string]int{},
@@ -141,7 +141,8 @@ func (s *Server) authenticate(r *http.Request) (*caller, *apiError) {
 	if err != nil {
 		return nil, unauthorized
 	}
-	c := &caller{token: t, agent: a, ip: s.net.ClientIP(r), transport: s.net.Transport(r)}
+	n := newNetInfo(s.Config())
+	c := &caller{token: t, agent: a, ip: n.ClientIP(r), transport: n.Transport(r)}
 	if !a.Enabled {
 		return c, newErr(http.StatusForbidden, CodeAgentDisabled, "Agent %q is disabled by the operator. Stop sending and tell your operator.", a.Name)
 	}
@@ -188,16 +189,16 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 	})
 }
 
-// docsAuth enforces api.docs: authenticated.
+// docsAuth enforces api.docs: authenticated. It is checked per request,
+// so a saved change applies to the next one.
 func (s *Server) docsAuth(next http.Handler) http.Handler {
-	if s.Config.API.Docs != "authenticated" {
-		return next
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, e := s.authenticate(r); e != nil {
-			writeError(w, newErr(http.StatusUnauthorized, CodeUnauthorized,
-				"This gateway requires 'Authorization: Bearer <token>' to read its documentation. Use the token your operator gave you."))
-			return
+		if s.Config().API.Docs == "authenticated" {
+			if _, e := s.authenticate(r); e != nil {
+				writeError(w, newErr(http.StatusUnauthorized, CodeUnauthorized,
+					"This gateway requires 'Authorization: Bearer <token>' to read its documentation. Use the token your operator gave you."))
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -209,12 +210,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGuide(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
-	w.Write([]byte(docs.Guide(s.net.BaseURL(r, s.Config.API.PublicURL))))
+	w.Write([]byte(docs.Guide(baseURL(r, s.Config()))))
 }
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(docs.OpenAPIJSON(s.net.BaseURL(r, s.Config.API.PublicURL)))
+	w.Write(docs.OpenAPIJSON(baseURL(r, s.Config())))
+}
+
+// baseURL is the API's base URL for a request, under cfg.
+func baseURL(r *http.Request, cfg *config.Config) string {
+	n := newNetInfo(cfg)
+	return n.BaseURL(r, cfg.API.PublicURL)
 }
 
 type recipientCap struct {

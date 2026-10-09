@@ -5,10 +5,11 @@
 # Two kinds of keys:
 # - Bootstrap keys (data_dir, listen addresses, api.tls, secret files, log)
 #   are read from this file at every start, including restarts from the
-#   dashboard or SIGHUP.
+#   dashboard or SIGHUP. The dashboard notices when this file changes and
+#   offers the restart.
 # - Keys marked "seed" are imported into state.db on the first start and
-#   managed on the dashboard's Settings page from then on; later edits here
-#   are ignored. Leave them out to start with defaults: a fresh install may
+#   managed on the dashboard's Settings page from then on, applied on save;
+#   later edits here are ignored. Leave them out to start with defaults: a fresh install may
 #   even omit upstream: and set the SMTP server on the dashboard.
 
 data_dir: /data                     # holds state.db (agents, token hashes, recipients, keys, audit metadata)

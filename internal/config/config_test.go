@@ -274,6 +274,26 @@ func TestDiffSettings(t *testing.T) {
 	}
 }
 
+func TestFingerprint(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	fp, err := config.FileFingerprint(env.Path)
+	if err != nil || fp == "" || fp != env.Config.Fingerprint {
+		t.Fatalf("fingerprint %q (%v), loaded %q", fp, err, env.Config.Fingerprint)
+	}
+	if again, _ := config.FileFingerprint(env.Path); again != fp {
+		t.Fatal("the fingerprint of an unchanged file is stable")
+	}
+	if err := os.WriteFile(env.Path, []byte(env.YAML+"# edited\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if edited, _ := config.FileFingerprint(env.Path); edited == fp {
+		t.Fatal("editing the file changes its fingerprint")
+	}
+	if _, err := config.FileFingerprint(filepath.Join(env.Dir, "missing.yaml")); err == nil {
+		t.Fatal("a missing file has no fingerprint")
+	}
+}
+
 func TestValidateManagedRepeatable(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{TrustedProxies: []string{"10.0.0.1", "192.168.0.0/16"}})
 	c, _ := config.Load(env.Path)

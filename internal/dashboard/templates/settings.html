@@ -11,12 +11,12 @@
 </ul>
 {{end}}
 
-<p class="hint">Saved settings are stored in the state database and take effect when the gateway restarts.</p>
+<p class="hint">Settings are stored in the state database and apply when saved.</p>
 
 {{$u := $f.Upstream}}
 <section class="card" id="upstream">
   <div class="card-header">
-    <div><h2>Upstream SMTP</h2><p>{{if $d.Configured}}Running with <code>{{$d.Upstream}}</code>.{{else}}Not configured: agents cannot send until it is set and the gateway restarted.{{end}}</p></div>
+    <div><h2>Upstream SMTP</h2><p>{{if $d.Configured}}Running with <code>{{$d.Upstream}}</code>.{{else}}Not configured: agents cannot send until a host and From address are saved.{{end}}</p></div>
     <div class="card-actions">{{if not $d.Configured}}<span class="tag danger">not configured</span>{{else}}{{with $d.SMTP}}{{if .OK}}<span class="tag ok">reachable</span>{{else}}<span class="tag danger">failed</span>{{end}}{{else}}<span class="tag">not checked</span>{{end}}{{end}}</div>
   </div>
   <form method="post" action="/settings/upstream">
@@ -76,7 +76,7 @@
   </form>
   <div class="card-body card-section">
     {{if $d.Configured}}
-    <p class="small text-2">{{with $d.SMTP}}Last check {{ts .At}}{{if not .OK}}: {{.Err}}{{end}}.{{else}}Not checked since the gateway started.{{end}} The tests use the running settings, the ones agents use.</p>
+    <p class="small text-2">{{with $d.SMTP}}Last check {{ts .At}}{{if not .OK}}: {{.Err}}{{end}}.{{else}}Not checked yet.{{end}}</p>
     <form method="post" action="/settings/test-smtp" class="inline">
       <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="back" value="/settings#upstream">
       <button type="submit" class="secondary">Test connection</button>
@@ -90,15 +90,8 @@
     {{else}}
     <p class="small muted"><a href="/recipients/new">Add a recipient</a> to send a test message.</p>
     {{end}}
-    {{end}}
-    {{if $d.TestSaved}}
-    <form method="post" action="/settings/test-smtp-saved" class="inline">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <span class="small text-2">Upstream changes are saved but not running yet.</span>
-      <button type="submit" class="secondary">Test saved settings</button>
-    </form>
-    {{else if not $d.Configured}}
-    <p class="small muted">Save a host and From address, then restart to send.</p>
+    {{else}}
+    <p class="small muted">Save a host and From address to send, and to test them.</p>
     {{end}}
   </div>
 </section>
@@ -159,7 +152,7 @@
     <div class="field">
       <label for="session_ttl">Session lifetime</label>
       <input id="session_ttl" name="session_ttl" value="{{$f.Dashboard.SessionTTL}}" placeholder="12h">
-      <p class="hint">How long a login lasts, e.g. <code>12h</code> or <code>7d</code>; at least <code>1m</code>.</p>
+      <p class="hint">How long a login lasts, e.g. <code>12h</code> or <code>7d</code>; at least <code>1m</code>. Applies to new logins; open sessions keep theirs.</p>
     </div>
   </div>
   <div class="card-footer"><button type="submit">Save dashboard settings</button></div>
@@ -172,6 +165,7 @@
     <div class="field">
       <label for="retention_days">Retention (days)</label>
       <input id="retention_days" name="retention_days" value="{{$f.Audit.RetentionDays}}" inputmode="numeric" placeholder="30">
+      <p class="hint">Older rows are removed hourly; a change applies at the next run.</p>
     </div>
     <div class="field">
       <label class="check"><input type="checkbox" name="log_subject" {{if $f.Audit.LogSubject}}checked{{end}}> Log subjects</label>
@@ -241,14 +235,14 @@
 </section>
 
 <section class="card" id="restart">
-  <div class="card-header"><div><h2>Restart</h2><p>Applies the saved settings and re-reads config.yaml, without leaving the container.</p></div>{{with $d.Pending}}<span class="tag warn">{{len .}} pending</span>{{end}}</div>
+  <div class="card-header"><div><h2>Restart</h2><p>Re-reads config.yaml (bootstrap keys: <code>data_dir</code>, listen addresses, <code>api.tls</code>, secret files, <code>log</code>), without leaving the container. Secret files that change without config.yaml changing are not detected: restart after editing them too.</p></div>{{if $d.ConfigChanged}}<span class="tag warn">changed</span>{{end}}</div>
   <div class="card-body">
-    {{with $d.Pending}}<p class="small">Saved but not running yet: {{range $i, $k := .}}{{if $i}}, {{end}}<code>{{$k}}</code>{{end}}.</p>{{else}}<p class="small muted">The running settings match the saved ones.</p>{{end}}
+    {{if $d.ConfigChanged}}<p class="small">config.yaml changed on disk since email-me started.</p>{{else}}<p class="small muted">config.yaml is unchanged since email-me started.</p>{{end}}
     <p class="small text-2">Sends already in flight finish first; the API and the dashboard are down for a moment. Everyone is logged out of the dashboard, and the idempotency cache and the last SMTP test result are forgotten. If config.yaml no longer loads, nothing restarts. Sending <code>SIGHUP</code> to the process (<code>docker kill -s HUP</code>) does the same.</p>
   </div>
   <form method="post" action="/settings/restart" class="card-footer" data-confirm="Restart email-me now? Sends in flight finish first, and you will need to log in again.">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <button type="submit"{{if not $d.Pending}} class="secondary"{{end}}>Restart now</button>
+    <button type="submit"{{if not $d.ConfigChanged}} class="secondary"{{end}}>Restart now</button>
   </form>
 </section>
 {{end}}

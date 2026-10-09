@@ -1,13 +1,14 @@
 // Package settings holds the managed settings (config.Settings). They live
 // in the state database and are edited on the dashboard; the managed
-// sections of config.yaml only seed an empty database. Saved settings take
-// effect on the next restart, so a Manager keeps both the settings the
-// process is running with and the ones saved since, and reports the keys
-// that differ.
+// sections of config.yaml only seed an empty database. Saved settings apply
+// at once: a Manager serves the current configuration (Current), the
+// bootstrap keys read from config.yaml completed with the saved settings,
+// and every successful Save replaces it with a new one.
 //
 // Stored settings never block startup: a row that cannot be decoded or
 // fails validation is reported (LoadProblems, config warnings) and the
-// gateway still comes up, so the operator can fix it on the dashboard.
+// gateway still comes up, so the operator can fix it on the dashboard. The
+// next successful save clears the problems.
 package settings
 
 import (
@@ -18,7 +19,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/keys"
@@ -30,9 +31,6 @@ const passwordAAD = "settings.smtp_password"
 
 // WarningPrefix starts the config warnings that repeat LoadProblems.
 const WarningPrefix = "saved settings: "
-
-// passwordKey is the pending key reported when only the password changed.
-const passwordKey = "upstream.smtp.password"
 
 // PasswordState says how the saved SMTP password is stored.
 type PasswordState int
@@ -57,22 +55,22 @@ type PasswordChange struct {
 	Value string
 }
 
-// Manager serves the running and saved settings and saves new ones.
+// Manager serves the current configuration and saves new settings.
 type Manager struct {
-	st        *store.Store
-	kek       []byte         // nil: passwords are stored raw
-	base      *config.Config // bootstrap keys that saved settings are validated against
-	running   config.Settings
-	runningPW string
+	st           *store.Store
+	kek          []byte         // nil: passwords are stored raw
+	base         *config.Config // bootstrap keys that saved settings are validated against
+	bootWarnings []string       // base's own warnings (config.yaml), kept by every snapshot
 
-	mu           sync.RWMutex // guards everything below
-	saved        config.Settings
-	savedPW      string
-	savedBlob    []byte // stored password column, kept as-is when a Save does not change it
+	// cur is the current configuration. A stored snapshot is never
+	// modified: Save stores a new one, so a reader that holds one sees a
+	// consistent configuration however long it keeps it.
+	cur atomic.Pointer[config.Config]
+
+	mu           sync.RWMutex // serializes Save and guards everything below
+	savedBlob    []byte       // stored password column, kept as-is when a Save does not change it
 	savedSealed  bool
 	pwState      PasswordState
-	pending      []string
-	savedAt      time.Time
 	loadProblems []string
 }
 
@@ -85,7 +83,7 @@ type Manager struct {
 // are not: they are reported by LoadProblems and added to cfg.Warnings.
 // Only a store error fails a boot with stored settings.
 func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, log *slog.Logger) (*Manager, bool, error) {
-	m := &Manager{st: st, base: cfg}
+	m := &Manager{st: st, base: cfg, bootWarnings: slices.Clone(cfg.Warnings)}
 	if cfg.SigningConfigured() {
 		m.kek = cfg.Signing.KEK
 	}
@@ -138,7 +136,7 @@ func (m *Manager) seed(ctx context.Context, cfg *config.Config) (bool, error) {
 	return ok, nil
 }
 
-// load applies a stored row to cfg and records it as both running and saved.
+// load applies a stored row to cfg and makes cfg the current configuration.
 func (m *Manager) load(ctx context.Context, row *store.Settings, cfg *config.Config, log *slog.Logger) error {
 	var problems []string
 	var s config.Settings
@@ -159,11 +157,9 @@ func (m *Manager) load(ctx context.Context, row *store.Settings, cfg *config.Con
 		cfg.Warnings = append(cfg.Warnings, WarningPrefix+p)
 	}
 
-	m.running, m.runningPW = cfg.Managed(), pw
-	m.saved, m.savedPW = m.running.Clone(), pw
 	m.savedBlob, m.savedSealed, m.pwState = row.SMTPPassword, row.PasswordSealed, state
-	m.savedAt = row.UpdatedAt
 	m.loadProblems = problems
+	m.cur.Store(cfg)
 	return nil
 }
 
@@ -222,16 +218,16 @@ func (m *Manager) seal(pw string) ([]byte, bool, error) {
 	return blob, true, err
 }
 
-// Save validates s against the bootstrap keys and stores it, normalized
-// (defaults applied). It does not change the running settings: they apply
-// on restart. It returns the settings' warnings, and a
-// *config.ValidationError listing every problem if s is invalid.
+// Save validates s against the bootstrap keys, stores it normalized
+// (defaults applied) and makes it current: it applies at once. It returns
+// the settings' warnings, and a *config.ValidationError listing every
+// problem if s is invalid, in which case nothing changes.
 func (m *Manager) Save(ctx context.Context, s config.Settings, pw PasswordChange) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := scratch(m.base)
 	c.SetManaged(s)
-	password := m.savedPW
+	password := m.cur.Load().Upstream.SMTP.Password
 	if pw.Set {
 		password = pw.Value
 	}
@@ -240,8 +236,10 @@ func (m *Manager) Save(ctx context.Context, s config.Settings, pw PasswordChange
 	if len(problems) > 0 {
 		return warnings, &config.ValidationError{Problems: problems}
 	}
-	norm := c.Managed()
-	row, err := m.row(norm)
+	// The snapshot's warnings: config.yaml's and these settings'. Problems
+	// found at boot are gone with the settings that had them.
+	c.Warnings = append(slices.Clone(m.bootWarnings), warnings...)
+	row, err := m.row(c.Managed())
 	if err != nil {
 		return nil, err
 	}
@@ -264,55 +262,24 @@ func (m *Manager) Save(ctx context.Context, s config.Settings, pw PasswordChange
 	if err := m.st.SaveSettings(ctx, row); err != nil {
 		return nil, fmt.Errorf("saving settings: %w", err)
 	}
-	m.saved, m.savedPW = norm, password
 	m.savedBlob, m.savedSealed, m.pwState = row.SMTPPassword, row.PasswordSealed, state
-	m.savedAt = row.UpdatedAt
-	m.pending = config.DiffSettings(m.running, m.saved)
-	if m.savedPW != m.runningPW {
-		m.pending = append(m.pending, passwordKey)
-		slices.Sort(m.pending)
-	}
+	m.loadProblems = nil
+	m.cur.Store(c)
 	return warnings, nil
 }
 
-// Running returns the settings the process is running with.
-func (m *Manager) Running() config.Settings { return m.running.Clone() }
+// Current returns the current configuration: config.yaml's bootstrap keys
+// with the saved settings. The caller must not modify it. A request should
+// read it once and use that snapshot throughout, so a concurrent save
+// cannot mix two configurations in one response.
+func (m *Manager) Current() *config.Config { return m.cur.Load() }
 
-// Saved returns the saved settings, which apply on the next restart.
-func (m *Manager) Saved() config.Settings {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.saved.Clone()
-}
-
-// SavedSMTP returns the saved upstream server, with its password, for
-// testing it before a restart.
-func (m *Manager) SavedSMTP() config.SMTP {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	s := m.saved.Upstream.SMTP
-	s.Password = m.savedPW
-	return s
-}
-
-// Pending returns the dotted keys whose saved value differs from the
-// running one, sorted; empty when no restart is needed.
-func (m *Manager) Pending() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return slices.Clone(m.pending)
-}
-
-// SavedAt returns when the settings were last written.
-func (m *Manager) SavedAt() time.Time {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.savedAt
-}
+// Saved returns the saved settings, the ones in effect, with the SMTP
+// password in memory.
+func (m *Manager) Saved() config.Settings { return m.Current().Managed() }
 
 // LoadProblems returns what was wrong with the stored settings at boot.
-// The process runs regardless; saving valid settings fixes them on the
-// next restart.
+// The process runs regardless; the next successful save clears them.
 func (m *Manager) LoadProblems() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

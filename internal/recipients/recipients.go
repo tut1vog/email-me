@@ -63,7 +63,7 @@ func (r *Recipient) KeyExpiry() time.Time {
 // Registry is the live set of recipients, backed by the store.
 type Registry struct {
 	st       *store.Store
-	defaults policy.Effective
+	defaults func() policy.Effective
 
 	wmu sync.Mutex // serializes write + reload so snapshots never go stale
 
@@ -73,15 +73,17 @@ type Registry struct {
 }
 
 // New returns an empty registry; call Reload to load the store's recipients.
-// defaults is the configured default policy that Effective resolves against.
-func New(st *store.Store, defaults policy.Effective) *Registry {
+// defaults returns the default policy that Effective resolves against. It
+// is called on every resolution, so a saved default policy applies at once.
+func New(st *store.Store, defaults func() policy.Effective) *Registry {
 	return &Registry{st: st, defaults: defaults, byAlias: map[string]*Recipient{}}
 }
 
 // Bootstrap creates a registry, seeds the store from cfg.Recipients if it
 // has no recipients yet, and loads it. It returns the aliases it seeded.
-func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config) (*Registry, []string, error) {
-	r := New(st, cfg.DefaultPolicy)
+// defaults is as for New.
+func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, defaults func() policy.Effective) (*Registry, []string, error) {
+	r := New(st, defaults)
 	seeded, err := r.SeedIfEmpty(ctx, cfg.Recipients)
 	if err != nil {
 		return nil, nil, err
@@ -189,10 +191,10 @@ func (r *Registry) Len() int {
 	return len(r.aliases)
 }
 
-// Effective resolves an agent's partial policy against the configured
+// Effective resolves an agent's partial policy against the current
 // defaults, dropping aliases that do not exist (any more).
 func (r *Registry) Effective(p policy.Policy) policy.Effective {
-	e := p.Apply(r.defaults)
+	e := p.Apply(r.defaults())
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	kept := make([]string, 0, len(e.Recipients))

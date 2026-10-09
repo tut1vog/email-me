@@ -49,20 +49,21 @@ func (s *Session) ValidCSRF(token string) bool {
 // Sessions is an in-memory session store; sessions are lost on restart.
 type Sessions struct {
 	mu  sync.Mutex
-	ttl time.Duration
 	m   map[string]*Session
 	now func() time.Time
 }
 
-func NewSessions(ttl time.Duration) *Sessions {
-	return &Sessions{ttl: ttl, m: map[string]*Session{}, now: time.Now}
+func NewSessions() *Sessions {
+	return &Sessions{m: map[string]*Session{}, now: time.Now}
 }
 
-func (s *Sessions) Create() *Session {
+// Create starts a session that lasts ttl. Each session keeps the expiry it
+// was created with.
+func (s *Sessions) Create(ttl time.Duration) *Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gc()
-	sess := &Session{ID: ids.Random(52), CSRF: ids.Random(52), ExpiresAt: s.now().Add(s.ttl)}
+	sess := &Session{ID: ids.Random(52), CSRF: ids.Random(52), ExpiresAt: s.now().Add(ttl)}
 	s.m[sess.ID] = sess
 	return sess
 }

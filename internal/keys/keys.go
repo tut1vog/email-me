@@ -29,17 +29,16 @@ var (
 	ErrExpired = errors.New("agent signing key has expired; rotate it from the dashboard")
 	// ErrNoFrom means no From address (upstream.from) is configured, so a new
 	// key would carry a user ID without an address.
-	ErrNoFrom = errors.New("no From address is configured: set upstream.from on the Settings page and restart, then generate the key")
+	ErrNoFrom = errors.New("no From address is configured: set upstream.from on the Settings page, then generate the key")
 )
 
 // Manager generates, stores and loads agent signing keys.
 type Manager struct {
-	store    *store.Store
-	kek      []byte
-	validity time.Duration
-	master   *openpgp.Entity
-	email    string
-	now      func() time.Time
+	store  *store.Store
+	kek    []byte
+	master *openpgp.Entity
+	from   func() (email string, validity time.Duration) // for new keys
+	now    func() time.Time
 
 	mu    sync.Mutex
 	cache map[string]*openpgp.Entity // fingerprint → decrypted entity
@@ -51,10 +50,19 @@ type Options struct {
 	Validity time.Duration
 	Master   *openpgp.Entity
 	Email    string // user ID address; matches the From header
+
+	// From, if set, replaces Email and Validity: it is called whenever a
+	// key is generated or a user ID shown, so saved settings apply to the
+	// next key.
+	From func() (email string, validity time.Duration)
 }
 
 func NewManager(st *store.Store, o Options) *Manager {
-	m := &Manager{store: st, validity: o.Validity, master: o.Master, email: o.Email, now: time.Now, cache: map[string]*openpgp.Entity{}}
+	from := o.From
+	if from == nil {
+		from = func() (string, time.Duration) { return o.Email, o.Validity }
+	}
+	m := &Manager{store: st, master: o.Master, from: from, now: time.Now, cache: map[string]*openpgp.Entity{}}
 	if len(o.KEK) == 32 {
 		m.kek = o.KEK
 	}
@@ -67,24 +75,28 @@ func (m *Manager) Enabled() bool { return m != nil && m.kek != nil }
 // Master returns the certification master key, if configured.
 func (m *Manager) Master() *openpgp.Entity { return m.master }
 
-// UserID returns the OpenPGP user ID for an agent.
+// UserID returns the OpenPGP user ID a key generated now would carry for
+// an agent: it follows the current From address. Existing keys keep the
+// user ID they were generated with.
 func (m *Manager) UserID(agentName string) string {
-	return fmt.Sprintf("%s via email-me <%s>", agentName, m.email)
+	email, _ := m.from()
+	return fmt.Sprintf("%s via email-me <%s>", agentName, email)
 }
 
 // generate creates (but does not store) a new key for the agent.
 func (m *Manager) generate(agentName string) (*store.AgentKey, *openpgp.Entity, error) {
-	if m.email == "" {
+	email, validity := m.from()
+	if email == "" {
 		return nil, nil, ErrNoFrom
 	}
 	now := m.now()
 	cfg := pgp.Config()
 	cfg.Algorithm = packet.PubKeyAlgoEdDSA // v4 Ed25519 for broad client support (GnuPG 2.2+, Thunderbird)
 	cfg.Curve = packet.Curve25519
-	cfg.KeyLifetimeSecs = uint32(m.validity / time.Second)
+	cfg.KeyLifetimeSecs = uint32(validity / time.Second)
 	cfg.Time = func() time.Time { return now }
 
-	e, err := openpgp.NewEntity(agentName+" via email-me", "", m.email, cfg)
+	e, err := openpgp.NewEntity(agentName+" via email-me", "", email, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating key: %w", err)
 	}
@@ -221,10 +233,11 @@ func (m *Manager) EnsureAll(ctx context.Context) (created int, err error) {
 		return 0, err
 	}
 	var missing error
+	email, _ := m.from()
 	for _, a := range agents {
 		k, err := m.store.ActiveKey(ctx, a.ID)
 		if errors.Is(err, store.ErrNotFound) {
-			if m.email == "" {
+			if email == "" {
 				missing = ErrNoFrom
 				continue
 			}

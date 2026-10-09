@@ -27,12 +27,13 @@ const expiryWarning = 30 * 24 * time.Hour
 
 // apiBaseURL is the URL agents should use, for snippets and the guide preview.
 func (s *Server) apiBaseURL() string {
-	if s.Config.API.PublicURL != "" {
-		return s.Config.API.PublicURL
+	cfg := s.Config()
+	if cfg.API.PublicURL != "" {
+		return cfg.API.PublicURL
 	}
-	_, port, _ := net.SplitHostPort(s.Config.API.Listen)
+	_, port, _ := net.SplitHostPort(cfg.API.Listen)
 	scheme := "http"
-	if s.Config.API.TLS.Enabled() {
+	if cfg.API.TLS.Enabled() {
 		scheme = "https"
 	}
 	return scheme + "://localhost:" + port
@@ -130,7 +131,8 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, row)
 	}
-	notices, insecure, err := s.notices(ctx, agents)
+	cfg := s.Config()
+	notices, insecure, err := s.notices(ctx, cfg, agents)
 	if err != nil {
 		s.fail(w, "computing warnings", err)
 		return
@@ -149,7 +151,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		"Notices":      notices,
 		"Insecure":     insecure,
 		"SMTP":         smtp,
-		"Upstream":     upstreamAddr(s.Config),
+		"Upstream":     upstreamAddr(cfg),
 	})
 }
 
@@ -159,22 +161,23 @@ type insecureAgent struct {
 	RequireSigning bool
 }
 
-func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, []insecureAgent, error) {
+// notices is the Needs-attention list under cfg.
+func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*store.Agent) ([]notice, []insecureAgent, error) {
 	var out []notice
-	for _, w := range s.configWarnings() {
+	for _, w := range configWarnings(cfg) {
 		out = append(out, notice{Kind: "warn", Title: "Configuration", Text: w, Link: "/settings"})
 	}
 	for _, p := range s.Settings.LoadProblems() {
 		out = append(out, notice{Kind: "danger", Title: "Saved settings",
 			Text: p + ".", Link: "/settings"})
 	}
-	if p := s.Settings.Pending(); len(p) > 0 {
+	if s.configChanged() {
 		out = append(out, notice{Kind: "warn", Title: "Restart to apply",
-			Text: "Saved settings are not in effect yet: " + strings.Join(p, ", ") + ".", Link: "/settings#restart"})
+			Text: "config.yaml changed on disk since email-me started. Restart to apply it.", Link: "/settings#restart"})
 	}
-	if !upstreamConfigured(s.Config) {
+	if !upstreamConfigured(cfg) {
 		out = append(out, notice{Kind: "danger", Title: "Configure SMTP",
-			Text: "No upstream SMTP server or From address is set, so every send fails. Set them on the Settings page and restart.",
+			Text: "No upstream SMTP server or From address is set, so every send fails. Set them on the Settings page.",
 			Link: "/settings#upstream"})
 	}
 	switch s.Settings.PasswordState() {
@@ -197,7 +200,7 @@ func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, 
 		out = append(out, notice{Kind: "danger", Title: "No recipients",
 			Text: "Agents have nobody to email. Add a recipient, such as your own address.", Link: "/recipients/new"})
 	}
-	if u := s.Recipients.UnknownAliases(s.Config.Defaults.Policy); len(u) > 0 {
+	if u := s.Recipients.UnknownAliases(cfg.Defaults.Policy); len(u) > 0 {
 		out = append(out, notice{Kind: "warn", Title: "Default policy",
 			Text: "The default policy names recipients that do not exist (ignored): " + strings.Join(u, ", ") + ".",
 			Link: "/settings#policy"})
@@ -235,9 +238,9 @@ func (s *Server) notices(ctx context.Context, agents []*store.Agent) ([]notice, 
 		signing := "/agents/" + a.ID + "/signing"
 		k, err := s.Keys.ActiveKey(ctx, a.ID)
 		switch {
-		case errors.Is(err, store.ErrNotFound) && s.Config.Upstream.From == "":
+		case errors.Is(err, store.ErrNotFound) && cfg.Upstream.From == "":
 			out = append(out, notice{Kind: "warn", Title: title,
-				Text: "No signing key. One can be generated once a From address is set on the Settings page and the gateway restarted.",
+				Text: "No signing key. One can be generated once a From address is set on the Settings page.",
 				Link: "/settings#upstream"})
 		case errors.Is(err, store.ErrNotFound):
 			out = append(out, notice{Kind: "warn", Title: title, Text: "No signing key.", Link: signing})
@@ -303,7 +306,7 @@ func (s *Server) agents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) newAgentPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "agent_new", "New agent", map[string]any{
 		"Recipients": s.Recipients.All(),
-		"Defaults":   s.Config.DefaultPolicy,
+		"Defaults":   s.Config().DefaultPolicy,
 	})
 }
 
@@ -530,7 +533,7 @@ func (s *Server) agentPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	eff := s.Recipients.Effective(sh.Agent.Policy)
 	sh.Data["Form"] = formFromPolicy(sh.Agent.Policy, eff)
-	sh.Data["Defaults"] = s.Config.DefaultPolicy
+	sh.Data["Defaults"] = s.Config().DefaultPolicy
 	sh.Data["Effective"] = eff
 	sh.Data["Recipients"] = s.Recipients.All()
 	sh.Data["AllServices"] = policy.AllServices
@@ -543,7 +546,7 @@ func (s *Server) agentSigning(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := sh.Data["KeyState"]
-	sh.Data["NoFrom"] = s.Config.Upstream.From == ""
+	sh.Data["NoFrom"] = s.Config().Upstream.From == ""
 	sh.Data["KeyExpired"] = state == "expired"
 	sh.Data["KeyExpiring"] = state == "expiring"
 	sh.Data["RetiredKeys"] = sh.Retired
@@ -1040,7 +1043,7 @@ func (s *Server) deleteRecipientPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "recipient_delete", "Delete "+rc.Alias, map[string]any{
 		"Recipient":  rc,
 		"Agents":     recipients.ReferencingAgents(agents, rc.Alias),
-		"InDefaults": slices.Contains(s.Config.DefaultPolicy.Recipients, rc.Alias),
+		"InDefaults": slices.Contains(s.Config().DefaultPolicy.Recipients, rc.Alias),
 	})
 }
 
@@ -1123,7 +1126,7 @@ func (s *Server) auditPage(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, r, "audit", "Audit log", map[string]any{
 		"Rows": rows, "Names": names, "Agents": agents, "Filter": f, "Period": period,
-		"Page": pg, "More": more, "LogSubject": s.Config.Audit.LogSubject,
+		"Page": pg, "More": more, "LogSubject": s.Config().Audit.LogSubject,
 		"Query": r.URL.Query(),
 	})
 }

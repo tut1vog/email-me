@@ -294,3 +294,37 @@ func TestNoKeysWithoutFromAddress(t *testing.T) {
 		t.Fatalf("EnsureAll with a From address: %d, %v", n, err)
 	}
 }
+
+func TestFromFollowsSettings(t *testing.T) {
+	st, _, a, _ := setup(t, nil)
+	ctx := context.Background()
+	var from string
+	validity := 24 * time.Hour
+	m := keys.NewManager(st, keys.Options{KEK: kek(7), From: func() (string, time.Duration) { return from, validity }})
+	if n, err := m.EnsureAll(ctx); n != 0 || !errors.Is(err, keys.ErrNoFrom) {
+		t.Fatalf("EnsureAll without a From address: %d, %v", n, err)
+	}
+
+	// The From address is saved: the same manager generates keys with it.
+	from, validity = "gateway@example.com", 48*time.Hour
+	if m.UserID(a.Name) != "bench via email-me <gateway@example.com>" {
+		t.Fatalf("user ID = %q", m.UserID(a.Name))
+	}
+	if n, err := m.EnsureAll(ctx); n != 1 || err != nil {
+		t.Fatalf("EnsureAll with a From address: %d, %v", n, err)
+	}
+	k, err := st.ActiveKey(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	el, err := openpgp.ReadArmoredKeyRing(strings.NewReader(k.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id := el[0].PrimaryIdentity(); id == nil || id.Name != m.UserID(a.Name) {
+		t.Fatalf("key user ID = %+v", id)
+	}
+	if got := k.ExpiresAt.Sub(k.CreatedAt); got != 48*time.Hour {
+		t.Fatalf("key lifetime = %v", got)
+	}
+}

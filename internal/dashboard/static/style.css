@@ -844,7 +844,7 @@ h1 .tag, .page-title .tag { font-size: var(--fs-sm); height: 22px; margin-left: 
 .banner details.help { margin: 4px 0 0; }
 .banner .form-actions { margin-top: var(--s-2); }
 
-/* Restart-to-apply banner: the pending keys and an inline Restart form. */
+/* Restart-to-apply banner (config.yaml changed): an inline Restart form. */
 .banner code { overflow-wrap: anywhere; }
 .banner form.inline { margin: var(--s-2) 0 0; }
 

@@ -3,6 +3,7 @@ package dashboard
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -20,12 +21,11 @@ import (
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/units"
-	"github.com/tut1vog/email-me/internal/upstream"
 )
 
 // The Settings page edits the managed settings: one form per card, each
-// saving the card merged into the saved settings. Saved settings apply on
-// restart; the forms always show the saved values, not the running ones.
+// saving the card merged into the saved settings. A save applies at once;
+// the forms show the settings in effect.
 
 // settingsForms holds every card's form values as text, so a rejected
 // submission can be shown again exactly as typed.
@@ -107,9 +107,9 @@ func parseInt(label, v string, errs *[]string) int {
 
 func (s *Server) builtinPolicy() policy.Effective { return policy.Builtin(s.Keys.Enabled()) }
 
-// settingsForms fills every card from the saved settings.
-func (s *Server) settingsForms() settingsForms {
-	cur := s.Settings.Saved()
+// settingsForms fills every card from the settings in cfg.
+func (s *Server) settingsForms(cfg *config.Config) settingsForms {
+	cur := cfg.Managed()
 	u := cur.Upstream
 	f := settingsForms{
 		Upstream: upstreamForm{
@@ -152,12 +152,12 @@ func upstreamConfigured(c *config.Config) bool {
 	return c.Upstream.SMTP.Host != "" && c.Upstream.From != ""
 }
 
-// configWarnings are the config warnings the Needs-attention list and the
+// configWarnings are cfg's warnings that the Needs-attention list and the
 // Settings page show as such. Problems with the saved settings and a
 // missing upstream are left out: they have their own notices and banner.
-func (s *Server) configWarnings() []string {
+func configWarnings(cfg *config.Config) []string {
 	var out []string
-	for _, w := range s.Config.Warnings {
+	for _, w := range cfg.Warnings {
 		if strings.HasPrefix(w, settings.WarningPrefix) || w == config.UpstreamNotConfigured {
 			continue
 		}
@@ -166,7 +166,7 @@ func (s *Server) configWarnings() []string {
 	return out
 }
 
-// upstreamAddr is the running upstream server, for display.
+// upstreamAddr is the upstream server in c, for display.
 func upstreamAddr(c *config.Config) string {
 	if c.Upstream.SMTP.Host == "" {
 		return "not configured"
@@ -193,15 +193,16 @@ func (s *Server) lastSMTPCheck() *smtpStatus {
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
-	s.settingsPage(w, r, http.StatusOK, s.settingsForms())
+	cfg := s.Config()
+	s.settingsPage(w, r, http.StatusOK, cfg, s.settingsForms(cfg))
 }
 
-func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request, status int, forms settingsForms) {
+// settingsPage renders the Settings page for cfg, with forms in the cards.
+func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request, status int, cfg *config.Config, forms settingsForms) {
 	var master string
 	if m := s.Keys.Master(); m != nil {
 		master = pgp.Fingerprint(m)
 	}
-	pending := s.Settings.Pending()
 	s.renderStatus(w, r, status, "settings", "Settings", map[string]any{
 		"Form": forms,
 		"Policy": map[string]any{
@@ -209,24 +210,25 @@ func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request, status int
 			"Recipients": s.Recipients.All(), "AllServices": policy.AllServices,
 		},
 		"SMTP":           s.lastSMTPCheck(),
-		"Configured":     upstreamConfigured(s.Config),
-		"Upstream":       upstreamAddr(s.Config),
+		"Configured":     upstreamConfigured(cfg),
+		"Upstream":       upstreamAddr(cfg),
 		"Password":       passwordState(s.Settings.PasswordState()),
 		"HasPassword":    s.Settings.HasPassword(),
-		"TestSaved":      slices.ContainsFunc(pending, func(k string) bool { return strings.HasPrefix(k, "upstream.") }),
 		"Securities":     []string{"starttls", "tls", "none"},
 		"Aliases":        s.Recipients.Aliases(),
 		"SigningEnabled": s.Keys.Enabled(),
 		"MasterFpr":      master,
-		"Warnings":       s.configWarnings(),
-		"Config":         s.Config,
-		"Pending":        pending,
+		"Warnings":       configWarnings(cfg),
+		"Config":         cfg,
+		"ConfigChanged":  s.configChanged(),
 	})
 }
 
 // cardSave is one card's submission: apply copies it into the saved
 // settings (returning parse problems) and keep puts the submitted form
-// back for a re-render.
+// back for a re-render. after, if set, runs once the settings are saved
+// and current, with the settings before and after the save and the keys
+// that changed; it returns a note for the confirmation.
 type cardSave struct {
 	id, title string
 	problems  []string
@@ -234,12 +236,21 @@ type cardSave struct {
 	password  settings.PasswordChange
 	apply     func(*config.Settings) []string
 	keep      func(*settingsForms)
+	after     func(r *http.Request, prev, now config.Settings, changed []string) string
 }
 
-// saveCard saves a card merged into the saved settings. Problems re-render
-// the page (422) with the card as submitted; success redirects to the card.
+// passwordKey stands for the SMTP password, which DiffSettings does not
+// compare, in the keys a save changed.
+const passwordKey = "upstream.smtp.password"
+
+// saveCard saves a card merged into the current settings, which applies
+// it. Problems re-render the page (422) with the card as submitted;
+// success redirects to the card.
 func (s *Server) saveCard(w http.ResponseWriter, r *http.Request, c cardSave) {
-	cur := s.Settings.Saved()
+	cfg := s.Config()
+	prev := cfg.Managed()
+	hadPassword := s.Settings.HasPassword()
+	cur := prev.Clone()
 	problems := append(c.problems, c.apply(&cur)...)
 	var warnings []string
 	if len(problems) == 0 {
@@ -256,24 +267,34 @@ func (s *Server) saveCard(w http.ResponseWriter, r *http.Request, c cardSave) {
 	}
 	if len(problems) > 0 {
 		s.flash(r, "error", "%s not saved: %s.", c.title, strings.Join(problems, "; "))
-		forms := s.settingsForms()
+		forms := s.settingsForms(cfg)
 		c.keep(&forms)
-		s.settingsPage(w, r, http.StatusUnprocessableEntity, forms)
+		s.settingsPage(w, r, http.StatusUnprocessableEntity, cfg, forms)
 		return
 	}
-	pending := s.Settings.Pending()
-	msg := c.title + " saved. Restart to apply."
-	if len(pending) == 0 {
-		msg = c.title + " saved. They match the running settings: no restart is needed."
+	now := s.Settings.Saved()
+	changed := config.DiffSettings(prev, now)
+	if pw := c.password; pw.Set && (pw.Value != prev.Upstream.SMTP.Password || hadPassword != (pw.Value != "")) {
+		changed = append(changed, passwordKey)
+		slices.Sort(changed)
 	}
-	// Warnings the running settings already have are on the Needs-attention
+	msg := c.title + " saved and applied."
+	if len(changed) == 0 {
+		msg = c.title + " saved; nothing changed."
+	}
+	if c.after != nil {
+		if note := c.after(r, prev, now, changed); note != "" {
+			msg += " " + note
+		}
+	}
+	// Warnings the previous settings already had are on the Needs-attention
 	// list; a save only mentions new ones.
 	for _, w := range append(warnings, c.warnings...) {
-		if !slices.Contains(s.Config.Warnings, w) && (w != config.UpstreamNotConfigured || c.id == "upstream") {
+		if !slices.Contains(cfg.Warnings, w) && (w != config.UpstreamNotConfigured || c.id == "upstream") {
 			msg += " Note: " + w + "."
 		}
 	}
-	s.Log.Info("settings saved", "card", c.id, "pending", pending)
+	s.Log.Info("settings saved", "card", c.id, "changed", changed)
 	s.flash(r, "ok", "%s", msg)
 	s.redirect(w, r, "/settings#"+c.id)
 }
@@ -286,7 +307,7 @@ func (s *Server) saveUpstream(w http.ResponseWriter, r *http.Request) {
 		From: strings.TrimSpace(f.Get("from")), FromNameTemplate: f.Get("from_name_template"),
 		AllowPlaintext: f.Get("allow_plaintext") == "on",
 	}
-	c := cardSave{id: "upstream", title: "Upstream SMTP settings", keep: func(fs *settingsForms) { fs.Upstream = form }}
+	c := cardSave{id: "upstream", title: "Upstream SMTP settings", keep: func(fs *settingsForms) { fs.Upstream = form }, after: s.afterUpstream}
 	switch pw, remove := f.Get("password"), f.Get("remove_password") == "on"; {
 	case pw != "" && remove:
 		c.problems = append(c.problems, "either enter a new password or remove the stored one, not both")
@@ -306,6 +327,32 @@ func (s *Server) saveUpstream(w http.ResponseWriter, r *http.Request) {
 		return errs
 	}
 	s.saveCard(w, r, c)
+}
+
+// afterUpstream follows an upstream save: the last connection test was of
+// other settings, and agents left without a signing key for want of a From
+// address get one now that it is set.
+func (s *Server) afterUpstream(r *http.Request, prev, now config.Settings, changed []string) string {
+	if len(changed) > 0 {
+		s.smtpMu.Lock()
+		s.smtpCheck = nil
+		s.smtpMu.Unlock()
+	}
+	if !s.Keys.Enabled() || prev.Upstream.From != "" || now.Upstream.From == "" {
+		return ""
+	}
+	n, err := s.Keys.EnsureAll(r.Context())
+	if err != nil {
+		s.Log.Error("generating signing keys after setting the From address", "err", err)
+		s.flash(r, "error", "Signing keys for agents without one were not all generated: %v. Generate them on each agent's Signing tab.", err)
+	}
+	switch {
+	case n == 1:
+		return "Generated a signing key for 1 agent."
+	case n > 1:
+		return fmt.Sprintf("Generated signing keys for %d agents.", n)
+	}
+	return ""
 }
 
 func (s *Server) saveAPI(w http.ResponseWriter, r *http.Request) {
@@ -378,8 +425,17 @@ func (s *Server) saveSigning(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// extendWriteDeadline gives a response that waits on the upstream server
+// room for the current upstream timeout, which the server's fixed write
+// timeout does not follow.
+func extendWriteDeadline(w http.ResponseWriter, cfg *config.Config) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(cfg.Upstream.SMTP.Timeout.D() + time.Minute))
+}
+
 func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Upstream.SMTP.Timeout.D()+5*time.Second)
+	cfg := s.Config()
+	extendWriteDeadline(w, cfg)
+	ctx, cancel := context.WithTimeout(r.Context(), cfg.Upstream.SMTP.Timeout.D()+5*time.Second)
 	defer cancel()
 	err := s.Sender.Check(ctx)
 	st := &smtpStatus{At: s.now(), OK: err == nil}
@@ -387,31 +443,12 @@ func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
 		st.Err = err.Error()
 		s.flash(r, "error", "SMTP connection test failed: %v", err)
 	} else {
-		s.flash(r, "ok", "Connected and authenticated to %s.", s.Config.Upstream.SMTP.Addr())
+		s.flash(r, "ok", "Connected and authenticated to %s.", cfg.Upstream.SMTP.Addr())
 	}
 	s.smtpMu.Lock()
 	s.smtpCheck = st
 	s.smtpMu.Unlock()
 	s.redirect(w, r, safeNext(r.PostForm.Get("back")))
-}
-
-// testSMTPSaved checks the saved upstream server, before a restart puts it
-// in use. It does not touch the running sender's status.
-func (s *Server) testSMTPSaved(w http.ResponseWriter, r *http.Request) {
-	cfg := s.Settings.SavedSMTP()
-	if cfg.Host == "" {
-		s.flash(r, "error", "The saved settings have no upstream host.")
-		s.redirect(w, r, "/settings#upstream")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), cfg.Timeout.D()+5*time.Second)
-	defer cancel()
-	if err := upstream.NewSMTP(cfg).Check(ctx); err != nil {
-		s.flash(r, "error", "Saved SMTP settings test failed: %v", err)
-	} else {
-		s.flash(r, "ok", "Connected and authenticated to %s with the saved settings. Restart to use them.", cfg.Addr())
-	}
-	s.redirect(w, r, "/settings#upstream")
 }
 
 func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
@@ -422,18 +459,20 @@ func (s *Server) testSend(w http.ResponseWriter, r *http.Request) {
 		s.redirect(w, r, "/settings#upstream")
 		return
 	}
+	cfg := s.Config()
+	extendWriteDeadline(w, cfg)
 	now := s.now()
 	msg := &compose.Message{
-		FromName: "email-me dashboard", FromAddr: s.Config.Upstream.From, To: []string{rc.Address},
+		FromName: "email-me dashboard", FromAddr: cfg.Upstream.From, To: []string{rc.Address},
 		Subject: "[email-me] Test message", Agent: "dashboard", MessageID: compose.NewMessageID(), Date: now,
 		Text: "This is a test message sent from the email-me dashboard at " + now.UTC().Format(time.RFC1123) +
 			".\n\nIf you can read it, delivery to the \"" + alias + "\" alias works.\n",
 	}
 	raw, err := compose.Build(msg)
 	if err == nil {
-		ctx, cancel := context.WithTimeout(r.Context(), s.Config.Upstream.SMTP.Timeout.D()+5*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.Upstream.SMTP.Timeout.D()+5*time.Second)
 		defer cancel()
-		err = s.Sender.Send(ctx, s.Config.Upstream.From, []string{rc.Address}, raw)
+		err = s.Sender.Send(ctx, cfg.Upstream.From, []string{rc.Address}, raw)
 	}
 	if err != nil {
 		s.flash(r, "error", "Test message to %s failed: %v", alias, err)
@@ -451,7 +490,7 @@ func (s *Server) up(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, s.bootID)
 }
 
-// restart asks the process to restart, which applies the saved settings.
+// restart asks the process to restart, which re-reads config.yaml.
 // Sessions live in memory and do not survive it, so this one ends now and
 // the restarting page sends the operator to the login page once the next
 // start is up.
@@ -471,14 +510,15 @@ func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
 		s.redirect(w, r, "/settings#restart")
 		return
 	}
-	s.Log.Info("restart requested from the dashboard", "ip", clientIP(r), "pending", s.Settings.Pending())
+	s.Log.Info("restart requested from the dashboard", "ip", clientIP(r))
 	s.endSession(w, r)
 	r = r.WithContext(context.WithValue(r.Context(), sessionKey, (*auth.Session)(nil)))
 	s.render(w, r, "restarting", "Restarting", map[string]any{"Boot": s.bootID})
 }
 
 func (s *Server) guidePreview(w http.ResponseWriter, r *http.Request) {
+	base := s.apiBaseURL()
 	s.render(w, r, "guide", "Agent guide", map[string]any{
-		"Guide": docs.Guide(s.apiBaseURL()), "BaseURL": s.apiBaseURL(),
+		"Guide": docs.Guide(base), "BaseURL": base,
 	})
 }

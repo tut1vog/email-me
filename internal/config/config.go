@@ -11,6 +11,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -55,6 +56,9 @@ type Config struct {
 	DefaultPolicy policy.Effective `yaml:"-"`
 	// Warnings are non-fatal problems to log at startup and show on the dashboard.
 	Warnings []string `yaml:"-"`
+	// Fingerprint identifies the config.yaml that Load read (see
+	// FileFingerprint), so a later change to the file can be detected.
+	Fingerprint string `yaml:"-"`
 }
 
 type API struct {
@@ -164,7 +168,28 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
-	return Parse(data)
+	c, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	c.Fingerprint = fingerprint(data)
+	return c, nil
+}
+
+// FileFingerprint returns the fingerprint of the config file at path, to
+// compare with a loaded Config's. Only the file itself is hashed: a secret
+// file it names can change without changing the fingerprint.
+func FileFingerprint(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return fingerprint(data), nil
+}
+
+func fingerprint(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // Parse is Load without the file read (secrets are still read from disk).

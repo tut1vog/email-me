@@ -42,27 +42,35 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
+// SMTP delivers to an upstream server. Each connection uses the server
+// settings current when it is opened.
 type SMTP struct {
-	cfg       config.SMTP
-	tlsConfig *tls.Config
+	cfg func() config.SMTP
 }
 
+// NewSMTP returns a sender for a fixed server.
 func NewSMTP(cfg config.SMTP) *SMTP {
-	return &SMTP{cfg: cfg, tlsConfig: &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}}
+	return NewDynamic(func() config.SMTP { return cfg })
 }
+
+// NewDynamic returns a sender that reads the server settings from cfg on
+// every connection, so saved settings apply to the next send.
+func NewDynamic(cfg func() config.SMTP) *SMTP { return &SMTP{cfg: cfg} }
 
 func (s *SMTP) dial(ctx context.Context) (*smtp.Client, error) {
-	if s.cfg.Host == "" {
+	cfg := s.cfg() // once: one connection, one set of settings
+	if cfg.Host == "" {
 		return nil, &Error{Err: ErrNotConfigured}
 	}
-	timeout := s.cfg.Timeout.D()
+	tlsConfig := &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}
+	timeout := cfg.Timeout.D()
 	d := &net.Dialer{Timeout: timeout}
 	var conn net.Conn
 	var err error
-	if s.cfg.Security == "tls" {
-		conn, err = (&tls.Dialer{NetDialer: d, Config: s.tlsConfig}).DialContext(ctx, "tcp", s.cfg.Addr())
+	if cfg.Security == "tls" {
+		conn, err = (&tls.Dialer{NetDialer: d, Config: tlsConfig}).DialContext(ctx, "tcp", cfg.Addr())
 	} else {
-		conn, err = d.DialContext(ctx, "tcp", s.cfg.Addr())
+		conn, err = d.DialContext(ctx, "tcp", cfg.Addr())
 	}
 	if err != nil {
 		return nil, &Error{Err: err}
@@ -74,8 +82,8 @@ func (s *SMTP) dial(ctx context.Context) (*smtp.Client, error) {
 	conn.SetDeadline(deadline)
 
 	var c *smtp.Client
-	if s.cfg.Security == "starttls" {
-		c, err = smtp.NewClientStartTLS(conn, s.tlsConfig)
+	if cfg.Security == "starttls" {
+		c, err = smtp.NewClientStartTLS(conn, tlsConfig)
 	} else {
 		c = smtp.NewClient(conn)
 	}
@@ -83,8 +91,8 @@ func (s *SMTP) dial(ctx context.Context) (*smtp.Client, error) {
 		conn.Close()
 		return nil, wrap(err)
 	}
-	if s.cfg.Username != "" {
-		if err := c.Auth(sasl.NewPlainClient("", s.cfg.Username, s.cfg.Password)); err != nil {
+	if cfg.Username != "" {
+		if err := c.Auth(sasl.NewPlainClient("", cfg.Username, cfg.Password)); err != nil {
 			c.Close()
 			return nil, wrap(err)
 		}

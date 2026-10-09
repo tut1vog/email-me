@@ -10,8 +10,8 @@ import (
 )
 
 // Settings are the managed keys: stored in the state database as JSON,
-// edited on the dashboard and applied on restart. Their sections in
-// config.yaml only seed an empty database. The SMTP password is not part
+// edited on the dashboard and applied as soon as they are saved. Their
+// sections in config.yaml only seed an empty database. The SMTP password is not part
 // of the document (see SMTP).
 type Settings struct {
 	API       APISettings       `json:"api"`

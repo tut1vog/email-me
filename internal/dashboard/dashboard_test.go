@@ -11,10 +11,12 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tut1vog/email-me/internal/auth"
+	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/dashboard"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/recipients"
@@ -35,6 +37,8 @@ type dash struct {
 	c        *http.Client
 	restart  *fakeRestart
 	srv      *dashboard.Server
+	// configChanged stands in for config.yaml changing on disk.
+	configChanged *atomic.Bool
 }
 
 // fakeRestart stands in for the process restart: it counts requests and
@@ -83,18 +87,26 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 		prepare(env, st)
 	}
 	sm := testutil.BootstrapSettings(t, env, st)
-	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg, testutil.DefaultPolicy(sm))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ko := keys.Options{Email: cfg.Upstream.From}
+	ko := keys.Options{From: func() (string, time.Duration) {
+		c := sm.Current()
+		if c.Signing == nil {
+			return c.Upstream.From, 0
+		}
+		return c.Upstream.From, c.Signing.KeyValidity.D()
+	}}
 	if cfg.Signing != nil {
-		ko.KEK, ko.Validity = cfg.Signing.KEK, cfg.Signing.KeyValidity.D()
+		ko.KEK = cfg.Signing.KEK
 	}
 	km := keys.NewManager(st, ko)
 	rs := &fakeRestart{}
-	srv, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km,
-		Sender: upstream.NewSMTP(cfg.Upstream.SMTP), Log: testutil.DiscardLogger(), Restart: rs.request})
+	changed := &atomic.Bool{}
+	srv, err := dashboard.New(dashboard.Deps{Config: sm.Current, Store: st, Recipients: reg, Settings: sm, Keys: km,
+		Sender: upstream.NewDynamic(func() config.SMTP { return sm.Current().Upstream.SMTP }),
+		Log:    testutil.DiscardLogger(), Restart: rs.request, ConfigChanged: changed.Load})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +114,7 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c, restart: rs, srv: srv}
+	return &dash{t: t, env: env, st: st, reg: reg, settings: sm, keys: km, ts: ts, c: c, restart: rs, srv: srv, configChanged: changed}
 }
 
 type page struct {

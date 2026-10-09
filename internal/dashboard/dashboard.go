@@ -40,16 +40,21 @@ const (
 )
 
 type Deps struct {
-	Config     *config.Config
+	// Config returns the current configuration. Saved settings replace it,
+	// so a handler reads it once and uses that snapshot throughout.
+	Config     func() *config.Config
 	Store      *store.Store
 	Recipients *recipients.Registry
 	Settings   *settings.Manager
 	Keys       *keys.Manager
 	Sender     upstream.Sender
 	Log        *slog.Logger
-	// Restart asks the process to restart and apply the saved settings. It
+	// Restart asks the process to restart, re-reading config.yaml. It
 	// returns an error, and nothing restarts, if config.yaml no longer loads.
 	Restart func() error
+	// ConfigChanged reports whether config.yaml changed on disk since this
+	// start, so a restart is needed to apply it. Nil means never.
+	ConfigChanged func() bool
 }
 
 type Server struct {
@@ -77,7 +82,7 @@ type smtpStatus struct {
 func New(d Deps) (*Server, error) {
 	s := &Server{
 		Deps:     d,
-		sessions: auth.NewSessions(d.Config.Dashboard.SessionTTL.D()),
+		sessions: auth.NewSessions(),
 		// Backoff is capped at a minute: brute force against a ≥12-character
 		// password is hopeless at that rate, and every local client shares
 		// one address behind Docker's NAT, so long lockouts would let any
@@ -164,7 +169,6 @@ func (s *Server) Handler() http.Handler {
 	authed("POST /settings/audit", s.saveAudit)
 	authed("POST /settings/signing", s.saveSigning)
 	authed("POST /settings/test-smtp", s.testSMTP)
-	authed("POST /settings/test-smtp-saved", s.testSMTPSaved)
 	authed("POST /settings/restart", s.restart)
 	authed("POST /settings/test-send", s.testSend)
 	authed("GET /settings/guide", s.guidePreview)
@@ -311,10 +315,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.throttle.Success(ip)
-	sess := s.sessions.Create()
+	// The current lifetime: a saved change applies to the next login, and
+	// sessions already open keep theirs.
+	ttl := s.Config().Dashboard.SessionTTL.D()
+	sess := s.sessions.Create(ttl)
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: sess.ID, Path: "/", HttpOnly: true, Secure: r.TLS != nil,
-		SameSite: http.SameSiteStrictMode, MaxAge: int(s.Config.Dashboard.SessionTTL.D().Seconds()),
+		SameSite: http.SameSiteStrictMode, MaxAge: int(ttl.Seconds()),
 	})
 	s.Log.Info("dashboard login", "ip", ip)
 	http.Redirect(w, r, next, http.StatusSeeOther)
@@ -340,7 +347,7 @@ func (s *Server) verifyPassword(ctx context.Context, password string) bool {
 	case <-ctx.Done():
 		return false
 	}
-	return auth.VerifyPassword(s.Config.Dashboard.AdminPasswordHash, password)
+	return auth.VerifyPassword(s.Config().Dashboard.AdminPasswordHash, password)
 }
 
 // safeNext only allows local paths as post-login redirects: no scheme, no
@@ -371,11 +378,10 @@ type page struct {
 	LoggedIn bool
 	Data     any
 
-	// Saved settings not in effect yet (dotted keys) and when they were
-	// saved; problems with the stored settings at boot. Logged in only.
-	Pending      []string
-	SavedAt      time.Time
-	LoadProblems []string
+	// Whether config.yaml changed since this start (a restart applies it),
+	// and problems with the stored settings at boot. Logged in only.
+	ConfigChanged bool
+	LoadProblems  []string
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, name, title string, data any) {
@@ -391,8 +397,9 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request, status int
 	p := page{Title: title, Nav: name, Section: sectionOf(name), Data: data}
 	if sess := sessionFrom(r); sess != nil {
 		p.CSRF, p.Flash, p.LoggedIn = sess.CSRF, sess.PopFlash(), true
+		p.ConfigChanged = s.configChanged()
 		if s.Settings != nil {
-			p.Pending, p.SavedAt, p.LoadProblems = s.Settings.Pending(), s.Settings.SavedAt(), s.Settings.LoadProblems()
+			p.LoadProblems = s.Settings.LoadProblems()
 		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -418,6 +425,9 @@ func sectionOf(name string) string {
 	}
 	return ""
 }
+
+// configChanged reports whether config.yaml changed since this start.
+func (s *Server) configChanged() bool { return s.ConfigChanged != nil && s.ConfigChanged() }
 
 func (s *Server) flash(r *http.Request, kind, format string, args ...any) {
 	if sess := sessionFrom(r); sess != nil {

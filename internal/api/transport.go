@@ -26,6 +26,12 @@ type netInfo struct {
 	external bool
 }
 
+// newNetInfo returns the netInfo for a configuration. It is cheap: build
+// one per request from the current configuration.
+func newNetInfo(cfg *config.Config) netInfo {
+	return netInfo{trusted: cfg.API.TrustedNets, external: cfg.API.ExternalTransportEncryption}
+}
+
 func (n *netInfo) peer(r *http.Request) netip.Addr {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

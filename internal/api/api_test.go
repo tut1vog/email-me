@@ -29,6 +29,7 @@ import (
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
+	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/testutil"
 	"github.com/tut1vog/email-me/internal/units"
 	"github.com/tut1vog/email-me/internal/upstream"
@@ -921,5 +922,67 @@ func TestUpstreamNotConfigured(t *testing.T) {
 	}
 	if h.env.SMTP.Count() != 0 {
 		t.Fatal("nothing must be sent")
+	}
+}
+
+func TestSettingsApplyWithoutRestart(t *testing.T) {
+	h := newHarness(t, testutil.Options{})
+	ctx := context.Background()
+	a, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"})})
+	save := func(f func(*config.Settings)) {
+		t.Helper()
+		s := h.settings.Saved()
+		f(&s)
+		if _, err := h.settings.Save(ctx, s, settings.PasswordChange{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// api.docs: the guide needs a token from the next request on.
+	if r := h.do("GET", "/", "", nil); r.status != 200 {
+		t.Fatalf("public guide: %d", r.status)
+	}
+	save(func(s *config.Settings) { s.API.Docs = "authenticated" })
+	if r := h.do("GET", "/", "", nil); r.status != 401 || r.code(t) != "unauthorized" {
+		t.Fatalf("guide after api.docs authenticated: %d", r.status)
+	}
+	if r := h.do("GET", "/openapi.json", tok, nil); r.status != 200 {
+		t.Fatalf("spec with a token: %d", r.status)
+	}
+	save(func(s *config.Settings) { s.API.Docs = "public" })
+	if r := h.do("GET", "/", "", nil); r.status != 200 {
+		t.Fatalf("guide after api.docs public: %d", r.status)
+	}
+
+	// audit.log_subject: the next row keeps its subject.
+	if r := h.do("POST", "/v1/messages", tok, msg("me", "first", "b")); r.status != 200 {
+		t.Fatalf("send: %d %s", r.status, r.body)
+	}
+	save(func(s *config.Settings) { s.Audit.LogSubject = true })
+	if r := h.do("POST", "/v1/messages", tok, msg("me", "second", "b")); r.status != 200 {
+		t.Fatalf("send: %d %s", r.status, r.body)
+	}
+	if rows := h.auditRows(a.ID); len(rows) != 2 || !strings.Contains(rows[0].Subject, "second") || rows[1].Subject != "" {
+		t.Fatalf("audit subjects: %q, %q", rows[0].Subject, rows[1].Subject)
+	}
+
+	// upstream: the next send goes to the newly saved server.
+	other := testutil.StartSMTP(t)
+	save(func(s *config.Settings) { s.Upstream.SMTP.Host, s.Upstream.SMTP.Port = other.Host, other.Port })
+	if r := h.do("POST", "/v1/messages", tok, msg("me", "third", "b")); r.status != 200 {
+		t.Fatalf("send: %d %s", r.status, r.body)
+	}
+	if other.Count() != 1 || h.env.SMTP.Count() != 2 {
+		t.Fatalf("delivered to the new server %d, the old one %d", other.Count(), h.env.SMTP.Count())
+	}
+
+	// defaults.policy.rate_limit: an agent that inherits it is held to it at once.
+	save(func(s *config.Settings) { s.Defaults.Policy.RateLimit = &policy.RateLimit{PerHour: 1, PerDay: 10} })
+	_, tokB := h.agent("b", policy.Policy{Recipients: ptr([]string{"me"})})
+	if r := h.do("POST", "/v1/messages", tokB, msg("me", "s", "b")); r.status != 200 {
+		t.Fatalf("first send: %d %s", r.status, r.body)
+	}
+	if r := h.do("POST", "/v1/messages", tokB, msg("me", "s", "b")); r.status != 429 || r.code(t) != "rate_limited" {
+		t.Fatalf("second send under the saved default: %d %s", r.status, r.body)
 	}
 }

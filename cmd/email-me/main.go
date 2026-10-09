@@ -3,8 +3,8 @@
 //	email-me serve [--config /config/config.yaml]   (default command)
 //	email-me healthcheck [--config ...]             (for Docker HEALTHCHECK)
 //
-// serve restarts in place on SIGHUP or from the dashboard, to apply saved
-// settings and edits to config.yaml.
+// Settings saved on the dashboard apply at once. serve restarts in place on
+// SIGHUP or from the dashboard, to apply edits to config.yaml.
 package main
 
 import (
@@ -29,6 +29,7 @@ import (
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/dashboard"
 	"github.com/tut1vog/email-me/internal/keys"
+	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
@@ -87,8 +88,8 @@ type runHooks struct {
 
 // serve runs the gateway until SIGINT or SIGTERM. A restart (the
 // dashboard's Restart button or SIGHUP) ends one run and starts the next in
-// the same process, reloading config.yaml and the saved settings; if the
-// next run cannot start, serve returns its error.
+// the same process, reloading config.yaml; if the next run cannot start,
+// serve returns its error.
 func serve(cfgPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -125,6 +126,9 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	defer st.Close()
 
 	// Settings first: they complete cfg (upstream, default policy, ...).
+	// From here on, everything reads the current configuration through sm,
+	// so a saved setting applies at once; cfg itself is used only for the
+	// bootstrap keys, which need a restart.
 	sm, _, err := settings.Bootstrap(runCtx, st, cfg, log)
 	if err != nil {
 		return err
@@ -133,7 +137,7 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		log.Warn(w)
 	}
 
-	reg, seeded, err := recipients.Bootstrap(runCtx, st, cfg)
+	reg, seeded, err := recipients.Bootstrap(runCtx, st, cfg, func() policy.Effective { return sm.Current().DefaultPolicy })
 	if err != nil {
 		return err
 	}
@@ -147,12 +151,12 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		log.Warn("defaults.policy.recipients names recipients that do not exist; they are ignored", "aliases", u)
 	}
 
-	km := keys.NewManager(st, keysOptions(cfg))
+	km := keys.NewManager(st, keysOptions(cfg, sm))
 	if km.Enabled() {
 		n, err := km.EnsureAll(runCtx)
 		switch {
 		case errors.Is(err, keys.ErrNoFrom):
-			log.Warn("some agents have no signing key; they get one once upstream.from is set on the Settings page and the gateway restarted")
+			log.Warn("some agents have no signing key; they get one once upstream.from is set on the Settings page")
 		case err != nil:
 			return fmt.Errorf("checking signing keys: %w", err)
 		}
@@ -175,23 +179,32 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		return nil
 	}
 
-	sender := upstream.NewSMTP(cfg.Upstream.SMTP)
-	auditW := audit.NewWriter(st, cfg.Audit.LogSubject, log)
+	// configChanged re-hashes config.yaml when a dashboard page renders:
+	// the file is small, and an unreadable one counts as changed.
+	configChanged := func() bool {
+		fp, err := config.FileFingerprint(cfgPath)
+		return err != nil || fp != cfg.Fingerprint
+	}
+
+	sender := upstream.NewDynamic(func() config.SMTP { return sm.Current().Upstream.SMTP })
+	auditW := audit.NewWriter(st, func() bool { return sm.Current().Audit.LogSubject }, log)
 	apiSrv := api.New(api.Deps{
-		Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: sender,
+		Config: sm.Current, Store: st, Recipients: reg, Keys: km, Sender: sender,
 		Limiter: ratelimit.New(st), Audit: auditW, Log: log.With("component", "api"),
 	})
-	dash, err := dashboard.New(dashboard.Deps{Config: cfg, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: sender,
-		Log: log.With("component", "dashboard"), Restart: requestRestart})
+	dash, err := dashboard.New(dashboard.Deps{Config: sm.Current, Store: st, Recipients: reg, Settings: sm, Keys: km, Sender: sender,
+		Log: log.With("component", "dashboard"), Restart: requestRestart, ConfigChanged: configChanged})
 	if err != nil {
 		return err
 	}
 
+	// Write timeouts are fixed: the handlers that wait on the upstream
+	// server extend their own deadline by the current upstream timeout.
 	apiHTTP := &http.Server{
 		Handler:           apiSrv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       2 * time.Minute,
-		WriteTimeout:      cfg.Upstream.SMTP.Timeout.D() + 2*time.Minute,
+		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
@@ -203,7 +216,7 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		Handler:           dash.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      cfg.Upstream.SMTP.Timeout.D() + time.Minute,
+		WriteTimeout:      time.Minute,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
@@ -224,7 +237,9 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	retention := make(chan struct{})
 	go func() {
 		defer close(retention)
-		audit.RunRetention(runCtx, st, time.Duration(cfg.Audit.RetentionDays)*24*time.Hour, log)
+		audit.RunRetention(runCtx, st, func() time.Duration {
+			return time.Duration(sm.Current().Audit.RetentionDays) * 24 * time.Hour
+		}, log)
 	}()
 
 	errc := make(chan error, 2)
@@ -259,7 +274,7 @@ wait:
 			log.Info("shutting down")
 			break wait
 		case <-restart:
-			log.Info("restarting to apply saved settings", "pending", sm.Pending())
+			log.Info("restarting to re-read config.yaml")
 			// Let the restarting page load its stylesheet and script first.
 			time.Sleep(hooks.grace)
 			result = errRestart
@@ -269,7 +284,7 @@ wait:
 				log.Error("SIGHUP: not restarting: config.yaml no longer loads", "err", err)
 				continue
 			}
-			log.Info("SIGHUP: restarting", "pending", sm.Pending())
+			log.Info("SIGHUP: restarting to re-read config.yaml")
 			result = errRestart
 			break wait
 		case err := <-errc: // a listener failed: stop the other and exit
@@ -279,7 +294,7 @@ wait:
 	}
 	// API first, so in-flight sends finish; then the dashboard, then the
 	// retention job; the store closes last (deferred).
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Upstream.SMTP.Timeout.D()+10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), sm.Current().Upstream.SMTP.Timeout.D()+10*time.Second)
 	defer cancel()
 	if err := apiHTTP.Shutdown(shutdownCtx); err != nil {
 		apiHTTP.Close()
@@ -292,10 +307,19 @@ wait:
 	return result
 }
 
-func keysOptions(cfg *config.Config) keys.Options {
-	o := keys.Options{Email: cfg.Upstream.From}
+// keysOptions configures signing from config.yaml's bootstrap keys; the
+// From address and key validity of new keys follow the saved settings.
+func keysOptions(cfg *config.Config, sm *settings.Manager) keys.Options {
+	o := keys.Options{From: func() (string, time.Duration) {
+		c := sm.Current()
+		var validity time.Duration
+		if c.Signing != nil {
+			validity = c.Signing.KeyValidity.D()
+		}
+		return c.Upstream.From, validity
+	}}
 	if cfg.Signing != nil {
-		o.KEK, o.Validity, o.Master = cfg.Signing.KEK, cfg.Signing.KeyValidity.D(), cfg.Signing.Master
+		o.KEK, o.Master = cfg.Signing.KEK, cfg.Signing.Master
 	}
 	return o
 }

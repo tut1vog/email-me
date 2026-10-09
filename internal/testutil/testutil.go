@@ -25,6 +25,7 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
@@ -298,8 +299,8 @@ func NewEnv(t testing.TB, o Options) *Env {
 func Bootstrap(t testing.TB, env *Env) (*store.Store, *recipients.Registry) {
 	t.Helper()
 	st := OpenStore(t, env)
-	BootstrapSettings(t, env, st)
-	reg, _, err := recipients.Bootstrap(context.Background(), st, env.Config)
+	sm := BootstrapSettings(t, env, st)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, env.Config, DefaultPolicy(sm))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +320,7 @@ func OpenStore(t testing.TB, env *Env) *store.Store {
 
 // BootstrapSettings loads the managed settings from st into env.Config,
 // seeding st from the config on first use. Call it before
-// recipients.Bootstrap, which needs the default policy.
+// recipients.Bootstrap, which needs the default policy (DefaultPolicy).
 func BootstrapSettings(t testing.TB, env *Env, st *store.Store) *settings.Manager {
 	t.Helper()
 	m, _, err := settings.Bootstrap(context.Background(), st, env.Config, DiscardLogger())
@@ -327,6 +328,12 @@ func BootstrapSettings(t testing.TB, env *Env, st *store.Store) *settings.Manage
 		t.Fatal(err)
 	}
 	return m
+}
+
+// DefaultPolicy returns the current default policy of m, as serve passes
+// it to recipients.Bootstrap.
+func DefaultPolicy(m *settings.Manager) func() policy.Effective {
+	return func() policy.Effective { return m.Current().DefaultPolicy }
 }
 
 func quoteAll(ss []string) []string {

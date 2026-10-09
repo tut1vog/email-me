@@ -22,6 +22,7 @@ import (
 	"github.com/tut1vog/email-me/internal/api/docs"
 	"github.com/tut1vog/email-me/internal/audit"
 	"github.com/tut1vog/email-me/internal/auth"
+	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
@@ -90,20 +91,27 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	cfg := env.Config
 	st := testutil.OpenStore(t, env)
 	sm := testutil.BootstrapSettings(t, env, st)
-	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg)
+	reg, _, err := recipients.Bootstrap(context.Background(), st, cfg, testutil.DefaultPolicy(sm))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ko := keys.Options{Email: cfg.Upstream.From}
+	ko := keys.Options{From: func() (string, time.Duration) {
+		c := sm.Current()
+		if c.Signing == nil {
+			return c.Upstream.From, 0
+		}
+		return c.Upstream.From, c.Signing.KeyValidity.D()
+	}}
 	if cfg.Signing != nil {
-		ko.KEK, ko.Validity, ko.Master = cfg.Signing.KEK, cfg.Signing.KeyValidity.D(), cfg.Signing.Master
+		ko.KEK, ko.Master = cfg.Signing.KEK, cfg.Signing.Master
 	}
 	km := keys.NewManager(st, ko)
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := api.New(api.Deps{
-		Config: cfg, Store: st, Recipients: reg, Keys: km, Sender: upstream.NewSMTP(cfg.Upstream.SMTP),
-		Limiter: ratelimit.New(st), Audit: audit.NewWriter(st, cfg.Audit.LogSubject, log), Log: log,
+		Config: sm.Current, Store: st, Recipients: reg, Keys: km,
+		Sender:  upstream.NewDynamic(func() config.SMTP { return sm.Current().Upstream.SMTP }),
+		Limiter: ratelimit.New(st), Audit: audit.NewWriter(st, func() bool { return sm.Current().Audit.LogSubject }, log), Log: log,
 	})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)

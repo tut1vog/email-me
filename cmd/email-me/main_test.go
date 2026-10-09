@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -146,8 +147,9 @@ func (g *gateway) session() string {
 	return ""
 }
 
-func TestRestartLoop(t *testing.T) {
-	g := startGateway(t, testutil.NewEnv(t, testutil.Options{}))
+func TestSettingsApplyWithoutRestart(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	g := startGateway(t, env)
 	boot := g.bootID()
 	if status, _ := g.get(g.api + "/"); status != http.StatusOK {
 		t.Fatalf("public guide: %d", status)
@@ -156,8 +158,53 @@ func TestRestartLoop(t *testing.T) {
 	if status, _ := g.post("/settings/api", g.form("docs", "authenticated")); status != http.StatusSeeOther {
 		t.Fatalf("saving api settings: %d", status)
 	}
-	if status, _ := g.get(g.api + "/"); status != http.StatusOK {
-		t.Fatal("a saved setting must not apply before the restart")
+	if status, _ := g.get(g.api + "/"); status != http.StatusUnauthorized {
+		t.Fatalf("api.docs authenticated must apply at once: %d", status)
+	}
+
+	// The upstream server changes for the next send.
+	other := testutil.StartSMTP(t)
+	if status, _ := g.post("/settings/upstream", g.form("host", other.Host, "port", strconv.Itoa(other.Port), "security", "none",
+		"username", env.SMTP.User, "timeout", "5s", "from", "gateway@example.com")); status != http.StatusSeeOther {
+		t.Fatalf("saving upstream settings: %d", status)
+	}
+	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther {
+		t.Fatalf("test send: %d", status)
+	}
+	if other.Count() != 1 || env.SMTP.Count() != 0 {
+		t.Fatalf("test send: new server %d, old server %d", other.Count(), env.SMTP.Count())
+	}
+
+	g.noRestart()
+	if g.bootID() != boot {
+		t.Fatal("saving settings must not restart")
+	}
+	if status, body := g.get(g.dash + "/settings"); status != http.StatusOK || strings.Contains(body, `id="restart-banner"`) {
+		t.Fatalf("the session stays and no restart is asked for: %d", status)
+	}
+}
+
+func TestRestartForConfigFile(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	g := startGateway(t, env)
+	boot := g.bootID()
+	g.login()
+	if _, body := g.get(g.dash + "/settings"); strings.Contains(body, `id="restart-banner"`) {
+		t.Fatal("no banner while config.yaml is unchanged")
+	}
+	edit := func(comment string) {
+		t.Helper()
+		data, err := os.ReadFile(env.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(env.Path, append(data, "# "+comment+"\n"...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	edit("edited")
+	if _, body := g.get(g.dash + "/agents"); !strings.Contains(body, `id="restart-banner"`) {
+		t.Fatal("a changed config.yaml must ask for a restart")
 	}
 	old := g.session()
 
@@ -168,9 +215,6 @@ func TestRestartLoop(t *testing.T) {
 	g.waitStarted()
 	if g.bootID() == boot {
 		t.Fatal("a restart must change the boot id")
-	}
-	if status, _ := g.get(g.api + "/"); status != http.StatusUnauthorized {
-		t.Fatalf("api.docs authenticated must apply after the restart: %d", status)
 	}
 	req, _ := http.NewRequest("GET", g.dash+"/settings", nil)
 	req.AddCookie(&http.Cookie{Name: "email_me_session", Value: old})
@@ -183,16 +227,24 @@ func TestRestartLoop(t *testing.T) {
 		t.Fatalf("sessions must not survive a restart: %d", res.StatusCode)
 	}
 	g.login()
-	if _, body := g.get(g.dash + "/settings"); !strings.Contains(body, "The running settings match the saved ones.") || strings.Contains(body, `id="restart-banner"`) {
-		t.Fatal("nothing is pending after the restart")
+	if _, body := g.get(g.dash + "/settings"); strings.Contains(body, `id="restart-banner"`) || !strings.Contains(body, "config.yaml is unchanged since email-me started.") {
+		t.Fatal("the restart applied config.yaml: no banner")
 	}
 
 	// SIGHUP restarts the same way.
+	edit("edited again")
+	if _, body := g.get(g.dash + "/settings"); !strings.Contains(body, `id="restart-banner"`) {
+		t.Fatal("a changed config.yaml must ask for a restart")
+	}
 	boot = g.bootID()
 	g.hup <- syscall.SIGHUP
 	g.waitStarted()
 	if g.bootID() == boot {
 		t.Fatal("SIGHUP must restart")
+	}
+	g.login()
+	if _, body := g.get(g.dash + "/settings"); strings.Contains(body, `id="restart-banner"`) {
+		t.Fatal("SIGHUP applied config.yaml: no banner")
 	}
 }
 

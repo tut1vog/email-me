@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
@@ -23,13 +25,10 @@ func (d *dash) saved(p page, card string) string {
 	return d.get("/settings").body
 }
 
-func TestSettingsUpstreamCardAndRestartBanner(t *testing.T) {
+func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
 	env := d.env
-	if b := d.get("/agents").body; strings.Contains(b, "Restart to apply") {
-		t.Fatal("no banner before anything is saved")
-	}
 
 	// A second server with other credentials: the saved settings point there.
 	other := testutil.StartSMTP(t)
@@ -38,40 +37,36 @@ func TestSettingsUpstreamCardAndRestartBanner(t *testing.T) {
 	body := d.saved(d.post("/settings/upstream", d.form("host", "127.0.0.1", "port", port, "security", "none",
 		"username", other.User, "password", "other-secret", "timeout", "5s", "from", "gateway@example.com",
 		"from_name_template", "{agent} via email-me")), "upstream")
-	if !strings.Contains(body, "Upstream SMTP settings saved. Restart to apply.") || strings.Contains(body, "other-secret") ||
+	if !strings.Contains(body, "Upstream SMTP settings saved and applied.") || strings.Contains(body, "other-secret") ||
 		!strings.Contains(body, `value="`+port+`"`) {
 		t.Fatal("saved upstream settings must be shown, the password never")
 	}
-	if got := d.settings.Pending(); !slices.Equal(got, []string{"upstream.smtp.password", "upstream.smtp.port"}) {
-		t.Fatalf("pending = %v", got)
+	if got := d.settings.Current().Upstream.SMTP; got.Port != other.Port || got.Password != "other-secret" {
+		t.Fatalf("current upstream = %+v", got)
 	}
-	agents := d.get("/agents").body
-	for _, want := range []string{"Restart to apply.", "<code>upstream.smtp.port</code>", "<code>upstream.smtp.password</code>", "just now", `href="/settings#restart"`} {
-		if !strings.Contains(agents, want) {
-			t.Errorf("banner on other pages lacks %q", want)
+	for _, path := range []string{"/agents", "/"} {
+		if b := d.get(path).body; strings.Contains(b, `id="restart-banner"`) || strings.Contains(b, "Restart to apply") {
+			t.Errorf("%s: saved settings need no restart", path)
 		}
 	}
-	if o := d.get("/").body; !strings.Contains(o, "Saved settings are not in effect yet") {
-		t.Error("pending settings must be on the attention list")
+	if strings.Contains(body, "test-smtp-saved") || !strings.Contains(body, "Not checked yet.") {
+		t.Fatal("the tests run against the settings in effect; there is no separate test of saved ones")
 	}
 
-	// The running sender is unchanged; the saved one can be tested.
-	if !strings.Contains(body, `action="/settings/test-smtp-saved"`) {
-		t.Fatal("Test saved settings is offered while upstream changes are pending")
-	}
-	d.post("/settings/test-smtp-saved", d.form())
-	if b := d.get("/settings").body; !strings.Contains(b, "with the saved settings") {
-		t.Fatal("saved settings test must reach the second server")
+	// The tests and agents' sends use the new server at once.
+	d.post("/settings/test-smtp", d.form("back", "/settings#upstream"))
+	if b := d.get("/settings").body; !strings.Contains(b, "Connected and authenticated to 127.0.0.1:"+port) {
+		t.Fatal("the connection test must reach the new server")
 	}
 	d.post("/settings/test-send", d.form("alias", "me"))
-	if env.SMTP.Count() != 1 || other.Count() != 0 {
-		t.Fatal("test send must use the running sender until a restart")
+	if env.SMTP.Count() != 0 || other.Count() != 1 {
+		t.Fatalf("test send: old server %d, new server %d", env.SMTP.Count(), other.Count())
 	}
 	d.saved(d.post("/settings/upstream", d.form("host", "127.0.0.1", "port", port, "security", "none",
 		"username", other.User, "password", "wrong", "timeout", "5s", "from", "gateway@example.com")), "upstream")
-	d.post("/settings/test-smtp-saved", d.form())
-	if b := d.get("/settings").body; !strings.Contains(b, "Saved SMTP settings test failed") {
-		t.Fatal("a wrong saved password must fail the saved settings test")
+	d.post("/settings/test-smtp", d.form("back", "/settings#upstream"))
+	if b := d.get("/settings").body; !strings.Contains(b, "SMTP connection test failed") {
+		t.Fatal("a wrong password must fail the connection test")
 	}
 
 	// Removing and replacing the password at once is refused.
@@ -85,18 +80,27 @@ func TestSettingsUpstreamCardAndRestartBanner(t *testing.T) {
 		t.Fatalf("username without password: %d", p.status)
 	}
 
-	// Reverting to the running values clears the banner.
-	body = d.saved(d.post("/settings/upstream", d.form("host", env.SMTP.Host, "port", strconv.Itoa(env.SMTP.Port), "security", "none",
-		"username", env.SMTP.User, "password", env.SMTP.Pass, "timeout", "5s", "from", "gateway@example.com",
-		"from_name_template", "{agent} via email-me")), "upstream")
-	if len(d.settings.Pending()) != 0 || strings.Contains(body, "Restart to apply.") || !strings.Contains(body, "no restart is needed") {
-		t.Fatalf("reverted settings must clear the banner: %v", d.settings.Pending())
+	// Back to the first server; saving the same values again changes nothing.
+	revert := []string{"host", env.SMTP.Host, "port", strconv.Itoa(env.SMTP.Port), "security", "none",
+		"username", env.SMTP.User, "timeout", "5s", "from", "gateway@example.com", "from_name_template", "{agent} via email-me"}
+	body = d.saved(d.post("/settings/upstream", d.form(append(revert, "password", env.SMTP.Pass)...)), "upstream")
+	if !strings.Contains(body, "Upstream SMTP settings saved and applied.") {
+		t.Fatal("reverting is a change")
+	}
+	body = d.saved(d.post("/settings/upstream", d.form(revert...)), "upstream")
+	if !strings.Contains(body, "Upstream SMTP settings saved; nothing changed.") {
+		t.Fatal("an unchanged save must say so")
+	}
+	d.post("/settings/test-send", d.form("alias", "me"))
+	if env.SMTP.Count() != 1 || other.Count() != 1 {
+		t.Fatalf("after reverting: old server %d, new server %d", env.SMTP.Count(), other.Count())
 	}
 }
 
 func TestSettingsCardsValidate(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
+	before := d.settings.Saved()
 	for _, c := range []struct {
 		card string
 		kv   []string
@@ -120,8 +124,8 @@ func TestSettingsCardsValidate(t *testing.T) {
 			t.Errorf("%s: the submitted value must be shown again", c.card)
 		}
 	}
-	if len(d.settings.Pending()) != 0 {
-		t.Fatal("rejected saves must not store anything")
+	if len(config.DiffSettings(d.settings.Saved(), before)) != 0 || d.settings.Current() != d.env.Config {
+		t.Fatal("rejected saves must not store or apply anything")
 	}
 
 	d.saved(d.post("/settings/api", d.form("docs", "authenticated", "trusted_proxies", "10.0.0.0/8, 192.168.1.1 172.16.0.0/12",
@@ -142,11 +146,18 @@ func TestSettingsCardsValidate(t *testing.T) {
 	}
 	want := []string{"api.docs", "api.external_transport_encryption", "api.public_url", "api.trusted_proxies",
 		"audit.log_subject", "audit.retention_days", "dashboard.session_ttl", "signing.key_validity"}
-	if got := d.settings.Pending(); !slices.Equal(got, want) {
-		t.Fatalf("pending = %v", got)
+	if got := config.DiffSettings(before, d.settings.Current().Managed()); !slices.Equal(got, want) {
+		t.Fatalf("applied = %v", got)
 	}
-	if d.env.Config.API.Docs != "public" {
-		t.Fatal("saving must not change the running settings")
+	if !strings.Contains(body, "Signing settings saved and applied.") || d.env.Config.API.Docs != "public" {
+		t.Fatal("a save applies a new configuration; the boot one is never modified")
+	}
+
+	// The session lifetime applies to the next login.
+	d.post("/logout", d.form())
+	p := d.post("/login", url.Values{"password": {d.env.AdminPW}, "next": {"/"}})
+	if c := p.header.Get("Set-Cookie"); p.status != http.StatusSeeOther || !strings.Contains(c, "Max-Age=7200") {
+		t.Fatalf("login after session_ttl 2h: %d %q", p.status, c)
 	}
 
 	nd := newDash(t, testutil.Options{})
@@ -179,7 +190,7 @@ func TestSettingsDefaultPolicyCard(t *testing.T) {
 	body = d.saved(d.post("/settings/policy", d.form("ov_recipients", "on", "recipients", "me", "recipients", "ghost",
 		"ov_services", "on", "services", "markdown", "services", "e2e", "require_signing", "false",
 		"ov_rate", "on", "per_hour", "5", "per_day", "50")), "policy")
-	if !strings.Contains(body, "Default policy saved. Restart to apply.") || !strings.Contains(body, "do not exist and are ignored: ghost") {
+	if !strings.Contains(body, "Default policy saved and applied.") || !strings.Contains(body, "do not exist and are ignored: ghost") {
 		t.Fatal("unknown aliases must be noted")
 	}
 	pol := d.settings.Saved().Defaults.Policy
@@ -191,8 +202,9 @@ func TestSettingsDefaultPolicyCard(t *testing.T) {
 		!strings.Contains(body, `name="ov_max_att" >`) {
 		t.Fatal("the saved policy must round-trip into the form")
 	}
-	if !slices.Equal(d.settings.Pending(), []string{"defaults.policy.rate_limit", "defaults.policy.recipients", "defaults.policy.require_signing", "defaults.policy.services"}) {
-		t.Fatalf("pending = %v", d.settings.Pending())
+	// Agents that inherit the default policy get it at once.
+	if eff := d.reg.Effective(policy.Policy{}); eff.RateLimit.PerHour != 5 || eff.RequireSigning || strings.Join(eff.Recipients, ",") != "me" {
+		t.Fatalf("effective default policy: %+v", eff)
 	}
 
 	// Without a KEK, require_signing is refused.
@@ -232,6 +244,17 @@ func TestSettingsLoadProblemsNotice(t *testing.T) {
 	if o := d.get("/").body; !strings.Contains(o, "Saved settings") {
 		t.Error("load problems must be on the attention list")
 	}
+
+	// A valid save replaces the broken settings: the problems are gone at once.
+	d.saved(d.post("/settings/api", d.form("docs", "public")), "api")
+	if len(d.settings.LoadProblems()) != 0 {
+		t.Fatalf("after a valid save: %v", d.settings.LoadProblems())
+	}
+	for _, path := range []string{"/", "/settings"} {
+		if b := d.get(path).body; strings.Contains(b, "The saved settings have problems.") || strings.Contains(b, "cannot be decoded") {
+			t.Errorf("%s still shows the load problems", path)
+		}
+	}
 }
 
 func TestSettingsUpstreamNotConfigured(t *testing.T) {
@@ -269,6 +292,19 @@ func TestSettingsUpstreamNotConfigured(t *testing.T) {
 	}
 	if o := d.get("/").body; !strings.Contains(o, "One can be generated once a From address is set") {
 		t.Error("the missing key notice must point at the From address")
+	}
+
+	// Saving a From address applies it and gives the agent its key.
+	body := d.saved(d.post("/settings/upstream", d.form("host", d.env.SMTP.Host, "port", strconv.Itoa(d.env.SMTP.Port), "security", "none",
+		"from", "gateway@example.com")), "upstream")
+	if !strings.Contains(body, "Upstream SMTP settings saved and applied. Generated a signing key for 1 agent.") {
+		t.Fatal("saving a From address must generate the missing keys")
+	}
+	if _, err := d.st.ActiveKey(context.Background(), a.ID); err != nil {
+		t.Fatalf("no key after saving a From address: %v", err)
+	}
+	if o := d.get("/").body; strings.Contains(o, "Configure SMTP") || strings.Contains(o, "No signing key") {
+		t.Error("the upstream and key notices must be gone")
 	}
 }
 
@@ -317,12 +353,25 @@ func TestRestartFromDashboard(t *testing.T) {
 	}
 	d.login()
 	d.saved(d.post("/settings/audit", d.form("retention_days", "60")), "audit")
+	if b := d.get("/agents").body; strings.Contains(b, `id="restart-banner"`) {
+		t.Fatal("no banner while config.yaml is unchanged")
+	}
+	if s := d.get("/settings").body; !strings.Contains(s, "config.yaml is unchanged since email-me started.") {
+		t.Fatal("the restart card says config.yaml is unchanged")
+	}
+
+	// config.yaml changes on disk: every page offers the restart.
+	d.configChanged.Store(true)
 	banner := d.get("/agents").body
-	if !strings.Contains(banner, `action="/settings/restart"`) || !strings.Contains(banner, "data-confirm=") {
+	if !strings.Contains(banner, `id="restart-banner"`) || !strings.Contains(banner, "changed on disk") ||
+		!strings.Contains(banner, `action="/settings/restart"`) || !strings.Contains(banner, "data-confirm=") {
 		t.Fatal("the restart banner offers Restart now, with a confirmation")
 	}
-	if s := d.get("/settings").body; !strings.Contains(s, `id="restart"`) || !strings.Contains(s, "<code>audit.retention_days</code>") {
-		t.Fatal("the restart card lists the pending keys")
+	if o := d.get("/").body; !strings.Contains(o, "Restart to apply") {
+		t.Error("a changed config.yaml must be on the attention list")
+	}
+	if s := d.get("/settings").body; !strings.Contains(s, `<span class="tag warn">changed</span>`) || !strings.Contains(s, "config.yaml changed on disk since email-me started.") {
+		t.Fatal("the restart card says config.yaml changed")
 	}
 
 	// config.yaml no longer loads: nothing restarts and the session stays.

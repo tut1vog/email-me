@@ -88,6 +88,7 @@ type prepared struct {
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	c := callerFrom(r)
+	cfg := s.Config()
 	entry := &store.AuditEntry{
 		AgentID: c.agent.ID, TokenID: c.token.ID, SourceIP: c.ip.String(), Transport: c.transport,
 	}
@@ -113,6 +114,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	defer done()
 
+	// The server's write timeout is fixed, but the upstream timeout is a
+	// setting: give this response room for the current one.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(cfg.Upstream.SMTP.Timeout.D() + 2*time.Minute))
+
 	limit := c.policy.MaxMessageBytes*4/3 + 64<<10
 	req, e := decodeSend(http.MaxBytesReader(w, r.Body, limit), c.policy.MaxMessageBytes)
 	if e != nil {
@@ -137,7 +142,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		defer finish(nil) // released unless a success was cached below
 	}
 
-	p, e := s.prepare(r.Context(), c, req)
+	p, e := s.prepare(r.Context(), cfg, c, req)
 	if p != nil {
 		entry.Recipients, entry.Services, entry.SizeBytes, entry.AttachmentCount = p.aliases, p.services, p.size, p.nAttach
 		entry.Encrypted, entry.Signed, entry.SigningKeyFpr, entry.Subject = p.encrypted, p.signed, p.fpr, p.subject
@@ -172,9 +177,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	// Delivery is not tied to the client connection: if the agent disconnects
 	// mid-send, the outcome is still recorded (and cached for idempotent retries).
-	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.Config.Upstream.SMTP.Timeout.D()+5*time.Second)
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), cfg.Upstream.SMTP.Timeout.D()+5*time.Second)
 	defer cancel()
-	if err := s.Sender.Send(sendCtx, s.Config.Upstream.From, p.recipients, raw); err != nil {
+	if err := s.Sender.Send(sendCtx, cfg.Upstream.From, p.recipients, raw); err != nil {
 		code := 0
 		var ue *upstream.Error
 		if errors.As(err, &ue) {
@@ -259,8 +264,8 @@ func (s *Server) internalErr(what string, err error) *apiError {
 
 // prepare validates the request, applies the agent's policy in the order
 // recipients → services → size/type → encryption → signing, and builds the
-// message. It returns partial audit metadata even on failure.
-func (s *Server) prepare(ctx context.Context, c *caller, req *sendRequest) (*prepared, *apiError) {
+// message under cfg. It returns partial audit metadata even on failure.
+func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req *sendRequest) (*prepared, *apiError) {
 	pol := c.policy
 	p := &prepared{}
 
@@ -507,8 +512,8 @@ func (s *Server) prepare(ctx context.Context, c *caller, req *sendRequest) (*pre
 	// --- build ----------------------------------------------------------
 	prefix := pol.Prefix(c.agent.Name)
 	msg := &compose.Message{
-		FromName:     s.Config.FromName(c.agent.Name),
-		FromAddr:     s.Config.Upstream.From,
+		FromName:     cfg.FromName(c.agent.Name),
+		FromAddr:     cfg.Upstream.From,
 		Subject:      compose.CleanHeaderText(prefix+subject, 998),
 		OuterSubject: compose.CleanHeaderText(prefix+"Encrypted message", 998),
 		Agent:        c.agent.Name,

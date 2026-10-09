@@ -51,32 +51,32 @@ func TestSeedOnlyIntoEmpty(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{DefaultsPolicy: "recipients: [me]", TrustedProxies: []string{"10.0.0.1"}})
 	st := testutil.OpenStore(t, env)
 	// A database from before settings moved there: recipients, no settings.
-	if _, _, err := recipients.Bootstrap(context.Background(), st, env.Config); err != nil {
+	if _, _, err := recipients.Bootstrap(context.Background(), st, env.Config, func() policy.Effective { return env.Config.DefaultPolicy }); err != nil {
 		t.Fatal(err)
 	}
 	m, cfg, seeded := boot(t, env.Path, st)
 	if !seeded {
 		t.Fatal("an empty settings table must be seeded")
 	}
-	r := m.Running()
+	r := m.Saved()
 	if r.Upstream.SMTP.Host != env.SMTP.Host || r.Upstream.SMTP.Port != env.SMTP.Port || r.Upstream.From != "gateway@example.com" || r.API.Docs != "public" {
-		t.Fatalf("running = %+v", r)
+		t.Fatalf("saved = %+v", r)
 	}
 	if cfg.Upstream.SMTP.Password != env.SMTP.Pass || !slices.Equal(cfg.DefaultPolicy.Recipients, []string{"me"}) || len(cfg.API.TrustedNets) != 1 {
 		t.Fatalf("cfg not loaded: %+v", cfg.Managed())
 	}
-	if len(m.Pending()) != 0 || len(m.LoadProblems()) != 0 || m.SavedAt().IsZero() || !m.HasPassword() {
-		t.Fatalf("pending %v, problems %v", m.Pending(), m.LoadProblems())
+	if m.Current() != cfg {
+		t.Fatal("the loaded config is the first current one")
 	}
-	if d := config.DiffSettings(m.Running(), m.Saved()); len(d) != 0 {
-		t.Fatal(d)
+	if len(m.LoadProblems()) != 0 || !m.HasPassword() {
+		t.Fatalf("problems %v", m.LoadProblems())
 	}
 
 	// Later boots ignore the file's managed keys, even if they changed.
 	changed := strings.Replace(env.YAML, "retention_days: 30", "retention_days: 99", 1)
 	p := writeFile(t, filepath.Join(env.Dir, "changed.yaml"), changed)
 	m, cfg, seeded = boot(t, p, st)
-	if seeded || m.Running().Audit.RetentionDays != 30 || cfg.Audit.RetentionDays != 30 {
+	if seeded || m.Current().Audit.RetentionDays != 30 || cfg.Audit.RetentionDays != 30 {
 		t.Fatalf("second boot seeded %v, retention %d", seeded, cfg.Audit.RetentionDays)
 	}
 	if cfg.Upstream.SMTP.Password != env.SMTP.Pass {
@@ -131,16 +131,18 @@ func TestSave(t *testing.T) {
 	if !errors.As(err, &ve) || len(ve.Problems) != 2 {
 		t.Fatalf("want 2 problems, got %v", err)
 	}
-	if len(m.Pending()) != 0 || len(config.DiffSettings(m.Saved(), orig)) != 0 {
+	if m.Current() != cfg || len(config.DiffSettings(m.Saved(), orig)) != 0 {
 		t.Fatal("an invalid save must change nothing")
 	}
 
 	s := m.Saved()
 	s.API.Docs = "authenticated"
 	s.API.PublicURL = "https://gw.example.com/"
+	s.API.TrustedProxies = []string{"10.0.0.0/8"}
 	s.Upstream.SMTP.Port = 0 // blank: default for the security mode
 	f := false
 	s.Defaults.Policy.RequireSigning = &f
+	s.Defaults.Policy.RateLimit = &policy.RateLimit{PerHour: 1, PerDay: 2}
 	if _, err := m.Save(ctx, s, settings.PasswordChange{}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,32 +150,37 @@ func TestSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := m.Saved()
-	if saved.API.PublicURL != "https://gw.example.com" || saved.Upstream.SMTP.Port != 25 || len(saved.API.TrustedProxies) != 2 {
+	if saved.API.PublicURL != "https://gw.example.com" || saved.Upstream.SMTP.Port != 25 || len(saved.API.TrustedProxies) != 1 {
 		t.Fatalf("saved settings must be normalized: %+v", saved)
 	}
-	want := "api.docs,api.public_url,defaults.policy.require_signing,upstream.smtp.port"
-	if got := strings.Join(m.Pending(), ","); got != want {
-		t.Fatalf("pending = %s", got)
+	// They apply at once, derived fields included.
+	c := m.Current()
+	if c.API.Docs != "authenticated" || c.API.PublicURL != "https://gw.example.com" || c.Upstream.SMTP.Port != 25 ||
+		len(c.API.TrustedNets) != 1 || c.API.TrustedNets[0].String() != "10.0.0.0/8" ||
+		c.DefaultPolicy.RateLimit.PerHour != 1 || c.Upstream.SMTP.Password != env.SMTP.Pass {
+		t.Fatalf("current = %+v", c.Managed())
 	}
-	if m.Running().API.Docs != "public" || cfg.API.Docs != "public" {
-		t.Fatal("saved settings apply on restart, not now")
+	if c.Dashboard.AdminPasswordHash != cfg.Dashboard.AdminPasswordHash || c.DataDir != cfg.DataDir {
+		t.Fatal("the bootstrap keys carry over")
 	}
-	if m.SavedSMTP().Password != env.SMTP.Pass || m.SavedSMTP().Port != 25 {
-		t.Fatalf("saved SMTP = %+v", m.SavedSMTP())
+	// The boot config is a snapshot of its own and is never modified.
+	if cfg.API.Docs != "public" || cfg.API.PublicURL != "" || len(cfg.API.TrustedNets) != 2 ||
+		cfg.Upstream.SMTP.Port != env.SMTP.Port || cfg.DefaultPolicy.RateLimit.PerHour == 1 {
+		t.Fatalf("boot config changed: %+v", cfg.Managed())
 	}
 
-	// A password change is pending too; reverting everything clears it.
+	// A new password applies at once too; the previous snapshot keeps its own.
 	if _, err := m.Save(ctx, s, settings.PasswordChange{Set: true, Value: "new-secret"}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(m.Pending(), "upstream.smtp.password") || m.SavedSMTP().Password != "new-secret" {
-		t.Fatalf("pending = %v", m.Pending())
+	if m.Current().Upstream.SMTP.Password != "new-secret" || c.Upstream.SMTP.Password != env.SMTP.Pass {
+		t.Fatal("password change")
 	}
 	if _, err := m.Save(ctx, orig, settings.PasswordChange{Set: true, Value: env.SMTP.Pass}); err != nil {
 		t.Fatal(err)
 	}
-	if len(m.Pending()) != 0 {
-		t.Fatalf("reverted, still pending: %v", m.Pending())
+	if d := config.DiffSettings(m.Saved(), orig); len(d) != 0 || m.Current().Upstream.SMTP.Password != env.SMTP.Pass {
+		t.Fatalf("reverted, still differs: %v", d)
 	}
 
 	// Removing the password needs no username.
@@ -188,7 +195,7 @@ func TestSave(t *testing.T) {
 
 	// The next boot runs with what was saved.
 	m2, cfg2, _ := boot(t, env.Path, st)
-	if cfg2.Upstream.SMTP.Username != "" || cfg2.Upstream.SMTP.Password != "" || len(m2.Pending()) != 0 || len(m2.LoadProblems()) != 0 {
+	if cfg2.Upstream.SMTP.Username != "" || cfg2.Upstream.SMTP.Password != "" || len(m2.LoadProblems()) != 0 {
 		t.Fatalf("after restart: %+v %v", cfg2.Upstream.SMTP, m2.LoadProblems())
 	}
 }
@@ -278,6 +285,9 @@ func TestPasswordUndecryptable(t *testing.T) {
 	if _, err := m.Save(context.Background(), s, settings.PasswordChange{Set: true, Value: env.SMTP.Pass}); err != nil || m.PasswordState() != settings.Sealed {
 		t.Fatalf("re-enter: %v %v", err, m.PasswordState())
 	}
+	if m.Current().Upstream.SMTP.Password != env.SMTP.Pass {
+		t.Fatal("a re-entered password is usable at once")
+	}
 	if _, cfg, _ = boot(t, env.Path, st); cfg.Upstream.SMTP.Password != env.SMTP.Pass {
 		t.Fatal("re-entered password not usable after restart")
 	}
@@ -317,6 +327,13 @@ func TestStoredProblemsNeverBlockBoot(t *testing.T) {
 	}
 	if _, err := m.Save(ctx, m.Saved(), settings.PasswordChange{}); err != nil {
 		t.Fatal(err)
+	}
+	// A valid save clears the problems at once.
+	if p := m.LoadProblems(); len(p) != 0 {
+		t.Fatalf("after save, problems = %v", p)
+	}
+	if w := m.Current().Warnings; slices.ContainsFunc(w, func(w string) bool { return strings.HasPrefix(w, settings.WarningPrefix) }) {
+		t.Fatalf("after save, warnings = %v", w)
 	}
 	if m, _, _ = boot(t, env.Path, st); len(m.LoadProblems()) != 0 {
 		t.Fatalf("after save: %v", m.LoadProblems())

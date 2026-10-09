@@ -11,18 +11,20 @@ import (
 
 type Writer struct {
 	st         *store.Store
-	logSubject bool
+	logSubject func() bool
 	log        *slog.Logger
 }
 
-func NewWriter(st *store.Store, logSubject bool, log *slog.Logger) *Writer {
+// NewWriter returns a Writer. logSubject reports audit.log_subject; it is
+// called for every row, so a saved change applies to the next one.
+func NewWriter(st *store.Store, logSubject func() bool, log *slog.Logger) *Writer {
 	return &Writer{st: st, logSubject: logSubject, log: log}
 }
 
 // Record stores an audit row. The subject is dropped unless audit.log_subject
 // is enabled. Failures are logged, never surfaced to the agent.
 func (w *Writer) Record(ctx context.Context, e *store.AuditEntry) {
-	if !w.logSubject {
+	if !w.logSubject() {
 		e.Subject = ""
 	}
 	// Use a detached context: the row must be written even if the client
@@ -34,10 +36,12 @@ func (w *Writer) Record(ctx context.Context, e *store.AuditEntry) {
 	}
 }
 
-// RunRetention prunes rows older than the retention period, hourly, until ctx ends.
-func RunRetention(ctx context.Context, st *store.Store, retention time.Duration, log *slog.Logger) {
+// RunRetention prunes rows older than the retention period, hourly, until
+// ctx ends. retention is read at every prune, so a saved change applies at
+// the next one.
+func RunRetention(ctx context.Context, st *store.Store, retention func() time.Duration, log *slog.Logger) {
 	prune := func() {
-		n, err := st.PruneAudit(ctx, time.Now().Add(-retention))
+		n, err := st.PruneAudit(ctx, time.Now().Add(-retention()))
 		if err != nil {
 			log.Error("pruning audit log", "err", err)
 		} else if n > 0 {
