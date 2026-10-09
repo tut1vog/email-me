@@ -1,9 +1,9 @@
-// Package config loads and validates config.yaml and the secret files it
+// Package config loads and validates config.yaml and the files it
 // references. Validation collects every problem so the operator can fix them
 // in one pass.
 //
-// Keys are of two kinds. Bootstrap keys (listen addresses, TLS, secret
-// files, log) are read from config.yaml on every start and validated by
+// Keys are of two kinds. Bootstrap keys (listen addresses, TLS, the
+// key-encryption key, log) are read from config.yaml on every start and validated by
 // Parse. Managed keys (see Settings) live in the state database and are
 // edited on the dashboard; their sections in config.yaml only seed an empty
 // database, and are validated then by ValidateSeed.
@@ -29,10 +29,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ProtonMail/go-crypto/openpgp"
 	"gopkg.in/yaml.v3"
 
-	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/units"
@@ -47,6 +45,7 @@ type Config struct {
 	Dashboard  Dashboard             `yaml:"dashboard"`
 	Upstream   Upstream              `yaml:"upstream"`
 	Recipients map[string]*Recipient `yaml:"recipients"`
+	KEK        KEK                   `yaml:"kek"`
 	Signing    *Signing              `yaml:"signing"`
 	Defaults   Defaults              `yaml:"defaults"`
 	Audit      Audit                 `yaml:"audit"`
@@ -82,11 +81,8 @@ type TLS struct {
 func (t TLS) Enabled() bool { return t.CertFile != "" || t.KeyFile != "" }
 
 type Dashboard struct {
-	Listen            string         `yaml:"listen"`
-	AdminPasswordFile string         `yaml:"admin_password_file"`
-	SessionTTL        units.Duration `yaml:"session_ttl"`
-
-	AdminPasswordHash string `yaml:"-"`
+	Listen     string         `yaml:"listen"`
+	SessionTTL units.Duration `yaml:"session_ttl"`
 }
 
 type Upstream struct {
@@ -95,16 +91,15 @@ type Upstream struct {
 	FromNameTemplate string `yaml:"from_name_template" json:"from_name_template"`
 }
 
-// SMTP is the upstream server. The password is never part of the stored
-// settings document: it is read from password_file when seeding and kept
-// in its own column afterwards.
+// SMTP is the upstream server. The password is never in config.yaml nor
+// part of the stored settings document: it is entered on the dashboard and
+// kept sealed in its own column.
 type SMTP struct {
-	Host         string         `yaml:"host" json:"host"`
-	Port         int            `yaml:"port" json:"port"`
-	Security     string         `yaml:"security" json:"security"`
-	Username     string         `yaml:"username" json:"username"`
-	PasswordFile string         `yaml:"password_file" json:"-"`
-	Timeout      units.Duration `yaml:"timeout" json:"timeout"`
+	Host     string         `yaml:"host" json:"host"`
+	Port     int            `yaml:"port" json:"port"`
+	Security string         `yaml:"security" json:"security"`
+	Username string         `yaml:"username" json:"username"`
+	Timeout  units.Duration `yaml:"timeout" json:"timeout"`
 
 	Password string `yaml:"-" json:"-"`
 }
@@ -125,18 +120,23 @@ type Recipient struct {
 	PublicKeyArmor string `yaml:"-"`
 }
 
-type Signing struct {
-	KeyEncryptionKeyFile string         `yaml:"key_encryption_key_file"`
-	KeyValidity          units.Duration `yaml:"key_validity"`
-	CertifyWith          *CertifyWith   `yaml:"certify_with"`
+// KEK names the key-encryption key that protects every credential in the
+// state database. The previous key is set only while rotating it.
+type KEK struct {
+	File         string `yaml:"file"`
+	PreviousFile string `yaml:"previous_file"`
 
-	KEK    []byte          `yaml:"-"`
-	Master *openpgp.Entity `yaml:"-"`
+	Key      []byte `yaml:"-"` // nil: no KEK
+	Previous []byte `yaml:"-"` // nil: none
 }
 
-type CertifyWith struct {
-	PGPPrivateKeyFile string `yaml:"pgp_private_key_file"`
-	PassphraseFile    string `yaml:"passphrase_file"`
+// Configured reports whether a KEK is set.
+func (k KEK) Configured() bool { return len(k.Key) == 32 }
+
+// Signing is the signing section. It is set exactly when a KEK is
+// configured, which is what signing needs.
+type Signing struct {
+	KeyValidity units.Duration `yaml:"key_validity"`
 }
 
 type Defaults struct {
@@ -153,7 +153,7 @@ type Log struct {
 }
 
 // SigningConfigured reports whether the sign service can work at all.
-func (c *Config) SigningConfigured() bool { return c.Signing != nil && len(c.Signing.KEK) == 32 }
+func (c *Config) SigningConfigured() bool { return c.Signing != nil && c.KEK.Configured() }
 
 // FromName renders the From display name for an agent.
 func (c *Config) FromName(agent string) string {
@@ -190,7 +190,7 @@ func fingerprint(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Parse is Load without the file read (secrets are still read from disk).
+// Parse is Load without the file read (the files it names are still read).
 // It validates the bootstrap keys only; managed keys are decoded (they may
 // seed the state database) but not defaulted or checked: see ValidateSeed
 // and ValidateManaged.
@@ -218,17 +218,7 @@ func Parse(data []byte) (*Config, error) {
 func (c *Config) ValidateManaged() (problems, warnings []string) {
 	c.ApplyManagedDefaults()
 	v := &validator{}
-	c.validateManaged(v, false)
-	return v.errs, v.warns
-}
-
-// ValidateSeed is ValidateManaged for the managed sections of config.yaml
-// when they seed an empty state database: it also reads
-// upstream.smtp.password_file into Upstream.SMTP.Password.
-func (c *Config) ValidateSeed() (problems, warnings []string) {
-	c.ApplyManagedDefaults()
-	v := &validator{}
-	c.validateManaged(v, true)
+	c.validateManaged(v)
 	return v.errs, v.warns
 }
 
@@ -305,20 +295,19 @@ func (c *Config) validateBootstrap(v *validator) {
 	c.validateListenTLS(v)
 	c.validateDashboard(v)
 	c.validateRecipients(v)
-	c.validateSigning(v)
+	c.validateKEK(v)
 	if !slices.Contains([]string{"debug", "info", "warn", "error"}, c.Log.Level) {
 		v.add("log.level must be one of debug, info, warn, error")
 	}
 }
 
-// validateManaged checks the settings managed on the dashboard. seed means
-// they come from config.yaml, so the SMTP password is read from its file.
-func (c *Config) validateManaged(v *validator, seed bool) {
+// validateManaged checks the settings managed on the dashboard.
+func (c *Config) validateManaged(v *validator) {
 	c.validateAPISettings(v)
 	if c.Dashboard.SessionTTL.D() < time.Minute {
 		v.add("dashboard.session_ttl must be at least 1m")
 	}
-	c.validateUpstream(v, seed)
+	c.validateUpstream(v)
 	if s := c.Signing; s != nil && (s.KeyValidity.D() < 24*time.Hour || s.KeyValidity.D() > 50*365*24*time.Hour) {
 		v.add("signing.key_validity must be between 1d and 50y")
 	}
@@ -382,43 +371,19 @@ func (c *Config) validateDashboard(v *validator) {
 	if _, _, err := net.SplitHostPort(d.Listen); err != nil {
 		v.add("dashboard.listen: %v", err)
 	}
-	if d.AdminPasswordFile == "" {
-		v.add("dashboard.admin_password_file is required")
-		return
-	}
-	secret, err := readSecret(d.AdminPasswordFile)
-	if err != nil {
-		v.add("dashboard.admin_password_file: %v", err)
-		return
-	}
-	if auth.IsArgon2Hash(secret) {
-		if err := auth.ValidateHash(secret); err != nil {
-			v.add("dashboard.admin_password_file: %v", err)
-			return
-		}
-		d.AdminPasswordHash = secret
-		return
-	}
-	if len([]rune(secret)) < 12 {
-		v.add("dashboard.admin_password_file: password must be at least 12 characters")
-		return
-	}
-	hash, err := auth.HashPassword(secret)
-	if err != nil {
-		v.add("dashboard.admin_password_file: hashing: %v", err)
-		return
-	}
-	d.AdminPasswordHash = hash
 }
 
 // UpstreamNotConfigured is the warning for a missing upstream host or From
 // address.
 const UpstreamNotConfigured = "upstream SMTP is not configured: set it on the Settings page"
 
-// validateUpstream checks the upstream settings. A missing host or from
-// address is only a warning: a fresh install starts without them and the
-// operator sets them on the dashboard; sends fail until then.
-func (c *Config) validateUpstream(v *validator, seed bool) {
+// SMTPPasswordMissing is the warning for a username without a password.
+const SMTPPasswordMissing = "upstream SMTP has a username but no password: enter it on the Settings page"
+
+// validateUpstream checks the upstream settings. A missing host, from
+// address or password is only a warning: a fresh install starts without
+// them and the operator sets them on the dashboard; sends fail until then.
+func (c *Config) validateUpstream(v *validator) {
 	s := &c.Upstream.SMTP
 	if s.Host == "" || c.Upstream.From == "" {
 		v.warn(UpstreamNotConfigured)
@@ -441,21 +406,8 @@ func (c *Config) validateUpstream(v *validator, seed bool) {
 	default:
 		v.add("upstream.smtp.security must be starttls, tls or none")
 	}
-	if s.Username != "" {
-		switch {
-		case !seed:
-			if s.Password == "" {
-				v.add("upstream.smtp.password is required when username is set")
-			}
-		case s.PasswordFile == "":
-			v.add("upstream.smtp.password_file is required when username is set")
-		default:
-			if pw, err := readSecret(s.PasswordFile); err != nil {
-				v.add("upstream.smtp.password_file: %v", err)
-			} else {
-				s.Password = pw
-			}
-		}
+	if s.Username != "" && s.Password == "" {
+		v.warn(SMTPPasswordMissing)
 	}
 	if c.Upstream.From != "" {
 		if a, err := mail.ParseAddress(c.Upstream.From); err != nil || a.Name != "" {
@@ -510,41 +462,41 @@ func (c *Config) validateRecipients(v *validator) {
 	}
 }
 
-func (c *Config) validateSigning(v *validator) {
-	s := c.Signing
-	if s == nil {
-		return
-	}
-	if s.KeyEncryptionKeyFile == "" {
-		v.add("signing.key_encryption_key_file is required when signing is configured")
-	} else if raw, err := os.ReadFile(s.KeyEncryptionKeyFile); err != nil {
-		v.add("signing.key_encryption_key_file: %v", err)
-	} else if kek, err := ParseKEK(raw); err != nil {
-		v.add("signing.key_encryption_key_file: %v", err)
-	} else {
-		s.KEK = kek
-	}
-	if cw := s.CertifyWith; cw != nil {
-		data, err := os.ReadFile(cw.PGPPrivateKeyFile)
-		if err != nil {
-			v.add("signing.certify_with.pgp_private_key_file: %v", err)
-			return
-		}
-		var pass []byte
-		if cw.PassphraseFile != "" {
-			p, err := readSecret(cw.PassphraseFile)
-			if err != nil {
-				v.add("signing.certify_with.passphrase_file: %v", err)
-				return
+// validateKEK reads the key-encryption keys. An empty kek.file means no
+// KEK, so compose can always mount the secret; a missing or empty
+// previous_file means none, so it can stay configured between rotations.
+// Signing is available exactly when a KEK is.
+func (c *Config) validateKEK(v *validator) {
+	k := &c.KEK
+	if k.File != "" {
+		if raw, err := os.ReadFile(k.File); err != nil {
+			v.add("kek.file: %v", err)
+		} else if len(bytes.TrimSpace(raw)) > 0 {
+			if k.Key, err = ParseKEK(raw); err != nil {
+				v.add("kek.file: %v", err)
 			}
-			pass = []byte(p)
 		}
-		master, err := pgp.ParsePrivateKey(data, pass)
-		if err != nil {
-			v.add("signing.certify_with: %v", err)
-			return
+	}
+	if k.PreviousFile != "" {
+		raw, err := os.ReadFile(k.PreviousFile)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			v.add("kek.previous_file: %v", err)
+		case len(bytes.TrimSpace(raw)) > 0:
+			if k.Previous, err = ParseKEK(raw); err != nil {
+				v.add("kek.previous_file: %v", err)
+			}
 		}
-		s.Master = master
+	}
+	if k.Previous != nil && k.Key == nil {
+		v.add("kek.previous_file is set but kek.file is not: a rotation needs the new KEK in kek.file")
+	}
+	switch {
+	case k.Key == nil:
+		c.Signing = nil
+	case c.Signing == nil:
+		c.Signing = &Signing{}
 	}
 }
 
@@ -579,18 +531,6 @@ func ParseKEK(raw []byte) ([]byte, error) {
 		return raw, nil
 	}
 	return nil, errors.New("must contain 32 random bytes as 64 hex characters (openssl rand -hex 32), base64, or raw bytes")
-}
-
-func readSecret(path string) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	s := strings.TrimRight(string(b), "\r\n")
-	if s == "" {
-		return "", errors.New("file is empty")
-	}
-	return s, nil
 }
 
 // validHost reports whether host looks like a hostname or IP address (no

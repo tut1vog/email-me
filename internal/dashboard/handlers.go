@@ -183,17 +183,22 @@ func (s *Server) notices(ctx context.Context, cfg *config.Config, agents []*stor
 	switch s.Settings.PasswordState() {
 	case settings.Unsealed:
 		out = append(out, notice{Kind: "warn", Title: "SMTP password",
-			Text: "Stored unencrypted in the state database. Set signing.key_encryption_key_file in config.yaml to encrypt it.",
+			Text: "Stored unencrypted in the state database. Set kek.file in config.yaml to encrypt it.",
 			Link: "/settings#upstream"})
 	case settings.Undecryptable:
 		out = append(out, notice{Kind: "danger", Title: "SMTP password",
-			Text: "The stored password cannot be decrypted: the key-encryption key changed or was removed. Enter it again.",
+			Text: "The stored password cannot be decrypted. Enter it again.",
 			Link: "/settings#upstream"})
 	}
 	if !s.Keys.Enabled() {
 		out = append(out, notice{Kind: "info", Title: "Signing is not configured",
-			Text: "Messages are not signed. Set signing.key_encryption_key_file to sign each agent's mail with its own key.",
+			Text: "Messages are not signed. Set kek.file to sign each agent's mail with its own key.",
 			Link: "/settings#signing"})
+	}
+	if cfg.KEK.Previous != nil {
+		out = append(out, notice{Kind: "info", Title: "Previous KEK",
+			Text: "kek.previous_file is still set. The keyring opens with kek.file, so remove the previous key and restart.",
+			Link: "/settings#bootstrap"})
 	}
 	now := s.now()
 	if s.Recipients.Len() == 0 {

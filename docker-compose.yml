@@ -12,9 +12,8 @@ services:
       - ./config:/config:ro
       - email-me-data:/data
     secrets:
-      - smtp_password
-      - admin_password
-      - signing_kek
+      - kek
+      # - previous_kek            # only while rotating the KEK (README)
     read_only: true
     tmpfs:
       - /tmp
@@ -23,13 +22,16 @@ services:
     security_opt:
       - no-new-privileges:true
 
+# The key-encryption key protects every credential in state.db. Keep it
+# outside this directory, e.g. `openssl rand -hex 32 > ~/.config/email-me/kek`,
+# and name it in .env or the shell: EMAIL_ME_KEK_FILE=~/.config/email-me/kek.
+# Keep a copy: without it the stored credentials are lost. An empty file
+# means no KEK (signing off). Secrets of a read-only service must be files.
 secrets:
-  smtp_password:
-    file: ./secrets/smtp_password
-  admin_password:
-    file: ./secrets/admin_password
-  signing_kek:
-    file: ./secrets/signing_kek
+  kek:
+    file: ${EMAIL_ME_KEK_FILE:?set EMAIL_ME_KEK_FILE to the key-encryption key file}
+  # previous_kek:
+  #   file: ${EMAIL_ME_PREVIOUS_KEK_FILE:?set EMAIL_ME_PREVIOUS_KEK_FILE to the old KEK file}
 
 volumes:
   email-me-data:

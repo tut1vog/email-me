@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tut1vog/email-me/internal/admin"
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/ids"
@@ -133,6 +134,8 @@ func (s *Server) Handler() http.Handler {
 
 	authed := func(pattern string, h http.HandlerFunc) { mux.Handle(pattern, s.requireSession(h)) }
 	authed("POST /logout", s.logout)
+	authed("GET /password", s.passwordPage)
+	authed("POST /password", s.changePassword)
 	authed("GET /{$}", s.overview)
 	authed("GET /agents", s.agents)
 	authed("GET /agents/new", s.newAgentPage)
@@ -168,6 +171,8 @@ func (s *Server) Handler() http.Handler {
 	authed("POST /settings/dashboard", s.saveDashboard)
 	authed("POST /settings/audit", s.saveAudit)
 	authed("POST /settings/signing", s.saveSigning)
+	authed("POST /settings/certify-key", s.setCertifyKey)
+	authed("POST /settings/certify-key/remove", s.removeCertifyKey)
 	authed("POST /settings/test-smtp", s.testSMTP)
 	authed("POST /settings/restart", s.restart)
 	authed("POST /settings/test-send", s.testSend)
@@ -248,6 +253,15 @@ func (s *Server) requireSession(next http.HandlerFunc) http.Handler {
 			http.Error(w, "session expired; log in again", http.StatusUnauthorized)
 			return
 		}
+		// A setup password must be replaced before anything else.
+		if sess.MustChange() && r.URL.Path != "/password" && r.URL.Path != "/logout" {
+			if r.Method == http.MethodGet {
+				http.Redirect(w, r, "/password?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
+				return
+			}
+			http.Error(w, "choose a new admin password first", http.StatusForbidden)
+			return
+		}
 		if r.Method == http.MethodPost {
 			if err := r.ParseForm(); err != nil {
 				http.Error(w, "bad form", http.StatusBadRequest)
@@ -271,7 +285,15 @@ func clientIP(r *http.Request) string {
 }
 
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
-	s.render(w, r, "login", "Log in", map[string]any{"Next": safeNext(r.URL.Query().Get("next")), "Error": "", "SharedHost": sharedHostHint(r.Host)})
+	s.renderLogin(w, r, http.StatusOK, safeNext(r.URL.Query().Get("next")), "")
+}
+
+// renderLogin renders the login page. While the admin password is a setup
+// password, the page says where to find it.
+func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int, next, errMsg string) {
+	s.renderStatus(w, r, status, "login", "Log in", map[string]any{
+		"Next": next, "Error": errMsg, "SharedHost": sharedHostHint(r.Host), "Setup": admin.Pending(r.Context(), s.Store),
+	})
 }
 
 // sharedHostHint returns a dedicated-host URL suggestion when the dashboard
@@ -305,13 +327,17 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	// Begin counts the attempt before the expensive password check, so
 	// parallel guesses cannot all slip past the throttle.
 	if ok, wait := s.throttle.Begin(ip); !ok {
-		s.renderStatus(w, r, http.StatusTooManyRequests, "login", "Log in", map[string]any{"Next": next, "SharedHost": sharedHostHint(r.Host),
-			"Error": fmt.Sprintf("Too many failed attempts. Try again in %d seconds.", int(wait.Seconds())+1)})
+		s.renderLogin(w, r, http.StatusTooManyRequests, next, fmt.Sprintf("Too many failed attempts. Try again in %d seconds.", int(wait.Seconds())+1))
 		return
 	}
-	if !s.verifyPassword(r.Context(), r.PostForm.Get("password")) {
+	ok, mustChange, err := s.verifyPassword(r.Context(), r.PostForm.Get("password"))
+	if err != nil {
+		s.fail(w, "checking the admin password", err)
+		return
+	}
+	if !ok {
 		s.Log.Warn("dashboard login failed", "ip", ip)
-		s.renderStatus(w, r, http.StatusUnauthorized, "login", "Log in", map[string]any{"Next": next, "Error": "Wrong password.", "SharedHost": sharedHostHint(r.Host)})
+		s.renderLogin(w, r, http.StatusUnauthorized, next, "Wrong password.")
 		return
 	}
 	s.throttle.Success(ip)
@@ -323,7 +349,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		Name: sessionCookie, Value: sess.ID, Path: "/", HttpOnly: true, Secure: r.TLS != nil,
 		SameSite: http.SameSiteStrictMode, MaxAge: int(ttl.Seconds()),
 	})
-	s.Log.Info("dashboard login", "ip", ip)
+	s.Log.Info("dashboard login", "ip", ip, "setup_password", mustChange)
+	if mustChange {
+		sess.SetMustChange(true)
+		next = "/password?next=" + url.QueryEscape(next)
+	}
 	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
@@ -338,16 +368,17 @@ func (s *Server) endSession(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 }
 
-// verifyPassword runs argon2id (64 MiB per check) under a small semaphore so
-// concurrent login attempts cannot exhaust memory.
-func (s *Server) verifyPassword(ctx context.Context, password string) bool {
+// verifyPassword checks the admin password, reporting whether it is a
+// setup password. It runs argon2id (64 MiB per check) under a small
+// semaphore so concurrent login attempts cannot exhaust memory.
+func (s *Server) verifyPassword(ctx context.Context, password string) (ok, mustChange bool, err error) {
 	select {
 	case s.argonSlots <- struct{}{}:
 		defer func() { <-s.argonSlots }()
 	case <-ctx.Done():
-		return false
+		return false, false, ctx.Err()
 	}
-	return auth.VerifyPassword(s.Config().Dashboard.AdminPasswordHash, password)
+	return admin.Verify(ctx, s.Store, password)
 }
 
 // safeNext only allows local paths as post-login redirects: no scheme, no
@@ -395,7 +426,10 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request, status int
 		return
 	}
 	p := page{Title: title, Nav: name, Section: sectionOf(name), Data: data}
-	if sess := sessionFrom(r); sess != nil {
+	if sess := sessionFrom(r); sess != nil && sess.MustChange() {
+		// Only the Password page is reachable: show it like the login page.
+		p.CSRF, p.Flash = sess.CSRF, sess.PopFlash()
+	} else if sess != nil {
 		p.CSRF, p.Flash, p.LoggedIn = sess.CSRF, sess.PopFlash(), true
 		p.ConfigChanged = s.configChanged()
 		if s.Settings != nil {
@@ -422,6 +456,8 @@ func sectionOf(name string) string {
 		return "audit"
 	case "settings", "guide":
 		return "settings"
+	case "password":
+		return "password"
 	}
 	return ""
 }

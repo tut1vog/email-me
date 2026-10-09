@@ -36,7 +36,7 @@ type DashboardSettings struct {
 }
 
 // SigningSettings are the managed keys of the signing section. They apply
-// only while signing is configured (signing.key_encryption_key_file).
+// only while signing is configured (a key-encryption key is set).
 type SigningSettings struct {
 	KeyValidity units.Duration `json:"key_validity"`
 }

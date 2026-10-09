@@ -1,7 +1,7 @@
-# Local deployment files (never commit real config or secrets)
+# Local deployment files (never commit real config or the KEK)
 /config/
-/secrets/
 /data/
+/.env
 
 # Build output
 /email-me

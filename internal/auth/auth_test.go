@@ -44,7 +44,7 @@ func TestPasswordHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !IsArgon2Hash(h) || ValidateHash(h) != nil {
+	if _, err := parsePHC(h); !strings.HasPrefix(h, "$argon2id$") || err != nil {
 		t.Fatalf("bad hash %q", h)
 	}
 	if !VerifyPassword(h, "correct horse battery staple") {
@@ -58,8 +58,8 @@ func TestPasswordHash(t *testing.T) {
 		t.Fatal("salts must differ")
 	}
 	for _, bad := range []string{"$argon2id$v=19$m=0,t=1,p=1$AAAA$AAAA", "$argon2i$v=19$m=1,t=1,p=1$AAAA$AAAA", "$argon2id$v=19$m=65536,t=3,p=2$@@$AA"} {
-		if ValidateHash(bad) == nil {
-			t.Errorf("ValidateHash(%q) should fail", bad)
+		if _, err := parsePHC(bad); err == nil {
+			t.Errorf("parsePHC(%q) should fail", bad)
 		}
 	}
 }

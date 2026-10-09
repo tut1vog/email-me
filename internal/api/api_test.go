@@ -512,7 +512,7 @@ func TestSigningNotConfigured(t *testing.T) {
 func TestExpiredSigningKey(t *testing.T) {
 	h := newHarness(t, testutil.Options{Signing: true})
 	a, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"})})
-	short := keys.NewManager(h.st, keys.Options{KEK: h.env.Config.Signing.KEK, Validity: time.Second, Email: "gateway@example.com"})
+	short := keys.NewManager(h.st, keys.Options{Keyring: testutil.Keyring(t, h.env, h.st), Validity: time.Second, Email: "gateway@example.com"})
 	if _, err := short.Rotate(context.Background(), a.ID, a.Name); err != nil {
 		t.Fatal(err)
 	}

@@ -347,7 +347,10 @@ a.brand:hover { color: var(--text); }
 }
 .nav-item[aria-current="page"] .icon { color: var(--accent); }
 
-.sidebar .logout {
+.sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   margin: auto 0 0;
   padding-top: var(--s-3);
   border-top: 1px solid var(--border);
@@ -1439,6 +1442,7 @@ body.auth .content {
 .login-card > .muted { margin: 0 0 var(--s-6); text-align: center; }
 .login-card .field { max-width: none; }
 .login-card button { width: 100%; }
+.login-card form + form { margin-top: var(--s-3); }
 .login-card .banner,
 .login-card .flash { margin-bottom: var(--s-5); }
 

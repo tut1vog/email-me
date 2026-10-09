@@ -1,7 +1,7 @@
 .git
 config
-secrets
 data
+.env
 email-me
 *.md
 !internal/**/*.md

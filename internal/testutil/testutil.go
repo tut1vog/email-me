@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,7 +25,10 @@ import (
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 
+	"github.com/tut1vog/email-me/internal/admin"
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/keyring"
+	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
@@ -189,7 +193,9 @@ func ArmorPrivate(t testing.TB, e *openpgp.Entity) string {
 
 // Options customize the generated config.
 type Options struct {
-	Signing        bool
+	// Signing configures a key-encryption key, which enables signing.
+	Signing bool
+	// Master is a certification key for the keys manager (see SetMaster).
 	Master         *openpgp.Entity
 	Docs           string
 	LogSubject     bool
@@ -214,18 +220,19 @@ type Env struct {
 	SMTP    *SMTPServer
 	MeKey   *openpgp.Entity // "me" recipient key (with private part, for decrypting in tests)
 	WorkKey *openpgp.Entity
-	AdminPW string
+	Master  *openpgp.Entity // Options.Master
+	AdminPW string          // stored by BootstrapSettings
 }
 
-// NewEnv writes secret files and a config.yaml into a temp dir and loads it.
+// NewEnv writes key files and a config.yaml into a temp dir and loads it.
 // Recipient seeds: "me" (with PGP key), "work" (with PGP key), "ops" (no
 // key); Bootstrap inserts them into the state database. The managed
-// settings in env.Config are validated and complete only after
-// BootstrapSettings (or Bootstrap).
+// settings in env.Config are validated and complete, and the credentials
+// stored, only after BootstrapSettings (or Bootstrap).
 func NewEnv(t testing.TB, o Options) *Env {
 	t.Helper()
 	dir := t.TempDir()
-	env := &Env{Dir: dir, DataDir: filepath.Join(dir, "data"), AdminPW: "correct horse battery staple"}
+	env := &Env{Dir: dir, DataDir: filepath.Join(dir, "data"), AdminPW: "correct horse battery staple", Master: o.Master}
 	if err := os.MkdirAll(env.DataDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -241,8 +248,6 @@ func NewEnv(t testing.TB, o Options) *Env {
 	env.WorkKey = NewKey(t, "Work", "work@example.org")
 	mePub := write("me.asc", ArmorPublic(t, env.MeKey))
 	workPub := write("work.asc", ArmorPublic(t, env.WorkKey))
-	adminPW := write("admin_password", env.AdminPW+"\n")
-	smtpPW := write("smtp_password", env.SMTP.Pass+"\n")
 
 	docs := o.Docs
 	if docs == "" {
@@ -257,9 +262,9 @@ func NewEnv(t testing.TB, o Options) *Env {
 	if len(o.TrustedProxies) > 0 {
 		fmt.Fprintf(&b, "  trusted_proxies: [%s]\n", strings.Join(quoteAll(o.TrustedProxies), ", "))
 	}
-	fmt.Fprintf(&b, "dashboard:\n  listen: \"127.0.0.1:0\"\n  admin_password_file: %q\n", adminPW)
-	fmt.Fprintf(&b, "upstream:\n  smtp:\n    host: %s\n    port: %d\n    security: none\n    username: %q\n    password_file: %q\n    timeout: 5s\n",
-		env.SMTP.Host, env.SMTP.Port, env.SMTP.User, smtpPW)
+	fmt.Fprintf(&b, "dashboard:\n  listen: \"127.0.0.1:0\"\n")
+	fmt.Fprintf(&b, "upstream:\n  smtp:\n    host: %s\n    port: %d\n    security: none\n    username: %q\n    timeout: 5s\n",
+		env.SMTP.Host, env.SMTP.Port, env.SMTP.User)
 	fmt.Fprintf(&b, "  from: gateway@example.com\n")
 	fmt.Fprintf(&b, "recipients:\n")
 	fmt.Fprintf(&b, "  me:\n    address: me@example.com\n    description: Personal inbox\n    pgp_public_key_file: %q\n", mePub)
@@ -268,12 +273,9 @@ func NewEnv(t testing.TB, o Options) *Env {
 	if o.Signing {
 		kek := make([]byte, 32)
 		rand.Read(kek)
-		kekPath := write("signing_kek", hex.EncodeToString(kek)+"\n")
-		fmt.Fprintf(&b, "signing:\n  key_encryption_key_file: %q\n  key_validity: 1y\n", kekPath)
-		if o.Master != nil {
-			mp := write("master.asc", ArmorPrivate(t, o.Master))
-			fmt.Fprintf(&b, "  certify_with:\n    pgp_private_key_file: %q\n", mp)
-		}
+		kekPath := write("kek", hex.EncodeToString(kek)+"\n")
+		fmt.Fprintf(&b, "kek:\n  file: %q\n", kekPath)
+		fmt.Fprintf(&b, "signing:\n  key_validity: 1y\n")
 	}
 	if o.DefaultsPolicy != "" {
 		b.WriteString("defaults:\n  policy:\n")
@@ -319,15 +321,72 @@ func OpenStore(t testing.TB, env *Env) *store.Store {
 }
 
 // BootstrapSettings loads the managed settings from st into env.Config,
-// seeding st from the config on first use. Call it before
+// seeding st from the config on first use, as serve does. On first use it
+// also stores the credentials an operator would enter on the dashboard:
+// the fake server's SMTP password and env.AdminPW. Call it before
 // recipients.Bootstrap, which needs the default policy (DefaultPolicy).
 func BootstrapSettings(t testing.TB, env *Env, st *store.Store) *settings.Manager {
 	t.Helper()
-	m, _, err := settings.Bootstrap(context.Background(), st, env.Config, DiscardLogger())
+	ctx := context.Background()
+	m, seeded, err := settings.Bootstrap(ctx, st, env.Config, Keyring(t, env, st), DiscardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if seeded {
+		if _, err := m.Save(ctx, m.Saved(), settings.PasswordChange{Set: true, Value: env.SMTP.Pass}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.GetAdmin(ctx); errors.Is(err, store.ErrNotFound) {
+		if err := admin.Set(ctx, st, env.AdminPW); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return m
+}
+
+// Keyring opens st's keyring with env's KEK, as serve does (nil without
+// one).
+func Keyring(t testing.TB, env *Env, st *store.Store) *keyring.Keyring {
+	t.Helper()
+	kr, _, err := keyring.Open(context.Background(), st, env.Config.KEK.Key, env.Config.KEK.Previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kr
+}
+
+// Keys returns a keys manager for env, as serve builds it: sealed under
+// st's keyring, following m's From address and key validity, and with
+// env.Master as its certification key.
+func Keys(t testing.TB, env *Env, st *store.Store, m *settings.Manager) *keys.Manager {
+	t.Helper()
+	km := keys.NewManager(st, keys.Options{Keyring: Keyring(t, env, st), From: func() (string, time.Duration) {
+		c := m.Current()
+		if c.Signing == nil {
+			return c.Upstream.From, 0
+		}
+		return c.Upstream.From, c.Signing.KeyValidity.D()
+	}})
+	if env.Master != nil {
+		if _, err := km.SetMaster(context.Background(), []byte(ArmorPrivate(t, env.Master)), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return km
+}
+
+// SeedState prepares env's state database the way an operator's first
+// session would (see BootstrapSettings), for tests that start the whole
+// gateway on it.
+func SeedState(t testing.TB, env *Env) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	BootstrapSettings(t, env, st)
 }
 
 // DefaultPolicy returns the current default policy of m, as serve passes

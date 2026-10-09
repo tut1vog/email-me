@@ -15,8 +15,9 @@ type Session struct {
 	CSRF      string
 	ExpiresAt time.Time
 
-	mu    sync.Mutex
-	flash []Flash
+	mu         sync.Mutex
+	flash      []Flash
+	mustChange bool
 }
 
 // Flash is a one-shot message shown on the next page render.
@@ -39,6 +40,21 @@ func (s *Session) PopFlash() []Flash {
 	f := s.flash
 	s.flash = nil
 	return f
+}
+
+// MustChange reports whether the session was opened with a setup password
+// that must be replaced before anything else.
+func (s *Session) MustChange() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mustChange
+}
+
+// SetMustChange marks or clears the session's pending password change.
+func (s *Session) SetMustChange(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mustChange = v
 }
 
 // ValidCSRF compares a submitted CSRF token in constant time.
@@ -86,6 +102,17 @@ func (s *Sessions) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.m, id)
+}
+
+// DeleteOthers ends every session but keep's.
+func (s *Sessions) DeleteOthers(keep string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.m {
+		if id != keep {
+			delete(s.m, id)
+		}
+	}
 }
 
 func (s *Sessions) gc() {

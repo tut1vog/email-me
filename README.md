@@ -13,27 +13,27 @@ The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi
 
 ## Quick start (Docker)
 
-1. Create the config and secrets:
+1. Create the config and the key-encryption key (KEK):
 
    ```sh
-   mkdir -p config secrets
+   mkdir -p config ~/.config/email-me
    cp config.example.yaml config/config.yaml        # then edit upstream (and the first recipient), or leave them out
-   printf '%s' 'your-smtp-app-password' > secrets/smtp_password
-   printf '%s' 'a-long-dashboard-password' > secrets/admin_password
-   openssl rand -hex 32 > secrets/signing_kek         # encrypts agent signing keys at rest
+   (umask 077; openssl rand -hex 32 > ~/.config/email-me/kek)
+   echo "EMAIL_ME_KEK_FILE=$HOME/.config/email-me/kek" > .env
    ```
 
-   `upstream` and the SMTP password can also be left out and set on the dashboard's **Settings** page after the first start. The container runs as uid 65532. On Linux, make the secrets readable by it: `sudo chown 65532:65532 secrets/* && chmod 400 secrets/*`.
+   The KEK is the only secret email-me needs from you: every credential it stores (the SMTP password, the agents' signing keys) is encrypted with it in `state.db`. Keep it outside the checkout; Compose mounts the file named by `EMAIL_ME_KEK_FILE` (from `.env` or your shell) as a Docker secret. The container runs as uid 65532: on Linux, make the file readable by it (`sudo chown 65532 ~/.config/email-me/kek`). **Keep a copy in your password manager**: without it, those credentials are lost. `upstream` can also be left out and set on the dashboard's **Settings** page after the first start; the SMTP password is always entered there.
 
 2. Start it:
 
    ```sh
    docker compose up -d --build
+   docker compose logs email-me | grep 'setup password'
    ```
 
-   Both ports are published on `127.0.0.1` only: the agent API on `8025`, the dashboard on `8026`.
+   Both ports are published on `127.0.0.1` only: the agent API on `8025`, the dashboard on `8026`. The first start logs a one-time **setup password** for the dashboard.
 
-3. Open `http://email-me.localhost:8026` (Chrome and Firefox resolve `*.localhost` to your machine) and log in with the admin password. If the overview says **Configure SMTP**, set the upstream server on the **Settings** page; it applies when saved. On the **Recipients** page, check the recipient imported from `config.yaml` or add your address (optionally pasting your PGP public key). Then create an agent, grant it one or more aliases, and issue a token. The token page shows everything to hand to the agent:
+3. Open `http://email-me.localhost:8026` (Chrome and Firefox resolve `*.localhost` to your machine), log in with the setup password and choose your own (at least 12 characters). On the **Settings** page, enter the SMTP password (and the upstream server, if the overview says **Configure SMTP**); it applies when saved. On the **Recipients** page, check the recipient imported from `config.yaml` or add your address (optionally pasting your PGP public key). Then create an agent, grant it one or more aliases, and issue a token. The token page shows everything to hand to the agent:
 
    ```
    EMAIL_ME_URL=http://localhost:8025
@@ -63,7 +63,7 @@ curl -fsSL https://github.com/tut1vog/email-me/releases/latest/download/install.
 
 The script downloads the release for your OS and architecture (amd64 or arm64), checks it against the release's `checksums.txt` and puts `email-me` in `~/.local/bin`, or where `email-me` already is on your `PATH`. Run the same command again to update; restart a running gateway afterwards. `email-me version` prints the installed version. Set `EMAIL_ME_VERSION=v1.2.3` to install a specific release and `EMAIL_ME_INSTALL_DIR` to choose the directory, e.g. `curl -fsSL … | EMAIL_ME_INSTALL_DIR=/usr/local/bin sh`.
 
-Outside the container, adapt the paths in `config.example.yaml`: point `data_dir` and each `*_file` at your own directories, and set both `listen` addresses to `127.0.0.1` (the default `0.0.0.0` relies on Docker publishing the ports on localhost only). Then run `email-me serve --config /path/to/config.yaml` under your service manager.
+Outside the container, adapt the paths in `config.example.yaml`: point `data_dir` and `kek.file` at your own directories (the KEK file holds `openssl rand -hex 32`, mode `600`), and set both `listen` addresses to `127.0.0.1` (the default `0.0.0.0` relies on Docker publishing the ports on localhost only). Then run `email-me serve --config /path/to/config.yaml` under your service manager.
 
 ## Letting agents on other hosts in
 
@@ -86,17 +86,19 @@ The defaults keep everything on localhost. To accept agents from other machines,
 - **Gateway-side encryption (`pgp`)**: paste the recipient's ASCII-armored public key (`gpg --export --armor --export-options export-minimal you@example.com`) on its page under **Recipients**. The agent sets `options.encrypt: "pgp"`.
 - **End-to-end (`e2e`)**: the agent fetches the recipient's key from `/v1/recipients/{alias}/pgp-key`, encrypts a MIME entity itself, and sends the ciphertext. The gateway never sees plaintext, so it cannot sign; an agent needs `require_signing: false` in its policy to use `e2e`.
 - **Revocation**: every agent key comes with two revocation certificates. Publish the *retired* one after rotating or deleting an agent; signatures the key already made stay valid. Publish the *compromised* one only if the key may have leaked (for example, the database and the KEK were both exposed); it invalidates every signature the key made.
+- **Certification**: optionally paste a master private key (and its passphrase) on the Settings page. Every agent key generated afterwards is certified by it, so GnuPG users can trust the master key once. It is stored encrypted, without its passphrase.
 - **Signatures**: each agent's key has the user ID `<agent> via email-me <your from address>`. Download public keys from the agent's Signing tab, or all of them from Settings, and import them into your mail client. A signature proves the message was submitted through your gateway with that agent's token and was not modified afterwards.
 
 ## Operations
 
 - **Health**: the image has a Docker `HEALTHCHECK` (`email-me healthcheck`), and `GET /healthz` on the API.
-- **Settings**: the upstream SMTP server and its password, the From address, the agent API's public URL, guide access and trusted proxies, the default policy, the dashboard session lifetime, audit retention and signing-key validity are edited on the dashboard's **Settings** page and stored in `state.db`. Saving applies them at once, without a restart: the next send uses the new upstream server and policy, the next login the new session lifetime. The SMTP password is write-only on the page and stored encrypted with the signing KEK (unencrypted without a KEK, which the dashboard flags).
-- **`config.yaml`** keeps the bootstrap keys: `data_dir`, the listen addresses, `api.tls`, the admin password file, the `signing` key files, and `log`. They are read at every start: when the file changes on disk, a banner on every dashboard page offers **Restart now**, which restarts email-me inside the container. In-flight sends finish first, the listeners are down for a moment, and you log in again. `docker kill -s HUP <container>` restarts the same way; restart the container instead when the change also needs new mounts or ports. Only the file itself is watched: after replacing a secret file it names, restart too. Every problem is listed at once; if the file no longer loads, a restart from the dashboard or `SIGHUP` is refused and the gateway keeps running.
-- **Seeds**: the file's other sections (`upstream`, the managed `api`, `dashboard` and `signing` keys, `defaults`, `audit`) and `recipients:` are imported into `state.db` on the first start and ignored afterwards (a log line says so; you may delete them). `upstream.smtp.password_file` is read only then. Recipients are managed on the **Recipients** page and take effect immediately; the `recipients:` section is imported again only when the database has none.
-- **Upgrading** from a version that read these settings from `config.yaml`: the first start imports your current values once, so nothing changes; from then on, edit them on the dashboard.
-- **State**: `state.db` in the `email-me-data` volume holds agents, token hashes, recipients and their PGP public keys, settings and the SMTP password, encrypted signing keys and audit metadata. Back it up together with `signing_kek`; without the KEK the signing keys and the stored SMTP password cannot be decrypted (the dashboard then asks for the password again).
-- **Admin password as a hash**: `admin_password` may hold an argon2id PHC string instead of plaintext, e.g. `printf '%s' 'password' | argon2 "$(openssl rand -hex 16)" -id -t 3 -m 16 -p 2 -e`.
+- **Settings**: the upstream SMTP server and its password, the From address, the agent API's public URL, guide access and trusted proxies, the default policy, the dashboard session lifetime, audit retention, signing-key validity and the certification key are edited on the dashboard's **Settings** page and stored in `state.db`. Saving applies them at once, without a restart: the next send uses the new upstream server and policy, the next login the new session lifetime. The SMTP password is write-only on the page and stored encrypted (unencrypted without a KEK, which the dashboard flags).
+- **Credentials**: every credential lives in `state.db`. The admin password is an argon2id hash, changed on the dashboard's **Password** page. The SMTP password, the agents' signing keys and the certification key are encrypted with a random data key, which is itself encrypted with the KEK. Without a KEK (an empty KEK file), signing is off and the SMTP password is stored unencrypted.
+- **`config.yaml`** keeps the bootstrap keys: `data_dir`, the listen addresses, `api.tls`, `kek`, and `log`. They are read at every start: when the file changes on disk, a banner on every dashboard page offers **Restart now**, which restarts email-me inside the container. In-flight sends finish first, the listeners are down for a moment, and you log in again. `docker kill -s HUP <container>` restarts the same way; recreate the container instead when the change also needs new mounts or ports (`docker compose up -d`) or a new KEK (`docker compose up -d --force-recreate`: Compose does not notice a changed secret file). Only the file itself is watched. Every problem is listed at once; if the file no longer loads, or its KEK does not open the stored credentials, a restart from the dashboard or `SIGHUP` is refused and the gateway keeps running.
+- **Seeds**: the file's other sections (`upstream` without its password, the managed `api`, `dashboard` and `signing` keys, `defaults`, `audit`) and `recipients:` are imported into `state.db` on the first start and ignored afterwards (a log line says so; you may delete them). Recipients are managed on the **Recipients** page and take effect immediately; the `recipients:` section is imported again only when the database has none.
+- **State**: `state.db` in the `email-me-data` volume holds agents, token hashes, recipients and their PGP public keys, settings, the encrypted credentials and audit metadata. Back it up, and keep the KEK somewhere else: a copy of `state.db` alone reveals no credential, and without the KEK the encrypted ones are lost.
+- **Rotating the KEK**: write the new key to a new file and point `EMAIL_ME_KEK_FILE` at it, point `EMAIL_ME_PREVIOUS_KEK_FILE` at the old one, uncomment the `previous_kek` secret in `docker-compose.yml`, and run `docker compose up -d --force-recreate`. The start re-encrypts the data key with the new KEK (one row, nothing else changes). Then remove the previous key and the secret and run `docker compose up -d --force-recreate` again; the dashboard reminds you until you do. A start whose KEK does not open the stored credentials fails and says so (`docker compose logs email-me`).
+- **Recovery**: a forgotten admin password: `docker compose exec email-me /email-me reset-admin-password` prints a new setup password. A lost KEK: the gateway no longer starts, so run `docker compose stop` and `docker compose run --rm email-me reset-keyring --yes`, which discards the encrypted credentials (the SMTP password, the certification key, and the agents' signing keys, which are retired); then start with a new KEK, and agents get new keys. Everything else is kept.
 
 ## Development
 
@@ -108,4 +110,4 @@ CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull requ
 
 Releases: pushing a tag such as `v1.2.3` runs `.github/workflows/release.yml`, which runs the CI checks, attaches the macOS and Linux tarballs, `checksums.txt` and `install.sh` to a GitHub release, and pushes the image to `ghcr.io/tut1vog/email-me` (`1.2.3`, `1.2`, `latest`). A tag with a suffix (`v1.2.3-rc.1`) makes a prerelease that the install script and `latest` skip.
 
-Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/recipients` (recipient registry), `internal/settings` (managed settings), `internal/store` (SQLite), `internal/config`, `internal/policy`.
+Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/keyring` (credential encryption), `internal/admin` (admin password), `internal/recipients` (recipient registry), `internal/settings` (managed settings), `internal/store` (SQLite), `internal/config`, `internal/policy`.

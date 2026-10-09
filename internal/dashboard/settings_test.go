@@ -74,10 +74,10 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 	if p.status != http.StatusUnprocessableEntity || !strings.Contains(p.body, "not both") {
 		t.Fatalf("password and remove: %d", p.status)
 	}
-	// A username without a password is refused by validation.
-	p = d.post("/settings/upstream", d.form("host", "127.0.0.1", "security", "none", "username", "u", "remove_password", "on", "from", "gateway@example.com"))
-	if p.status != http.StatusUnprocessableEntity || !strings.Contains(p.body, "upstream.smtp.password is required") {
-		t.Fatalf("username without password: %d", p.status)
+	// A username without a password saves, with a warning.
+	body = d.saved(d.post("/settings/upstream", d.form("host", "127.0.0.1", "security", "none", "username", "u", "remove_password", "on", "from", "gateway@example.com")), "upstream")
+	if !strings.Contains(body, "Note: "+config.SMTPPasswordMissing) {
+		t.Fatal("username without password must warn")
 	}
 
 	// Back to the first server; saving the same values again changes nothing.
@@ -100,7 +100,7 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 func TestSettingsCardsValidate(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
-	before := d.settings.Saved()
+	before, cur := d.settings.Saved(), d.settings.Current()
 	for _, c := range []struct {
 		card string
 		kv   []string
@@ -124,7 +124,7 @@ func TestSettingsCardsValidate(t *testing.T) {
 			t.Errorf("%s: the submitted value must be shown again", c.card)
 		}
 	}
-	if len(config.DiffSettings(d.settings.Saved(), before)) != 0 || d.settings.Current() != d.env.Config {
+	if len(config.DiffSettings(d.settings.Saved(), before)) != 0 || d.settings.Current() != cur {
 		t.Fatal("rejected saves must not store or apply anything")
 	}
 
@@ -375,7 +375,7 @@ func TestRestartFromDashboard(t *testing.T) {
 	}
 
 	// config.yaml no longer loads: nothing restarts and the session stays.
-	d.restart.fail(errors.New("parsing config: yaml: line 3: did not find expected key"))
+	d.restart.fail(errors.New("config.yaml no longer loads: parsing config: yaml: line 3: did not find expected key"))
 	p := d.post("/settings/restart", d.form())
 	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/settings#restart" || d.restart.count() != 0 {
 		t.Fatalf("refused restart: %d %s", p.status, p.header.Get("Location"))

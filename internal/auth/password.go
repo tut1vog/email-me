@@ -18,9 +18,6 @@ const (
 	argonKeyLen  = 32
 )
 
-// IsArgon2Hash reports whether s looks like an argon2id PHC string.
-func IsArgon2Hash(s string) bool { return strings.HasPrefix(s, "$argon2id$") }
-
 // HashPassword returns an argon2id PHC string.
 func HashPassword(password string) (string, error) {
 	salt := make([]byte, 16)
@@ -66,12 +63,6 @@ func parsePHC(hash string) (*phc, error) {
 		return nil, fmt.Errorf("invalid argon2 hash")
 	}
 	return p, nil
-}
-
-// ValidateHash checks that a PHC string is well-formed.
-func ValidateHash(hash string) error {
-	_, err := parsePHC(hash)
-	return err
 }
 
 // VerifyPassword checks a password against an argon2id PHC string in constant time.

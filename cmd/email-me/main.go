@@ -3,6 +3,8 @@
 //	email-me serve [--config /config/config.yaml]   (default command)
 //	email-me healthcheck [--config ...]             (for Docker HEALTHCHECK)
 //	email-me version
+//	email-me reset-admin-password [--config ...]    (forgotten admin password)
+//	email-me reset-keyring --yes [--config ...]     (lost key-encryption key)
 //
 // Settings saved on the dashboard apply at once. serve restarts in place on
 // SIGHUP or from the dashboard, to apply edits to config.yaml.
@@ -14,6 +16,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,10 +28,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/tut1vog/email-me/internal/admin"
 	"github.com/tut1vog/email-me/internal/api"
 	"github.com/tut1vog/email-me/internal/audit"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/dashboard"
+	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/ratelimit"
@@ -44,7 +49,9 @@ var version = "dev"
 
 func main() {
 	cmd, args := "serve", os.Args[1:]
-	if len(args) > 0 && (args[0] == "serve" || args[0] == "healthcheck" || args[0] == "version") {
+	switch {
+	case len(args) == 0:
+	case args[0] == "serve", args[0] == "healthcheck", args[0] == "version", args[0] == "reset-admin-password", args[0] == "reset-keyring":
 		cmd, args = args[0], args[1:]
 	}
 	if cmd == "version" {
@@ -57,11 +64,25 @@ func main() {
 		defaultCfg = "/config/config.yaml"
 	}
 	cfgPath := fs.String("config", defaultCfg, "path to config.yaml (env EMAIL_ME_CONFIG)")
+	yes := false
+	if cmd == "reset-keyring" {
+		fs.BoolVar(&yes, "yes", false, "discard the credentials (without it, only say what would be discarded)")
+	}
 	fs.Parse(args)
 
 	switch cmd {
 	case "healthcheck":
 		os.Exit(healthcheck(*cfgPath))
+	case "reset-admin-password":
+		if err := resetAdminPassword(*cfgPath, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "email-me:", err)
+			os.Exit(1)
+		}
+	case "reset-keyring":
+		if err := resetKeyring(*cfgPath, yes, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "email-me:", err)
+			os.Exit(1)
+		}
 	default:
 		if err := serve(*cfgPath); err != nil {
 			fmt.Fprintln(os.Stderr, "email-me:", err)
@@ -130,11 +151,36 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 	}
 	defer st.Close()
 
+	// The keyring before anything that reads a credential. A KEK that does
+	// not open it is fatal, like any other bootstrap problem.
+	kr, ev, err := keyring.Open(runCtx, st, cfg.KEK.Key, cfg.KEK.Previous)
+	if err != nil {
+		return err
+	}
+	switch {
+	case ev == keyring.Created:
+		log.Info("created the keyring: stored credentials are encrypted under kek.file from now on")
+	case ev == keyring.Rewrapped:
+		log.Info("rotated the key-encryption key: the keyring is now encrypted under kek.file; remove kek.previous_file and restart")
+	case cfg.KEK.Previous != nil:
+		log.Info("kek.previous_file is no longer needed: the keyring opens with kek.file; remove it")
+	case kr == nil:
+		log.Warn("no key-encryption key (kek.file): signing is off and the SMTP password is stored unencrypted")
+	}
+	setup, err := admin.Ensure(runCtx, st)
+	if err != nil {
+		return err
+	}
+	if setup != "" {
+		// The one secret ever logged: it works once, to choose a password.
+		log.Warn("dashboard setup password: log in with it and choose your own; every start prints a new one until you do", "password", setup)
+	}
+
 	// Settings first: they complete cfg (upstream, default policy, ...).
 	// From here on, everything reads the current configuration through sm,
 	// so a saved setting applies at once; cfg itself is used only for the
 	// bootstrap keys, which need a restart.
-	sm, _, err := settings.Bootstrap(runCtx, st, cfg, log)
+	sm, _, err := settings.Bootstrap(runCtx, st, cfg, kr, log)
 	if err != nil {
 		return err
 	}
@@ -156,7 +202,10 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		log.Warn("defaults.policy.recipients names recipients that do not exist; they are ignored", "aliases", u)
 	}
 
-	km := keys.NewManager(st, keysOptions(cfg, sm))
+	km := keys.NewManager(st, keysOptions(sm, kr))
+	if err := km.LoadMaster(runCtx); err != nil {
+		log.Error("the certification key cannot be loaded; new agent keys are not certified until it is set again on the Settings page", "err", err)
+	}
 	if km.Enabled() {
 		n, err := km.EnsureAll(runCtx)
 		switch {
@@ -170,11 +219,18 @@ func run(ctx context.Context, cfgPath string, hooks runHooks) error {
 		}
 	}
 
-	// A restart is refused while config.yaml does not load, so a typo in
-	// the file cannot take the gateway down.
+	// A restart is refused while config.yaml does not load or its KEK does
+	// not open the keyring, so a typo cannot take the gateway down.
+	preflight := func() error {
+		c, err := config.Load(cfgPath)
+		if err != nil {
+			return fmt.Errorf("config.yaml no longer loads: %w", err)
+		}
+		return keyring.Verify(runCtx, st, c.KEK.Key, c.KEK.Previous)
+	}
 	restart := make(chan struct{}, 1)
 	requestRestart := func() error {
-		if _, err := config.Load(cfgPath); err != nil {
+		if err := preflight(); err != nil {
 			return err
 		}
 		select {
@@ -285,8 +341,8 @@ wait:
 			result = errRestart
 			break wait
 		case <-hooks.hup:
-			if _, err := config.Load(cfgPath); err != nil {
-				log.Error("SIGHUP: not restarting: config.yaml no longer loads", "err", err)
+			if err := preflight(); err != nil {
+				log.Error("SIGHUP: not restarting", "err", err)
 				continue
 			}
 			log.Info("SIGHUP: restarting to re-read config.yaml")
@@ -312,10 +368,11 @@ wait:
 	return result
 }
 
-// keysOptions configures signing from config.yaml's bootstrap keys; the
-// From address and key validity of new keys follow the saved settings.
-func keysOptions(cfg *config.Config, sm *settings.Manager) keys.Options {
-	o := keys.Options{From: func() (string, time.Duration) {
+// keysOptions configures signing: keys are sealed under the keyring (nil:
+// signing is off), and the From address and key validity of new keys
+// follow the saved settings.
+func keysOptions(sm *settings.Manager, kr *keyring.Keyring) keys.Options {
+	return keys.Options{Keyring: kr, From: func() (string, time.Duration) {
 		c := sm.Current()
 		var validity time.Duration
 		if c.Signing != nil {
@@ -323,10 +380,82 @@ func keysOptions(cfg *config.Config, sm *settings.Manager) keys.Options {
 		}
 		return c.Upstream.From, validity
 	}}
-	if cfg.Signing != nil {
-		o.KEK, o.Master = cfg.Signing.KEK, cfg.Signing.Master
+}
+
+// openStateDB opens state.db for a recovery command. It reads only
+// data_dir from config.yaml, so it works when the rest of the file does
+// not load.
+func openStateDB(cfgPath string) (*store.Store, error) {
+	var c struct {
+		DataDir string `yaml:"data_dir"`
 	}
-	return o
+	data, err := os.ReadFile(cfgPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("reading config: %w", err)
+	}
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	if c.DataDir == "" {
+		c.DataDir = "/data"
+	}
+	path := filepath.Join(c.DataDir, "state.db")
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("no state database at %s: %w", path, err)
+	}
+	return store.Open(path)
+}
+
+// resetAdminPassword replaces the admin password with a setup password
+// that the next login must change, and prints it.
+func resetAdminPassword(cfgPath string, out io.Writer) error {
+	st, err := openStateDB(cfgPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	pw, err := admin.Reset(context.Background(), st)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Setup password: %s\n\nLog in to the dashboard with it; you will choose a new password next.\nSessions already open stay valid until they expire or email-me restarts.\n", pw)
+	return nil
+}
+
+// resetKeyring discards the keyring and every credential sealed under it,
+// for a lost key-encryption key. Without yes it only says what it would do.
+func resetKeyring(cfgPath string, yes bool, out io.Writer) error {
+	st, err := openStateDB(cfgPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if !yes {
+		fmt.Fprint(out, `reset-keyring discards every credential encrypted with the key-encryption key:
+  - the upstream SMTP password (enter it again on the Settings page),
+  - the certification master key (set it again on the Settings page),
+  - every agent's signing private key (the keys are retired; their public keys
+    and revocation certificates stay, and agents get new keys at the next start).
+Agents, tokens, recipients, settings and the audit log are kept.
+Stop email-me (or restart it right after), then run again with --yes.
+`)
+		return nil
+	}
+	d, err := st.ResetKeyring(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Discarded the keyring: SMTP password %s, certification key %s, %d agent signing key(s) retired.\n",
+		yesNo(d.SMTPPassword, "removed", "none stored"), yesNo(d.CertifyKey, "removed", "none set"), d.AgentKeys)
+	fmt.Fprintln(out, "Start email-me with the new kek.file: it creates a new keyring and new agent keys.")
+	return nil
+}
+
+func yesNo(b bool, yes, no string) string {
+	if b {
+		return yes
+	}
+	return no
 }
 
 // healthcheck GETs /healthz on the local API. It reads only api.listen and

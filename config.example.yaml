@@ -1,9 +1,11 @@
 # email-me configuration. Copy to ./config/config.yaml and edit.
-# Secrets are never written here: every *_file points at a Docker secret.
-# The file is validated at startup and every problem is reported at once.
+# No secret is written here. The one this file names is the key-encryption
+# key (kek.file, a Docker secret); every other credential lives in state.db
+# and is set on the dashboard. The file is validated at startup and every
+# problem is reported at once.
 #
 # Two kinds of keys:
-# - Bootstrap keys (data_dir, listen addresses, api.tls, secret files, log)
+# - Bootstrap keys (data_dir, listen addresses, api.tls, kek, log)
 #   are read from this file at every start, including restarts from the
 #   dashboard or SIGHUP. The dashboard notices when this file changes and
 #   offers the restart.
@@ -26,19 +28,17 @@ api:
                                          # tunnel (Tailscale/WireGuard/SSH); silences plain-HTTP warnings
 
 dashboard:
-  listen: "0.0.0.0:8026"
-  admin_password_file: /run/secrets/admin_password   # plaintext (≥12 chars) or an argon2id PHC hash
+  listen: "0.0.0.0:8026"            # the first start logs a one-time setup password
   session_ttl: 12h                  # seed
 
-# seed: imported on first boot, then managed on the dashboard (the whole
-# section, the password included; password_file is read only then).
+# seed: imported on first boot, then managed on the dashboard. The SMTP
+# password is never written here: enter it on the Settings page.
 upstream:
   smtp:
     host: smtp.gmail.com
     port: 587
     security: starttls              # starttls | tls | none (none only to localhost)
     username: you@gmail.com
-    password_file: /run/secrets/smtp_password         # e.g. a Gmail app password
     timeout: 30s
   from: you@gmail.com               # envelope and header From address
   from_name_template: "{agent} via email-me"
@@ -58,12 +58,13 @@ recipients:
   #   pgp_public_key_file: /config/keys/work.asc
   #   require_encryption: true
 
-signing:                            # per-agent signing keys held by the gateway; on by default when set
-  key_encryption_key_file: /run/secrets/signing_kek     # openssl rand -hex 32
+kek:                                # key-encryption key: encrypts every credential in state.db
+  file: /run/secrets/kek            # openssl rand -hex 32 (compose: EMAIL_ME_KEK_FILE); an empty file = none,
+                                    # which also turns signing off
+  previous_file: /run/secrets/previous_kek   # only while rotating the KEK; ignored when absent or empty
+
+signing:                            # per-agent signing keys held by the gateway; on by default with a KEK
   key_validity: 2y                  # seed: lifetime of newly generated agent keys
-  # certify_with:                   # optional master key that certifies every agent key
-  #   pgp_private_key_file: /run/secrets/master_key.asc
-  #   passphrase_file: /run/secrets/master_key_passphrase
 
 # seed: imported on first boot, then managed on the dashboard (Default policy).
 defaults:
@@ -76,7 +77,7 @@ defaults:
     rate_limit: { per_hour: 20, per_day: 100 }
     subject_prefix: "[{agent}] "
     require_encryption: false
-    # require_signing: omitted = true when signing is configured, false otherwise
+    # require_signing: omitted = true when a KEK is configured, false otherwise
 
 # seed: imported on first boot, then managed on the dashboard.
 audit:

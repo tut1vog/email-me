@@ -14,6 +14,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
+	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/policy"
@@ -21,7 +22,7 @@ import (
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
-func kek(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
+func kr(b byte) *keyring.Keyring { return keyring.New(bytes.Repeat([]byte{b}, 32)) }
 
 func setup(t *testing.T, master *openpgp.Entity) (*store.Store, *keys.Manager, *store.Agent, string) {
 	t.Helper()
@@ -35,7 +36,12 @@ func setup(t *testing.T, master *openpgp.Entity) (*store.Store, *keys.Manager, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := keys.NewManager(st, keys.Options{KEK: kek(7), Validity: 365 * 24 * time.Hour, Master: master, Email: "gateway@example.com"})
+	m := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 365 * 24 * time.Hour, Email: "gateway@example.com"})
+	if master != nil {
+		if _, err := m.SetMaster(context.Background(), []byte(testutil.ArmorPrivate(t, master)), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return st, m, a, dbPath
 }
 
@@ -116,9 +122,9 @@ func TestWrongKEKFailsLoudly(t *testing.T) {
 	if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
 		t.Fatal(err)
 	}
-	wrong := keys.NewManager(st, keys.Options{KEK: kek(9), Validity: time.Hour, Email: "gateway@example.com"})
-	if _, err := wrong.EnsureAll(ctx); err == nil || !strings.Contains(err.Error(), "same KEK") {
-		t.Fatalf("EnsureAll with wrong KEK must fail loudly, got %v", err)
+	wrong := keys.NewManager(st, keys.Options{Keyring: kr(9), Validity: time.Hour, Email: "gateway@example.com"})
+	if _, err := wrong.EnsureAll(ctx); err == nil || !strings.Contains(err.Error(), "decrypting signing key") {
+		t.Fatalf("EnsureAll with the wrong data key must fail loudly, got %v", err)
 	}
 	if _, _, err := wrong.Signer(ctx, a.ID); err == nil {
 		t.Fatal("Signer with wrong KEK must fail")
@@ -241,14 +247,107 @@ func TestMasterCertification(t *testing.T) {
 	}
 }
 
+// certifiedBy reports whether master certified the armored public key.
+func certifiedBy(t *testing.T, armored string, master *openpgp.Entity) bool {
+	t.Helper()
+	pub := readPublic(t, armored)
+	for _, sig := range pub.PrimaryIdentity().Signatures {
+		if sig.SigType == packet.SigTypeGenericCert && sig.IssuerKeyId != nil && *sig.IssuerKeyId == master.PrimaryKey.KeyId {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMasterSetLoadRemove(t *testing.T) {
+	st, m, a, dbPath := setup(t, nil)
+	ctx := context.Background()
+	master := testutil.NewKey(t, "email-me master", "gateway@example.com")
+
+	// A passphrase-protected key needs its passphrase.
+	cfg := &packet.Config{}
+	if err := master.EncryptPrivateKeys([]byte("open sesame"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, _ := armor.Encode(&buf, openpgp.PrivateKeyType, nil)
+	if err := master.SerializePrivateWithoutSigning(w, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	locked := buf.Bytes()
+	for pass, want := range map[string]string{"": "passphrase-protected", "wrong": "wrong passphrase"} {
+		if _, err := m.SetMaster(ctx, locked, []byte(pass)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("passphrase %q: want %q, got %v", pass, want, err)
+		}
+	}
+	if _, err := m.SetMaster(ctx, []byte(testutil.ArmorPublic(t, master)), nil); err == nil || !strings.Contains(err.Error(), "public key") {
+		t.Fatalf("a public key must be refused: %v", err)
+	}
+	if m.Master() != nil {
+		t.Fatal("a refused key must not be set")
+	}
+	e, err := m.SetMaster(ctx, locked, []byte("open sesame"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := m.Create(ctx, a.ID, a.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !certifiedBy(t, k.PublicKey, e) {
+		t.Fatal("a key generated after SetMaster must be certified")
+	}
+
+	// Stored sealed and without its passphrase: neither the private key
+	// nor the passphrase is in the database files.
+	row, err := st.GetCertifyKey(ctx)
+	if err != nil || row.Fingerprint != pgp.Fingerprint(e) || !strings.Contains(row.PublicKey, "PUBLIC KEY") {
+		t.Fatalf("stored: %+v %v", row, err)
+	}
+	for _, suffix := range []string{"", "-wal"} {
+		b, _ := os.ReadFile(dbPath + suffix)
+		if bytes.Contains(b, []byte("open sesame")) || bytes.Contains(b, []byte("PRIVATE KEY")) {
+			t.Fatalf("certification key material in plaintext in %s", filepath.Base(dbPath+suffix))
+		}
+	}
+
+	// A new manager (the next start) loads it; another data key cannot.
+	again := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 365 * 24 * time.Hour, Email: "gateway@example.com"})
+	if err := again.LoadMaster(ctx); err != nil || again.Master() == nil || pgp.Fingerprint(again.Master()) != pgp.Fingerprint(e) {
+		t.Fatalf("LoadMaster: %v", err)
+	}
+	k2, err := again.Rotate(ctx, a.ID, a.Name)
+	if err != nil || !certifiedBy(t, k2.PublicKey, e) {
+		t.Fatalf("the loaded key must certify: %v", err)
+	}
+	if err := keys.NewManager(st, keys.Options{Keyring: kr(9)}).LoadMaster(ctx); err == nil {
+		t.Fatal("LoadMaster with the wrong data key must fail")
+	}
+
+	if err := again.RemoveMaster(ctx); err != nil || again.Master() != nil {
+		t.Fatalf("RemoveMaster: %v", err)
+	}
+	k3, err := again.Rotate(ctx, a.ID, a.Name)
+	if err != nil || certifiedBy(t, k3.PublicKey, e) {
+		t.Fatalf("a key generated after RemoveMaster is not certified: %v", err)
+	}
+	if _, err := st.GetCertifyKey(ctx); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("removed: %v", err)
+	}
+	if _, err := keys.NewManager(st, keys.Options{}).SetMaster(ctx, locked, []byte("open sesame")); !errors.Is(err, keys.ErrNotConfigured) {
+		t.Fatalf("without a keyring: %v", err)
+	}
+}
+
 func TestExpiredKey(t *testing.T) {
 	st, _, a, _ := setup(t, nil)
-	m := keys.NewManager(st, keys.Options{KEK: kek(7), Validity: 24 * time.Hour, Email: "gateway@example.com"})
+	m := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 24 * time.Hour, Email: "gateway@example.com"})
 	ctx := context.Background()
 	if _, err := m.Create(ctx, a.ID, a.Name); err != nil {
 		t.Fatal(err)
 	}
-	later := keys.NewManager(st, keys.Options{KEK: kek(7), Validity: 24 * time.Hour, Email: "gateway@example.com"})
+	later := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 24 * time.Hour, Email: "gateway@example.com"})
 	keys.SetNow(later, func() time.Time { return time.Now().Add(48 * time.Hour) })
 	if _, _, err := later.Signer(ctx, a.ID); !errors.Is(err, keys.ErrExpired) {
 		t.Fatalf("want ErrExpired, got %v", err)
@@ -276,7 +375,7 @@ func TestNoKeysWithoutFromAddress(t *testing.T) {
 	if _, err := m.Create(ctx, b.ID, b.Name); err != nil {
 		t.Fatal(err)
 	}
-	noFrom := keys.NewManager(st, keys.Options{KEK: kek(7), Validity: 365 * 24 * time.Hour})
+	noFrom := keys.NewManager(st, keys.Options{Keyring: kr(7), Validity: 365 * 24 * time.Hour})
 	if _, err := noFrom.Create(ctx, a.ID, a.Name); !errors.Is(err, keys.ErrNoFrom) {
 		t.Fatalf("Create without a From address: %v", err)
 	}
@@ -300,7 +399,7 @@ func TestFromFollowsSettings(t *testing.T) {
 	ctx := context.Background()
 	var from string
 	validity := 24 * time.Hour
-	m := keys.NewManager(st, keys.Options{KEK: kek(7), From: func() (string, time.Duration) { return from, validity }})
+	m := keys.NewManager(st, keys.Options{Keyring: kr(7), From: func() (string, time.Duration) { return from, validity }})
 	if n, err := m.EnsureAll(ctx); n != 0 || !errors.Is(err, keys.ErrNoFrom) {
 		t.Fatalf("EnsureAll without a From address: %d, %v", n, err)
 	}

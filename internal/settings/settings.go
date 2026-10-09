@@ -22,7 +22,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tut1vog/email-me/internal/config"
-	"github.com/tut1vog/email-me/internal/keys"
+	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/store"
 )
 
@@ -38,12 +38,12 @@ type PasswordState int
 const (
 	// None: no password is stored.
 	None PasswordState = iota
-	// Sealed: encrypted under the signing key-encryption key.
+	// Sealed: encrypted under the keyring.
 	Sealed
 	// Unsealed: stored raw because no key-encryption key is configured.
 	Unsealed
-	// Undecryptable: stored encrypted, but the key-encryption key is missing
-	// or not the one it was sealed with. It must be entered again.
+	// Undecryptable: stored sealed, but it does not open with the keyring
+	// (a damaged row). It must be entered again.
 	Undecryptable
 )
 
@@ -58,9 +58,9 @@ type PasswordChange struct {
 // Manager serves the current configuration and saves new settings.
 type Manager struct {
 	st           *store.Store
-	kek          []byte         // nil: passwords are stored raw
-	base         *config.Config // bootstrap keys that saved settings are validated against
-	bootWarnings []string       // base's own warnings (config.yaml), kept by every snapshot
+	kr           *keyring.Keyring // nil: passwords are stored raw
+	base         *config.Config   // bootstrap keys that saved settings are validated against
+	bootWarnings []string         // base's own warnings (config.yaml), kept by every snapshot
 
 	// cur is the current configuration. A stored snapshot is never
 	// modified: Save stores a new one, so a reader that holds one sees a
@@ -82,11 +82,10 @@ type Manager struct {
 // when config.yaml was the source of truth. Problems in stored settings
 // are not: they are reported by LoadProblems and added to cfg.Warnings.
 // Only a store error fails a boot with stored settings.
-func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, log *slog.Logger) (*Manager, bool, error) {
-	m := &Manager{st: st, base: cfg, bootWarnings: slices.Clone(cfg.Warnings)}
-	if cfg.SigningConfigured() {
-		m.kek = cfg.Signing.KEK
-	}
+//
+// kr seals the SMTP password; nil (no key-encryption key) stores it raw.
+func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, kr *keyring.Keyring, log *slog.Logger) (*Manager, bool, error) {
+	m := &Manager{st: st, kr: kr, base: cfg, bootWarnings: slices.Clone(cfg.Warnings)}
 	fileManaged := !cfg.Managed().IsZero()
 	row, err := st.GetSettings(ctx)
 	seeded := false
@@ -115,18 +114,16 @@ func Bootstrap(ctx context.Context, st *store.Store, cfg *config.Config, log *sl
 	return m, seeded, nil
 }
 
-// seed validates cfg's managed keys (reading the SMTP password file) and
-// stores them if the store has no settings.
+// seed validates cfg's managed keys and stores them if the store has no
+// settings. The SMTP password is never seeded: it is entered on the
+// dashboard.
 func (m *Manager) seed(ctx context.Context, cfg *config.Config) (bool, error) {
 	c := scratch(cfg)
-	if problems, _ := c.ValidateSeed(); len(problems) > 0 {
+	if problems, _ := c.ValidateManaged(); len(problems) > 0 {
 		return false, &config.ValidationError{Problems: problems}
 	}
 	row, err := m.row(c.Managed())
 	if err != nil {
-		return false, err
-	}
-	if row.SMTPPassword, row.PasswordSealed, err = m.seal(c.Upstream.SMTP.Password); err != nil {
 		return false, err
 	}
 	ok, err := m.st.SeedSettings(ctx, row)
@@ -164,17 +161,17 @@ func (m *Manager) load(ctx context.Context, row *store.Settings, cfg *config.Con
 }
 
 // openPassword reads the stored password. One that cannot be decrypted is
-// dropped with a warning; a raw one is sealed now if a KEK has appeared.
+// dropped with a warning; a raw one is sealed now if a keyring has appeared.
 func (m *Manager) openPassword(ctx context.Context, row *store.Settings, log *slog.Logger) (string, PasswordState, error) {
 	switch {
 	case len(row.SMTPPassword) == 0:
 		return "", None, nil
-	case !row.PasswordSealed && m.kek == nil:
-		log.Warn("the upstream SMTP password is stored unencrypted in the state database; set signing.key_encryption_key_file to encrypt it")
+	case !row.PasswordSealed && m.kr == nil:
+		log.Warn("the upstream SMTP password is stored unencrypted in the state database; set kek.file to encrypt it")
 		return string(row.SMTPPassword), Unsealed, nil
 	case !row.PasswordSealed:
 		pw := string(row.SMTPPassword)
-		blob, err := keys.Seal(m.kek, row.SMTPPassword, passwordAAD)
+		blob, err := m.kr.Seal(row.SMTPPassword, passwordAAD)
 		if err != nil {
 			return "", None, err
 		}
@@ -182,15 +179,17 @@ func (m *Manager) openPassword(ctx context.Context, row *store.Settings, log *sl
 		if err := m.st.SaveSettings(ctx, row); err != nil {
 			return "", None, fmt.Errorf("encrypting the stored SMTP password: %w", err)
 		}
-		log.Info("encrypted the stored upstream SMTP password with the key-encryption key")
+		log.Info("encrypted the stored upstream SMTP password with the keyring")
 		return pw, Sealed, nil
-	case m.kek == nil:
-		log.Warn("the stored upstream SMTP password is encrypted but signing.key_encryption_key_file is not set; re-enter the password on the Settings page")
+	case m.kr == nil:
+		// Not reached from serve: a sealed password implies a keyring,
+		// which cannot be opened without a KEK.
+		log.Warn("the stored upstream SMTP password is encrypted but no key-encryption key is set; re-enter the password on the Settings page")
 		return "", Undecryptable, nil
 	}
-	plain, err := keys.Unseal(m.kek, row.SMTPPassword, passwordAAD)
+	plain, err := m.kr.Unseal(row.SMTPPassword, passwordAAD)
 	if err != nil {
-		log.Warn("the stored upstream SMTP password cannot be decrypted (was signing.key_encryption_key_file changed?); re-enter it on the Settings page")
+		log.Warn("the stored upstream SMTP password cannot be decrypted; re-enter it on the Settings page")
 		return "", Undecryptable, nil
 	}
 	return string(plain), Sealed, nil
@@ -206,15 +205,15 @@ func (m *Manager) row(s config.Settings) (*store.Settings, error) {
 }
 
 // seal returns the password column for pw: nil for none, sealed under the
-// KEK if there is one, raw otherwise.
+// keyring if there is one, raw otherwise.
 func (m *Manager) seal(pw string) ([]byte, bool, error) {
 	if pw == "" {
 		return nil, false, nil
 	}
-	if m.kek == nil {
+	if m.kr == nil {
 		return []byte(pw), false, nil
 	}
-	blob, err := keys.Seal(m.kek, []byte(pw), passwordAAD)
+	blob, err := m.kr.Seal([]byte(pw), passwordAAD)
 	return blob, true, err
 }
 
@@ -256,7 +255,7 @@ func (m *Manager) Save(ctx context.Context, s config.Settings, pw PasswordChange
 			state = Sealed
 		default:
 			state = Unsealed
-			warnings = append(warnings, "the SMTP password is stored unencrypted in the state database; set signing.key_encryption_key_file in config.yaml to encrypt it")
+			warnings = append(warnings, "the SMTP password is stored unencrypted in the state database; set kek.file in config.yaml to encrypt it")
 		}
 	}
 	if err := m.st.SaveSettings(ctx, row); err != nil {

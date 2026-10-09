@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tut1vog/email-me/internal/policy"
+	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
 )
 
@@ -30,6 +36,14 @@ type gateway struct {
 }
 
 func startGateway(t *testing.T, env *testutil.Env) *gateway {
+	t.Helper()
+	testutil.SeedState(t, env)
+	return startFresh(t, env)
+}
+
+// startFresh starts serve on env's state database as it is: on a fresh
+// one, the admin has only a setup password and no SMTP password is set.
+func startFresh(t *testing.T, env *testutil.Env) *gateway {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	jar, _ := cookiejar.New(nil)
@@ -279,5 +293,173 @@ func TestRestartRefusedWhenConfigBroken(t *testing.T) {
 	g.waitStarted()
 	if g.bootID() == boot {
 		t.Fatal("SIGHUP must restart once config.yaml loads again")
+	}
+}
+
+func TestFirstStartAndResetAdminPassword(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{})
+	g := startFresh(t, env)
+	if status, _ := g.post("/login", url.Values{"password": {env.AdminPW}}); status != http.StatusUnauthorized {
+		t.Fatal("a fresh install has only a setup password")
+	}
+	if _, body := g.get(g.dash + "/login"); !strings.Contains(body, "one-time setup password") {
+		t.Fatal("the login page says where the setup password is")
+	}
+
+	// The recovery command works on the running gateway's database.
+	var out strings.Builder
+	if err := resetAdminPassword(env.Path, &out); err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`Setup password: (\S+)`).FindStringSubmatch(out.String())
+	if m == nil {
+		t.Fatalf("output: %s", out.String())
+	}
+	status, _ := g.post("/login", url.Values{"password": {m[1]}, "next": {"/settings"}})
+	if status != http.StatusSeeOther {
+		t.Fatalf("setup login: %d", status)
+	}
+	_, body := g.get(g.dash + "/password")
+	tok := csrfRe.FindStringSubmatch(body)
+	if tok == nil {
+		t.Fatal("no CSRF token on the Password page")
+	}
+	if status, _ := g.post("/password", url.Values{"csrf": {tok[1]}, "password": {env.AdminPW}, "confirm": {env.AdminPW}, "next": {"/settings"}}); status != http.StatusSeeOther {
+		t.Fatalf("choosing a password: %d", status)
+	}
+	// Seeded upstream, but no password: the operator enters it.
+	_, body = g.get(g.dash + "/")
+	if !strings.Contains(body, "username but no password") {
+		t.Fatal("a seeded username without a password needs attention")
+	}
+	if status, _ := g.post("/settings/upstream", g.form("host", env.SMTP.Host, "port", strconv.Itoa(env.SMTP.Port), "security", "none",
+		"username", env.SMTP.User, "password", env.SMTP.Pass, "timeout", "5s", "from", "gateway@example.com")); status != http.StatusSeeOther {
+		t.Fatalf("saving the SMTP password: %d", status)
+	}
+	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 1 {
+		t.Fatalf("test send: %d, %d messages", status, env.SMTP.Count())
+	}
+}
+
+// writeKEK replaces the file name in env's directory with a new random KEK
+// and returns it.
+func writeKEK(t *testing.T, env *testutil.Env, name string) []byte {
+	t.Helper()
+	kek := make([]byte, 32)
+	rand.Read(kek)
+	if err := os.WriteFile(filepath.Join(env.Dir, name), []byte(hex.EncodeToString(kek)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return kek
+}
+
+func TestKEKRotation(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{Signing: true})
+	g := startGateway(t, env)
+	g.login()
+	if status, _ := g.post("/agents", g.form("name", "bench")); status != http.StatusSeeOther {
+		t.Fatalf("creating an agent: %d", status)
+	}
+	kekPath := filepath.Join(env.Dir, "kek")
+	old, err := os.ReadFile(kekPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A new KEK alone does not open the keyring: the restart is refused.
+	writeKEK(t, env, "kek")
+	boot := g.bootID()
+	g.hup <- syscall.SIGHUP
+	g.noRestart()
+	if g.bootID() != boot {
+		t.Fatal("the gateway must keep running")
+	}
+	status, _ := g.post("/settings/restart", g.form())
+	if _, body := g.get(g.dash + "/settings"); status != http.StatusSeeOther || !strings.Contains(body, "does not open the state database") {
+		t.Fatal("the dashboard refuses the restart and says why")
+	}
+
+	// With the previous KEK alongside, the restart rewraps the keyring.
+	if err := os.WriteFile(filepath.Join(env.Dir, "previous_kek"), old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withPrevious := strings.Replace(env.YAML, "kek:\n", fmt.Sprintf("kek:\n  previous_file: %q\n", filepath.Join(env.Dir, "previous_kek")), 1)
+	if err := os.WriteFile(env.Path, []byte(withPrevious), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g.hup <- syscall.SIGHUP
+	g.waitStarted()
+	g.login()
+	if _, body := g.get(g.dash + "/"); !strings.Contains(body, "kek.previous_file is still set") {
+		t.Fatal("the overview asks to remove the previous KEK")
+	}
+	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 1 {
+		t.Fatal("the SMTP password still decrypts")
+	}
+
+	// The next start needs only the new KEK; the agent's key still opens
+	// (serve checks every key at start).
+	if err := os.WriteFile(env.Path, []byte(env.YAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(env.Dir, "previous_kek")); err != nil {
+		t.Fatal(err)
+	}
+	g.hup <- syscall.SIGHUP
+	g.waitStarted()
+	g.login()
+	if _, body := g.get(g.dash + "/"); strings.Contains(body, "kek.previous_file is still set") {
+		t.Fatal("no previous KEK any more")
+	}
+	if status, _ := g.post("/settings/test-send", g.form("alias", "me")); status != http.StatusSeeOther || env.SMTP.Count() != 2 {
+		t.Fatal("the SMTP password decrypts with the new KEK alone")
+	}
+}
+
+func TestWrongKEKIsFatalAndResetKeyring(t *testing.T) {
+	env := testutil.NewEnv(t, testutil.Options{Signing: true})
+	testutil.SeedState(t, env)
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(env.DataDir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	a, err := st.CreateAgent(ctx, "bench", "", policy.Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testutil.Keys(t, env, st, testutil.BootstrapSettings(t, env, st)).Create(ctx, a.ID, a.Name); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := st.ActiveKey(ctx, a.ID)
+
+	// The KEK is lost: a start with another one fails.
+	writeKEK(t, env, "kek")
+	if err := run(ctx, env.Path, runHooks{}); err == nil || !strings.Contains(err.Error(), "does not open the state database's keyring") {
+		t.Fatalf("a wrong KEK must be fatal: %v", err)
+	}
+
+	var out strings.Builder
+	if err := resetKeyring(env.Path, false, &out); err != nil || !strings.Contains(out.String(), "--yes") {
+		t.Fatalf("without --yes: %v %s", err, out.String())
+	}
+	if _, err := st.GetKeyring(ctx); err != nil {
+		t.Fatal("without --yes nothing is discarded")
+	}
+	out.Reset()
+	if err := resetKeyring(env.Path, true, &out); err != nil || !strings.Contains(out.String(), "SMTP password removed") || !strings.Contains(out.String(), "1 agent signing key(s) retired") {
+		t.Fatalf("reset: %v %s", err, out.String())
+	}
+
+	// The next start creates a new keyring and a new key for the agent.
+	g := startFresh(t, env)
+	g.login()
+	after, err := st.ActiveKey(ctx, a.ID)
+	if err != nil || after.Fingerprint == before.Fingerprint {
+		t.Fatalf("a new agent key: %v", err)
+	}
+	if _, body := g.get(g.dash + "/settings"); !strings.Contains(body, "No password is stored.") {
+		t.Fatal("the SMTP password was discarded")
 	}
 }

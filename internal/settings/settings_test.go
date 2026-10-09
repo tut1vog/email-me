@@ -3,8 +3,6 @@ package settings_test
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/tut1vog/email-me/internal/config"
+	"github.com/tut1vog/email-me/internal/keyring"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/recipients"
 	"github.com/tut1vog/email-me/internal/settings"
@@ -30,14 +29,28 @@ func boot(t *testing.T, path string, st *store.Store, mod ...func(*config.Config
 	for _, f := range mod {
 		f(cfg)
 	}
-	m, seeded, err := settings.Bootstrap(context.Background(), st, cfg, testutil.DiscardLogger())
+	kr, _, err := keyring.Open(context.Background(), st, cfg.KEK.Key, cfg.KEK.Previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, seeded, err := settings.Bootstrap(context.Background(), st, cfg, kr, testutil.DiscardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	return m, cfg, seeded
 }
 
-func noSigning(c *config.Config) { c.Signing = nil }
+// noKEK boots as if kek.file were not set.
+func noKEK(c *config.Config) { c.Signing, c.KEK.Key = nil, nil }
+
+// enterPassword saves the SMTP password, as the operator does on the
+// dashboard: it is never seeded.
+func enterPassword(t *testing.T, m *settings.Manager, pw string) {
+	t.Helper()
+	if _, err := m.Save(context.Background(), m.Saved(), settings.PasswordChange{Set: true, Value: pw}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func writeFile(t *testing.T, p, content string) string {
 	t.Helper()
@@ -62,15 +75,17 @@ func TestSeedOnlyIntoEmpty(t *testing.T) {
 	if r.Upstream.SMTP.Host != env.SMTP.Host || r.Upstream.SMTP.Port != env.SMTP.Port || r.Upstream.From != "gateway@example.com" || r.API.Docs != "public" {
 		t.Fatalf("saved = %+v", r)
 	}
-	if cfg.Upstream.SMTP.Password != env.SMTP.Pass || !slices.Equal(cfg.DefaultPolicy.Recipients, []string{"me"}) || len(cfg.API.TrustedNets) != 1 {
+	if !slices.Equal(cfg.DefaultPolicy.Recipients, []string{"me"}) || len(cfg.API.TrustedNets) != 1 {
 		t.Fatalf("cfg not loaded: %+v", cfg.Managed())
 	}
 	if m.Current() != cfg {
 		t.Fatal("the loaded config is the first current one")
 	}
-	if len(m.LoadProblems()) != 0 || !m.HasPassword() {
-		t.Fatalf("problems %v", m.LoadProblems())
+	// The password is never seeded: the username alone is a warning.
+	if len(m.LoadProblems()) != 0 || m.HasPassword() || cfg.Upstream.SMTP.Password != "" || !slices.Contains(cfg.Warnings, config.SMTPPasswordMissing) {
+		t.Fatalf("problems %v, warnings %v", m.LoadProblems(), cfg.Warnings)
 	}
+	enterPassword(t, m, env.SMTP.Pass)
 
 	// Later boots ignore the file's managed keys, even if they changed.
 	changed := strings.Replace(env.YAML, "retention_days: 30", "retention_days: 99", 1)
@@ -93,7 +108,7 @@ func TestSeedProblemsAreFatal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = settings.Bootstrap(context.Background(), st, cfg, testutil.DiscardLogger())
+	_, _, err = settings.Bootstrap(context.Background(), st, cfg, nil, testutil.DiscardLogger())
 	var ve *config.ValidationError
 	if !errors.As(err, &ve) || len(ve.Problems) != 2 {
 		t.Fatalf("want both seed problems, got %v", err)
@@ -120,6 +135,8 @@ func TestSave(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{TrustedProxies: []string{"10.0.0.1", "192.168.0.0/16"}})
 	st := testutil.OpenStore(t, env)
 	m, cfg, _ := boot(t, env.Path, st)
+	enterPassword(t, m, env.SMTP.Pass)
+	cfg = m.Current()
 	ctx := context.Background()
 	orig := m.Saved()
 
@@ -160,7 +177,7 @@ func TestSave(t *testing.T) {
 		c.DefaultPolicy.RateLimit.PerHour != 1 || c.Upstream.SMTP.Password != env.SMTP.Pass {
 		t.Fatalf("current = %+v", c.Managed())
 	}
-	if c.Dashboard.AdminPasswordHash != cfg.Dashboard.AdminPasswordHash || c.DataDir != cfg.DataDir {
+	if c.KEK.File != cfg.KEK.File || c.DataDir != cfg.DataDir {
 		t.Fatal("the bootstrap keys carry over")
 	}
 	// The boot config is a snapshot of its own and is never modified.
@@ -183,14 +200,14 @@ func TestSave(t *testing.T) {
 		t.Fatalf("reverted, still differs: %v", d)
 	}
 
-	// Removing the password needs no username.
-	if _, err := m.Save(ctx, orig, settings.PasswordChange{Set: true}); err == nil || !strings.Contains(err.Error(), "password is required") {
-		t.Fatalf("username without password: %v", err)
+	// Removing the password while a username is set only warns.
+	if w, err := m.Save(ctx, orig, settings.PasswordChange{Set: true}); err != nil || !slices.Contains(w, config.SMTPPasswordMissing) || m.HasPassword() || m.PasswordState() != settings.None {
+		t.Fatalf("remove password: %v %v %v", w, err, m.PasswordState())
 	}
 	noUser := m.Saved()
 	noUser.Upstream.SMTP.Username = ""
-	if _, err := m.Save(ctx, noUser, settings.PasswordChange{Set: true}); err != nil || m.HasPassword() || m.PasswordState() != settings.None {
-		t.Fatalf("remove password: %v %v", err, m.PasswordState())
+	if w, err := m.Save(ctx, noUser, settings.PasswordChange{}); err != nil || slices.Contains(w, config.SMTPPasswordMissing) {
+		t.Fatalf("no username: %v %v", w, err)
 	}
 
 	// The next boot runs with what was saved.
@@ -217,6 +234,7 @@ func TestPasswordSealedRoundTrip(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{Signing: true})
 	st := testutil.OpenStore(t, env)
 	m, _, _ := boot(t, env.Path, st)
+	enterPassword(t, m, env.SMTP.Pass)
 	if m.PasswordState() != settings.Sealed {
 		t.Fatalf("state = %v", m.PasswordState())
 	}
@@ -236,7 +254,8 @@ func TestPasswordSealedRoundTrip(t *testing.T) {
 func TestPasswordRawWithoutKEKThenResealed(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{Signing: true})
 	st := testutil.OpenStore(t, env)
-	m, _, _ := boot(t, env.Path, st, noSigning)
+	m, _, _ := boot(t, env.Path, st, noKEK)
+	enterPassword(t, m, env.SMTP.Pass)
 	row, _ := st.GetSettings(context.Background())
 	if m.PasswordState() != settings.Unsealed || row.PasswordSealed || string(row.SMTPPassword) != env.SMTP.Pass {
 		t.Fatalf("state %v, row %+v", m.PasswordState(), row)
@@ -255,34 +274,32 @@ func TestPasswordRawWithoutKEKThenResealed(t *testing.T) {
 func TestPasswordUndecryptable(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{Signing: true})
 	st := testutil.OpenStore(t, env)
-	boot(t, env.Path, st)
+	m, _, _ := boot(t, env.Path, st)
+	enterPassword(t, m, env.SMTP.Pass)
 
-	// The KEK is removed: boot anyway, without the password.
-	m, cfg, _ := boot(t, env.Path, st, noSigning)
+	// A damaged row: boot anyway, without the password. (A KEK that does
+	// not open the keyring never gets this far: see the keyring package.)
+	ctx := context.Background()
+	row, _ := st.GetSettings(ctx)
+	row.SMTPPassword[len(row.SMTPPassword)-1] ^= 1
+	if err := st.SaveSettings(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	m, cfg, _ := boot(t, env.Path, st)
 	if m.PasswordState() != settings.Undecryptable || !m.HasPassword() || cfg.Upstream.SMTP.Password != "" {
-		t.Fatalf("no KEK: state %v", m.PasswordState())
+		t.Fatalf("state %v", m.PasswordState())
 	}
-	if !slices.ContainsFunc(m.LoadProblems(), func(p string) bool { return strings.Contains(p, "password is required") }) {
-		t.Fatalf("problems = %v", m.LoadProblems())
-	}
-
-	// The KEK is replaced: same.
-	kek := make([]byte, 32)
-	rand.Read(kek)
-	writeFile(t, filepath.Join(env.Dir, "signing_kek"), hex.EncodeToString(kek))
-	m, cfg, _ = boot(t, env.Path, st)
-	if m.PasswordState() != settings.Undecryptable || cfg.Upstream.SMTP.Password != "" {
-		t.Fatalf("new KEK: state %v", m.PasswordState())
+	if len(m.LoadProblems()) != 0 || !slices.Contains(cfg.Warnings, config.SMTPPasswordMissing) {
+		t.Fatalf("problems %v, warnings %v", m.LoadProblems(), cfg.Warnings)
 	}
 	// Saving other settings keeps the stored password as it is; entering
 	// it again fixes it.
 	s := m.Saved()
-	s.Upstream.SMTP.Username = ""
-	if _, err := m.Save(context.Background(), s, settings.PasswordChange{}); err != nil || m.PasswordState() != settings.Undecryptable {
+	s.Audit.RetentionDays = 7
+	if _, err := m.Save(ctx, s, settings.PasswordChange{}); err != nil || m.PasswordState() != settings.Undecryptable {
 		t.Fatalf("keep: %v %v", err, m.PasswordState())
 	}
-	s.Upstream.SMTP.Username = env.SMTP.User
-	if _, err := m.Save(context.Background(), s, settings.PasswordChange{Set: true, Value: env.SMTP.Pass}); err != nil || m.PasswordState() != settings.Sealed {
+	if _, err := m.Save(ctx, s, settings.PasswordChange{Set: true, Value: env.SMTP.Pass}); err != nil || m.PasswordState() != settings.Sealed {
 		t.Fatalf("re-enter: %v %v", err, m.PasswordState())
 	}
 	if m.Current().Upstream.SMTP.Password != env.SMTP.Pass {
@@ -297,6 +314,7 @@ func TestStoredProblemsNeverBlockBoot(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
 	st := testutil.OpenStore(t, env)
 	m, _, _ := boot(t, env.Path, st)
+	enterPassword(t, m, env.SMTP.Pass)
 	ctx := context.Background()
 	row, _ := st.GetSettings(ctx)
 

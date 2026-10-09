@@ -26,10 +26,13 @@
     <a class="nav-item" href="/audit" title="Audit log" {{if eq .Section "audit"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-list"/></svg><span>Audit log</span></a>
     <a class="nav-item" href="/settings" title="Settings" {{if eq .Section "settings"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-sliders"/></svg><span>Settings</span></a>
   </nav>
-  <form method="post" action="/logout" class="logout">
-    <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <button class="nav-item" type="submit" title="Log out"><svg class="icon" aria-hidden="true"><use href="#icon-log-out"/></svg><span>Log out</span></button>
-  </form>
+  <div class="sidebar-foot">
+    <a class="nav-item" href="/password" title="Password" {{if eq .Section "password"}}aria-current="page"{{end}}><svg class="icon" aria-hidden="true"><use href="#icon-key"/></svg><span>Password</span></a>
+    <form method="post" action="/logout">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button class="nav-item" type="submit" title="Log out"><svg class="icon" aria-hidden="true"><use href="#icon-log-out"/></svg><span>Log out</span></button>
+    </form>
+  </div>
 </aside>
 <label for="nav-toggle" class="nav-scrim" aria-hidden="true"></label>
 {{end}}

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/policy"
 	"github.com/tut1vog/email-me/internal/testutil"
@@ -24,23 +23,18 @@ func TestLoadValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Upstream.SMTP.Password != "" || c.DefaultPolicy.Services != nil {
-		t.Fatal("Load must not read the seed-only password file or resolve managed settings")
+	if c.DefaultPolicy.Services != nil {
+		t.Fatal("Load must not resolve managed settings")
 	}
-	if problems, warnings := c.ValidateSeed(); len(problems)+len(warnings) != 0 {
+	// The password is never in the file: a username without one warns.
+	if problems, warnings := c.ValidateManaged(); len(problems) != 0 || !slices.Equal(warnings, []string{config.SMTPPasswordMissing}) {
 		t.Fatalf("seed: %v %v", problems, warnings)
 	}
-	if !c.SigningConfigured() || len(c.Signing.KEK) != 32 {
+	if !c.SigningConfigured() || len(c.KEK.Key) != 32 || c.KEK.Previous != nil {
 		t.Fatal("signing should be configured")
 	}
 	if !strings.Contains(c.Recipients["me"].PublicKeyArmor, "BEGIN PGP PUBLIC KEY BLOCK") || c.Recipients["ops"].PublicKeyArmor != "" {
 		t.Fatal("recipient keys loaded incorrectly")
-	}
-	if !auth.VerifyPassword(c.Dashboard.AdminPasswordHash, env.AdminPW) {
-		t.Fatal("plaintext admin password must be hashed at load")
-	}
-	if c.Upstream.SMTP.Password != env.SMTP.Pass {
-		t.Fatal("SMTP password not read (trailing newline must be trimmed)")
 	}
 	if !c.DefaultPolicy.RequireSigning || !c.DefaultPolicy.HasService(policy.SvcSign) {
 		t.Fatal("signing must be on by default when configured")
@@ -72,8 +66,9 @@ api:
   docs: sometimes
   trusted_proxies: ["not-an-ip"]
 dashboard:
-  admin_password_file: /does/not/exist
   session_ttl: 30s
+kek:
+  file: /does/not/exist
 upstream:
   smtp:
     host: smtp.example.com
@@ -105,7 +100,7 @@ func TestValidationCollectsAllProblems(t *testing.T) {
 	}
 	joined := strings.Join(ve.Problems, "\n")
 	for _, want := range []string{
-		"api.listen", "admin_password_file", `"Bad_Alias"`, "recipients.Bad_Alias.address",
+		"api.listen", "kek.file", `"Bad_Alias"`, "recipients.Bad_Alias.address",
 		"recipients.ok.require_encryption", "log.level",
 	} {
 		if !strings.Contains(joined, want) {
@@ -113,7 +108,7 @@ func TestValidationCollectsAllProblems(t *testing.T) {
 		}
 	}
 	// Managed keys are not checked by Load: only when they seed the
-	// database (ValidateSeed) or are saved (ValidateManaged).
+	// database or are saved (ValidateManaged).
 	for _, managed := range []string{"api.docs", "upstream", "fax", "retention_days"} {
 		if strings.Contains(joined, managed) {
 			t.Errorf("Load reported managed key %q:\n%s", managed, joined)
@@ -121,33 +116,34 @@ func TestValidationCollectsAllProblems(t *testing.T) {
 	}
 
 	env := testutil.NewEnv(t, testutil.Options{})
-	yaml := strings.NewReplacer(`"nope"`, `"127.0.0.1:0"`, "/does/not/exist", filepath.Join(env.Dir, "admin_password"), "loud", "info").Replace(badManaged)
+	empty := filepath.Join(env.Dir, "empty_kek")
+	os.WriteFile(empty, nil, 0o600)
+	yaml := strings.NewReplacer(`"nope"`, `"127.0.0.1:0"`, "/does/not/exist", empty, "loud", "info").Replace(badManaged)
 	start, end := strings.Index(yaml, "recipients:\n  Bad"), strings.Index(yaml, "defaults:\n")
 	c, err := config.Load(writeConfig(t, yaml[:start]+yaml[end:]))
 	if err != nil {
 		t.Fatalf("valid bootstrap keys must load: %v", err)
 	}
-	problems, _ := c.ValidateSeed()
+	problems, warnings := c.ValidateManaged()
 	joined = strings.Join(problems, "\n")
 	for _, want := range []string{
-		"api.docs", "trusted_proxies", "session_ttl must be at least 1m", "security none", "password_file is required",
+		"api.docs", "trusted_proxies", "session_ttl must be at least 1m", "security none",
 		"upstream.from", "fax", "require_signing is true but signing is not configured", "retention_days",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing managed problem %q in:\n%s", want, joined)
 		}
 	}
-	// A save (not a seed) asks for the password itself, not its file.
-	if problems, _ := c.ValidateManaged(); !slices.ContainsFunc(problems, func(p string) bool {
-		return strings.Contains(p, "upstream.smtp.password is required")
-	}) {
-		t.Errorf("ValidateManaged: %v", problems)
+	// A username without a password is only a warning: it is entered on
+	// the dashboard.
+	if strings.Contains(joined, "password") || !slices.Contains(warnings, config.SMTPPasswordMissing) {
+		t.Errorf("password: %v %v", problems, warnings)
 	}
 }
 
 func TestBootstrapOnlyConfig(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
-	yaml := fmt.Sprintf("data_dir: %q\ndashboard:\n  admin_password_file: %q\n", env.DataDir, filepath.Join(env.Dir, "admin_password"))
+	yaml := fmt.Sprintf("data_dir: %q\n", env.DataDir)
 	c, err := config.Load(writeConfig(t, yaml))
 	if err != nil {
 		t.Fatalf("a file with only bootstrap keys must load: %v", err)
@@ -155,7 +151,7 @@ func TestBootstrapOnlyConfig(t *testing.T) {
 	if !c.Managed().IsZero() {
 		t.Fatalf("no managed keys were set: %+v", c.Managed())
 	}
-	problems, warnings := c.ValidateSeed()
+	problems, warnings := c.ValidateManaged()
 	if len(problems) != 0 {
 		t.Fatalf("defaults must be valid: %v", problems)
 	}
@@ -173,27 +169,47 @@ func TestBootstrapOnlyConfig(t *testing.T) {
 	}
 }
 
-func TestSeedReadsPasswordFile(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	missing := strings.Replace(env.YAML, filepath.Join(env.Dir, "smtp_password"), filepath.Join(env.Dir, "nope"), 1)
-	c, err := config.Load(writeConfig(t, missing))
-	if err != nil {
-		t.Fatalf("password_file is seed-only and not read by Load: %v", err)
+func TestKEKFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
-	if problems, _ := c.ValidateSeed(); len(problems) != 1 || !strings.Contains(problems[0], "upstream.smtp.password_file") {
-		t.Fatalf("seed must read password_file: %v", problems)
+	hex1 := strings.Repeat("ab", 32)
+	hex2 := strings.Repeat("cd", 32)
+	load := func(kek string) (*config.Config, error) {
+		return config.Load(writeConfig(t, fmt.Sprintf("data_dir: %q\nkek:\n%ssigning:\n  key_validity: 1y\n", dir, kek)))
 	}
-	c, _ = config.Load(env.Path)
-	c.ValidateSeed()
-	if c.Upstream.SMTP.Password != env.SMTP.Pass {
-		t.Fatalf("password = %q", c.Upstream.SMTP.Password)
+
+	c, err := load(fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("kek", hex1+"\n"), write("prev", hex2)))
+	if err != nil || !c.KEK.Configured() || c.KEK.Key[0] != 0xab || c.KEK.Previous[0] != 0xcd || !c.SigningConfigured() {
+		t.Fatalf("both keys: %+v %v", c, err)
+	}
+	// An empty file is no KEK (compose mounts an empty variable), which
+	// also leaves signing off; a missing previous file is no previous KEK.
+	c, err = load(fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("empty", "\n"), filepath.Join(dir, "absent")))
+	if err != nil || c.KEK.Key != nil || c.KEK.Previous != nil || c.Signing != nil || c.SigningConfigured() {
+		t.Fatalf("empty: %+v %v", c, err)
+	}
+	for kek, want := range map[string]string{
+		fmt.Sprintf("  file: %q\n", filepath.Join(dir, "absent")):                              "kek.file",
+		fmt.Sprintf("  file: %q\n", write("short", "abc")):                                     "kek.file: must contain 32 random bytes",
+		fmt.Sprintf("  file: %q\n  previous_file: %q\n", write("k2", hex1), write("bad", "x")): "kek.previous_file: must contain",
+		fmt.Sprintf("  previous_file: %q\n", write("p2", hex2)):                                "kek.previous_file is set but kek.file is not",
+	} {
+		if _, err := load(kek); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: want %q, got %v", kek, want, err)
+		}
 	}
 }
 
 func TestManagedRoundTrip(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{DefaultsPolicy: "recipients: [me]\nrate_limit: {per_hour: 5, per_day: 10}", TrustedProxies: []string{"10.0.0.1"}})
 	c, _ := config.Load(env.Path)
-	c.ValidateSeed()
+	c.ValidateManaged()
 	s := c.Managed()
 	if c.Signing != nil || s.Signing.KeyValidity != 0 {
 		t.Fatal("no signing configured")
@@ -207,6 +223,7 @@ func TestManagedRoundTrip(t *testing.T) {
 	}
 	s.Signing.KeyValidity = units.Duration(24 * time.Hour)
 	s.Audit.RetentionDays = 7
+	s.Upstream.SMTP.Password = env.SMTP.Pass
 	other, _ := config.Load(env.Path)
 	other.SetManaged(s)
 	if other.Signing != nil {
@@ -221,7 +238,7 @@ func TestManagedRoundTrip(t *testing.T) {
 		t.Fatalf("round trip differs: %v", d)
 	}
 
-	// JSON drops the password and its file but keeps everything else.
+	// JSON drops the password but keeps everything else.
 	data, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +259,7 @@ func TestManagedRoundTrip(t *testing.T) {
 	ss := sc.Managed()
 	ss.Signing.KeyValidity = units.Duration(48 * time.Hour)
 	sc.SetManaged(ss)
-	if sc.Signing == nil || sc.Signing.KeyValidity.D() != 48*time.Hour || len(sc.Signing.KEK) != 32 {
+	if sc.Signing == nil || sc.Signing.KeyValidity.D() != 48*time.Hour || !sc.KEK.Configured() {
 		t.Fatalf("signing: %+v", sc.Signing)
 	}
 }
@@ -250,7 +267,7 @@ func TestManagedRoundTrip(t *testing.T) {
 func TestDiffSettings(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
 	c, _ := config.Load(env.Path)
-	c.ValidateSeed()
+	c.ValidateManaged()
 	a := c.Managed()
 	b := a.Clone()
 	if d := config.DiffSettings(a, b); len(d) != 0 {
@@ -297,7 +314,7 @@ func TestFingerprint(t *testing.T) {
 func TestValidateManagedRepeatable(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{TrustedProxies: []string{"10.0.0.1", "192.168.0.0/16"}})
 	c, _ := config.Load(env.Path)
-	c.ValidateSeed() // reads the password
+	c.ValidateManaged()
 	for range 3 {
 		if problems, _ := c.ValidateManaged(); len(problems) != 0 {
 			t.Fatal(problems)
@@ -336,14 +353,14 @@ func TestDefaultsRejectE2EWithRequiredSigning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if problems, _ := c.ValidateSeed(); len(problems) != 1 || !strings.Contains(problems[0], "mutually exclusive") {
+	if problems, _ := c.ValidateManaged(); len(problems) != 1 || !strings.Contains(problems[0], "mutually exclusive") {
 		t.Fatalf("e2e with default require_signing must be rejected: %v", problems)
 	}
 	ok := env.YAML + "defaults:\n  policy:\n    services: [markdown, e2e]\n    require_signing: false\n"
 	if c, err = config.Load(writeConfig(t, ok)); err != nil {
 		t.Fatal(err)
 	}
-	if problems, _ := c.ValidateSeed(); len(problems) != 0 {
+	if problems, _ := c.ValidateManaged(); len(problems) != 0 {
 		t.Fatalf("e2e with require_signing false is valid: %v", problems)
 	}
 }
@@ -355,7 +372,8 @@ func TestPublicURLWarning(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		problems, warnings := c.ValidateSeed()
+		c.Upstream.SMTP.Password = "set on the dashboard"
+		problems, warnings := c.ValidateManaged()
 		if len(problems) != 0 {
 			t.Fatal(problems)
 		}
@@ -389,27 +407,6 @@ func TestParseKEK(t *testing.T) {
 	}
 }
 
-func TestArgon2HashInPasswordFile(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	h, _ := auth.HashPassword("another long password")
-	hp := filepath.Join(env.Dir, "admin_hash")
-	os.WriteFile(hp, []byte(h+"\n"), 0o600)
-	yaml := strings.Replace(env.YAML, filepath.Join(env.Dir, "admin_password"), hp, 1)
-	c, err := config.Load(writeConfig(t, yaml))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Dashboard.AdminPasswordHash != h {
-		t.Fatal("PHC hash must be used as-is")
-	}
-	short := filepath.Join(env.Dir, "short_pw")
-	os.WriteFile(short, []byte("short"), 0o600)
-	yaml = strings.Replace(env.YAML, filepath.Join(env.Dir, "admin_password"), short, 1)
-	if _, err := config.Load(writeConfig(t, yaml)); err == nil || !strings.Contains(err.Error(), "at least 12") {
-		t.Fatalf("short password must be rejected: %v", err)
-	}
-}
-
 func TestIsLoopbackHost(t *testing.T) {
 	for h, want := range map[string]bool{"localhost": true, "LOCALHOST.": true, "127.0.0.1": true, "::1": true, "[::1]": true, "127.1.2.3": true, "example.com": false, "10.0.0.1": false, "": false} {
 		if got := config.IsLoopbackHost(h); got != want {
@@ -424,7 +421,7 @@ func TestPlaintextOnlyToLocalhost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.ValidateSeed()
+	c.Upstream.SMTP.Password = "set on the dashboard"
 	for host, ok := range map[string]bool{"127.0.0.1": true, "localhost": true, "smtp.example.com": false, "10.0.0.1": false} {
 		c.Upstream.SMTP.Host = host
 		problems, warnings := c.ValidateManaged()

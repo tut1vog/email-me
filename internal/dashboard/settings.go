@@ -407,7 +407,7 @@ func (s *Server) saveAudit(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) saveSigning(w http.ResponseWriter, r *http.Request) {
 	if !s.Keys.Enabled() {
-		s.flash(r, "error", "Signing is not configured: set signing.key_encryption_key_file in config.yaml first.")
+		s.flash(r, "error", "Signing is not configured: set kek.file in config.yaml first.")
 		s.redirect(w, r, "/settings#signing")
 		return
 	}
@@ -420,6 +420,40 @@ func (s *Server) saveSigning(w http.ResponseWriter, r *http.Request) {
 			return errs
 		},
 	})
+}
+
+// setCertifyKey stores a pasted private key as the certification master
+// key. The passphrase only decrypts it here; neither the key nor the
+// passphrase is ever shown again.
+func (s *Server) setCertifyKey(w http.ResponseWriter, r *http.Request) {
+	defer s.redirect(w, r, "/settings#signing")
+	if !s.Keys.Enabled() {
+		s.flash(r, "error", "Signing is not configured: set kek.file in config.yaml first.")
+		return
+	}
+	key := strings.TrimSpace(r.PostForm.Get("private_key"))
+	if key == "" {
+		s.flash(r, "error", "Certification key not set: paste an ASCII-armored private key.")
+		return
+	}
+	e, err := s.Keys.SetMaster(r.Context(), []byte(key), []byte(r.PostForm.Get("passphrase")))
+	if err != nil {
+		s.flash(r, "error", "Certification key not set: %v.", err)
+		return
+	}
+	fpr := pgp.Fingerprint(e)
+	s.Log.Info("certification key set", "fingerprint", fpr)
+	s.flash(r, "ok", "Certification key %s set. It certifies agent keys generated from now on; rotate an agent's key to certify it.", fpr)
+}
+
+func (s *Server) removeCertifyKey(w http.ResponseWriter, r *http.Request) {
+	if err := s.Keys.RemoveMaster(r.Context()); err != nil {
+		s.fail(w, "removing the certification key", err)
+		return
+	}
+	s.Log.Info("certification key removed")
+	s.flash(r, "ok", "Certification key removed. Keys it certified keep their certification; new keys are not certified.")
+	s.redirect(w, r, "/settings#signing")
 }
 
 // extendWriteDeadline gives a response that waits on the upstream server
@@ -498,12 +532,13 @@ func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Restart(); err != nil {
+		// A config.yaml problem lists every problem on one line.
 		msg := err.Error()
 		if ve := (*config.ValidationError)(nil); errors.As(err, &ve) {
-			msg = strings.Join(ve.Problems, "; ")
+			msg = "config.yaml no longer loads: " + strings.Join(ve.Problems, "; ")
 		}
-		s.Log.Warn("restart refused: config.yaml does not load", "err", err)
-		s.flash(r, "error", "Not restarted: config.yaml no longer loads: %s.", msg)
+		s.Log.Warn("restart refused", "err", err)
+		s.flash(r, "error", "Not restarted: %s.", strings.TrimSuffix(msg, "."))
 		s.redirect(w, r, "/settings#restart")
 		return
 	}

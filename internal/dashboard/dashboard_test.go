@@ -7,7 +7,6 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -91,17 +90,7 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	ko := keys.Options{From: func() (string, time.Duration) {
-		c := sm.Current()
-		if c.Signing == nil {
-			return c.Upstream.From, 0
-		}
-		return c.Upstream.From, c.Signing.KeyValidity.D()
-	}}
-	if cfg.Signing != nil {
-		ko.KEK = cfg.Signing.KEK
-	}
-	km := keys.NewManager(st, ko)
+	km := testutil.Keys(t, env, st, sm)
 	rs := &fakeRestart{}
 	changed := &atomic.Bool{}
 	srv, err := dashboard.New(dashboard.Deps{Config: sm.Current, Store: st, Recipients: reg, Settings: sm, Keys: km,
@@ -440,11 +429,12 @@ func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
 			t.Fatalf("settings page leaks a secret: %q", secret)
 		}
 	}
-	if strings.Contains(s, "Effective configuration") || strings.Contains(s, filepath.Join(d.env.Dir, "smtp_password")) {
-		t.Fatal("the YAML dump is gone, and the SMTP password file is only a seed")
+	if strings.Contains(s, "Effective configuration") || strings.Contains(s, "admin_password") {
+		t.Fatal("the YAML dump and the admin password file are gone")
 	}
-	for _, want := range []string{`id="bootstrap"`, d.env.Config.Dashboard.AdminPasswordFile, d.env.Config.Signing.KeyEncryptionKeyFile,
-		`name="password" type="password" autocomplete="new-password"`, "encrypted with the key-encryption key", `value="gateway@example.com"`} {
+	for _, want := range []string{`id="bootstrap"`, d.env.Config.KEK.File,
+		`name="password" type="password" autocomplete="new-password"`, "A password is stored, encrypted.", `value="gateway@example.com"`,
+		`action="/settings/certify-key"`, `name="private_key"`} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("settings page lacks %q", want)
 		}

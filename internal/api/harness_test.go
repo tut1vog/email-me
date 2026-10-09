@@ -95,17 +95,7 @@ func newHarness(t *testing.T, o testutil.Options) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ko := keys.Options{From: func() (string, time.Duration) {
-		c := sm.Current()
-		if c.Signing == nil {
-			return c.Upstream.From, 0
-		}
-		return c.Upstream.From, c.Signing.KeyValidity.D()
-	}}
-	if cfg.Signing != nil {
-		ko.KEK, ko.Master = cfg.Signing.KEK, cfg.Signing.Master
-	}
-	km := keys.NewManager(st, ko)
+	km := testutil.Keys(t, env, st, sm)
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := api.New(api.Deps{

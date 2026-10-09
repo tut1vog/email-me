@@ -49,7 +49,7 @@
         <div class="field">
           <label for="smtp_password">Password</label>
           <input id="smtp_password" name="password" type="password" autocomplete="new-password" placeholder="{{if $d.HasPassword}}Leave blank to keep{{end}}">
-          <p class="hint">{{if eq $d.Password "sealed"}}A password is stored, encrypted with the key-encryption key.{{else if eq $d.Password "unsealed"}}A password is stored <strong>unencrypted</strong>: set <code>signing.key_encryption_key_file</code> in config.yaml to encrypt it.{{else if eq $d.Password "undecryptable"}}The stored password <strong>cannot be decrypted</strong>: the key-encryption key changed or was removed. Enter it again.{{else}}No password is stored.{{end}} It is never shown.</p>
+          <p class="hint">{{if eq $d.Password "sealed"}}A password is stored, encrypted.{{else if eq $d.Password "unsealed"}}A password is stored <strong>unencrypted</strong>: set <code>kek.file</code> in config.yaml to encrypt it.{{else if eq $d.Password "undecryptable"}}The stored password <strong>cannot be decrypted</strong>. Enter it again.{{else}}No password is stored.{{end}} It is never shown.</p>
           {{if $d.HasPassword}}<label class="check"><input type="checkbox" name="remove_password"> Remove the stored password</label>{{end}}
         </div>
       </div>
@@ -152,6 +152,7 @@
       <input id="session_ttl" name="session_ttl" value="{{$f.Dashboard.SessionTTL}}" placeholder="12h">
       <p class="hint">How long a login lasts, e.g. <code>12h</code> or <code>7d</code>; at least <code>1m</code>. Applies to new logins; open sessions keep theirs.</p>
     </div>
+    <p class="small text-2">The admin password is changed on the <a href="/password">Password</a> page.</p>
   </div>
   <div class="card-footer"><button type="submit">Save dashboard settings</button></div>
 </form>
@@ -188,7 +189,7 @@
     </details>
     {{end}}
   {{else}}
-    <p class="muted">Signing is not configured. Set <code>signing.key_encryption_key_file</code> in config.yaml and restart to give every agent its own signing key.</p>
+    <p class="muted">Signing is not configured. Set <code>kek.file</code> in config.yaml (with compose, the file named by <code>EMAIL_ME_KEK_FILE</code>) and recreate the container (<code>docker compose up -d --force-recreate</code>) to give every agent its own signing key.</p>
   {{end}}
   </div>
   {{if $d.SigningEnabled}}
@@ -203,6 +204,31 @@
     </div>
     <div class="card-footer"><button type="submit">Save signing settings</button></div>
   </form>
+  <div class="card-body card-section">
+    <h3 class="mt-0">Certification master key</h3>
+    {{if $d.MasterFpr}}
+    <p class="small text-2">Agent keys generated from now on are certified by <code>{{$d.MasterFpr}}</code>. It is stored encrypted and never shown.</p>
+    <form method="post" action="/settings/certify-key/remove" class="inline" data-confirm="Remove the certification key? Keys it certified keep their certification; new keys will not be certified.">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="secondary danger">Remove certification key</button>
+    </form>
+    {{else}}
+    <p class="small text-2">Optional. A master key that certifies every new agent key, so GnuPG users can trust it once. It is stored encrypted without its passphrase and never shown again.</p>
+    <form method="post" action="/settings/certify-key">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="field">
+        <label for="private_key">Private key</label>
+        <textarea id="private_key" name="private_key" class="mono" rows="6" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----"></textarea>
+        <p class="hint">ASCII armor, e.g. <code>gpg --export-secret-keys --armor &lt;fingerprint&gt;</code>. The key must be able to certify.</p>
+      </div>
+      <div class="field">
+        <label for="passphrase">Passphrase <span class="muted">(if it has one)</span></label>
+        <input id="passphrase" name="passphrase" type="password" autocomplete="off">
+      </div>
+      <button type="submit" class="secondary">Set certification key</button>
+    </form>
+    {{end}}
+  </div>
   {{end}}
 </section>
 
@@ -215,28 +241,25 @@
 </section>
 
 <section class="card" id="bootstrap">
-  <div class="card-header"><div><h2>From config.yaml</h2><p>Read-only. These keys are read from <code>config.yaml</code> at every start: edit the file, then restart. Secrets are read from the files named here and never shown. The file's other sections only seeded the database on the first start and are ignored now: manage them above and on the <a href="/recipients">Recipients</a> page.</p></div></div>
+  <div class="card-header"><div><h2>From config.yaml</h2><p>Read-only. These keys are read from <code>config.yaml</code> at every start: edit the file, then restart. The key-encryption key is read from the file named here and never shown. The file's other sections only seeded the database on the first start and are ignored now: manage them above and on the <a href="/recipients">Recipients</a> page.</p></div></div>
   <div class="card-body">
     <dl class="grid">
       <dt><code>data_dir</code></dt><dd><code>{{$c.DataDir}}</code></dd>
       <dt><code>api.listen</code></dt><dd><code>{{$c.API.Listen}}</code></dd>
       <dt><code>api.tls</code></dt><dd>{{if $c.API.TLS.Enabled}}certificate <code>{{$c.API.TLS.CertFile}}</code>, key <code>{{$c.API.TLS.KeyFile}}</code>{{else}}off{{end}}</dd>
       <dt><code>dashboard.listen</code></dt><dd><code>{{$c.Dashboard.Listen}}</code></dd>
-      <dt><code>dashboard.admin_password_file</code></dt><dd><code>{{$c.Dashboard.AdminPasswordFile}}</code></dd>
-      <dt><code>signing.key_encryption_key_file</code></dt><dd>{{with $c.Signing}}<code>{{.KeyEncryptionKeyFile}}</code>{{else}}not set: signing is off{{end}}</dd>
-      {{with $c.Signing}}{{with .CertifyWith}}
-      <dt><code>signing.certify_with</code></dt><dd>private key <code>{{.PGPPrivateKeyFile}}</code>{{with .PassphraseFile}}, passphrase <code>{{.}}</code>{{end}}</dd>
-      {{end}}{{end}}
+      <dt><code>kek.file</code></dt><dd>{{if $c.KEK.Configured}}<code>{{$c.KEK.File}}</code>{{else}}not set: credentials are stored unencrypted and signing is off{{end}}</dd>
+      {{if $c.KEK.Previous}}<dt><code>kek.previous_file</code></dt><dd><code>{{$c.KEK.PreviousFile}}</code> <span class="tag warn">remove after rotating</span></dd>{{end}}
       <dt><code>log</code></dt><dd>level <code>{{$c.Log.Level}}</code></dd>
     </dl>
   </div>
 </section>
 
 <section class="card" id="restart">
-  <div class="card-header"><div><h2>Restart</h2><p>Re-reads config.yaml (bootstrap keys: <code>data_dir</code>, listen addresses, <code>api.tls</code>, secret files, <code>log</code>), without leaving the container. Secret files that change without config.yaml changing are not detected: restart after editing them too.</p></div>{{if $d.ConfigChanged}}<span class="tag warn">changed</span>{{end}}</div>
+  <div class="card-header"><div><h2>Restart</h2><p>Re-reads config.yaml (bootstrap keys: <code>data_dir</code>, listen addresses, <code>api.tls</code>, the key-encryption key, <code>log</code>), without leaving the container. A key-encryption key that changes without config.yaml changing is not detected: restart after replacing it too (with compose, <code>docker compose up -d --force-recreate</code>: secrets are fixed when the container is created).</p></div>{{if $d.ConfigChanged}}<span class="tag warn">changed</span>{{end}}</div>
   <div class="card-body">
     {{if $d.ConfigChanged}}<p class="small">config.yaml changed on disk since email-me started.</p>{{else}}<p class="small muted">config.yaml is unchanged since email-me started.</p>{{end}}
-    <p class="small text-2">Sends already in flight finish first; the API and the dashboard are down for a moment. Everyone is logged out of the dashboard, and the idempotency cache and the last SMTP test result are forgotten. If config.yaml no longer loads, nothing restarts. Sending <code>SIGHUP</code> to the process (<code>docker kill -s HUP</code>) does the same.</p>
+    <p class="small text-2">Sends already in flight finish first; the API and the dashboard are down for a moment. Everyone is logged out of the dashboard, and the idempotency cache and the last SMTP test result are forgotten. If config.yaml no longer loads, or its key-encryption key does not open the stored credentials, nothing restarts. Sending <code>SIGHUP</code> to the process (<code>docker kill -s HUP</code>) does the same.</p>
   </div>
   <form method="post" action="/settings/restart" class="card-footer" data-confirm="Restart email-me now? Sends in flight finish first, and you will need to log in again.">
     <input type="hidden" name="csrf" value="{{.CSRF}}">

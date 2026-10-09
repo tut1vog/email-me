@@ -72,14 +72,14 @@ func ParsePrivateKey(data, passphrase []byte) (*openpgp.Entity, error) {
 	}
 	e := el[0]
 	if e.PrivateKey == nil {
-		return nil, fmt.Errorf("file contains a public key, not a private key")
+		return nil, fmt.Errorf("this is a public key, not a private key")
 	}
 	if e.PrivateKey.Encrypted {
 		if len(passphrase) == 0 {
-			return nil, fmt.Errorf("private key is passphrase-protected but no passphrase_file is set")
+			return nil, fmt.Errorf("the private key is passphrase-protected: give its passphrase")
 		}
 		if err := e.DecryptPrivateKeys(passphrase); err != nil {
-			return nil, fmt.Errorf("decrypting private key: %w", err)
+			return nil, fmt.Errorf("decrypting the private key (wrong passphrase?): %w", err)
 		}
 	}
 	if _, ok := e.CertificationKey(time.Now()); !ok {

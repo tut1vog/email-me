@@ -33,7 +33,7 @@ func TestMigrationsIdempotent(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 4 {
 		t.Fatalf("user_version = %d, %v", v, err)
 	}
 }
@@ -234,6 +234,59 @@ func TestKeysOneActive(t *testing.T) {
 	ks, _ := s.ListKeys(ctx, a.ID)
 	if len(ks) != 2 {
 		t.Fatal(len(ks))
+	}
+}
+
+func TestResetKeyring(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if err := s.CreateKeyring(ctx, []byte("wrapped")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateKeyring(ctx, []byte("again")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a second keyring must conflict: %v", err)
+	}
+	if err := s.SaveSettings(ctx, &Settings{Doc: []byte(`{}`), SMTPPassword: []byte("sealed"), PasswordSealed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetCertifyKey(ctx, &CertifyKey{Fingerprint: "M", PublicKey: "pub-M", PrivateKeyEnc: []byte("sealed")}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.CreateAgent(ctx, "a", "", policy.Policy{})
+	key := &AgentKey{Fingerprint: "K1", AgentID: a.ID, PublicKey: "pub-K1", PrivateKeyEnc: []byte("sealed"), RevocationCert: "rev", RevocationCertCompromised: "rev-c", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+	if err := s.InsertKey(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAdmin(ctx, "hash", false); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := s.ResetKeyring(ctx)
+	if err != nil || !d.SMTPPassword || !d.CertifyKey || d.AgentKeys != 1 {
+		t.Fatalf("ResetKeyring = %+v, %v", d, err)
+	}
+	if _, err := s.GetKeyring(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatal("keyring kept")
+	}
+	if got, _ := s.GetSettings(ctx); got.SMTPPassword != nil || got.PasswordSealed || string(got.Doc) != "{}" {
+		t.Fatalf("settings: %+v", got)
+	}
+	if _, err := s.GetCertifyKey(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatal("certification key kept")
+	}
+	if _, err := s.ActiveKey(ctx, a.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatal("the agent key must be retired")
+	}
+	if old, _ := s.GetKey(ctx, "K1"); old.RetiredAt == nil || len(old.PrivateKeyEnc) != 0 || old.RevocationCert != "rev" {
+		t.Fatalf("retired key: %+v", old)
+	}
+	if adm, err := s.GetAdmin(ctx); err != nil || adm.PasswordHash != "hash" {
+		t.Fatal("the admin password is not sealed and stays")
+	}
+	// A raw password (no keyring) is not the keyring's to discard.
+	s.SaveSettings(ctx, &Settings{Doc: []byte(`{}`), SMTPPassword: []byte("raw")})
+	if d, _ := s.ResetKeyring(ctx); d.SMTPPassword {
+		t.Fatal("a raw password is kept")
 	}
 }
 
