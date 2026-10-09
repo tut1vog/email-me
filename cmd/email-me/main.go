@@ -2,6 +2,7 @@
 //
 //	email-me serve [--config /config/config.yaml]   (default command)
 //	email-me healthcheck [--config ...]             (for Docker HEALTHCHECK)
+//	email-me version
 //
 // Settings saved on the dashboard apply at once. serve restarts in place on
 // SIGHUP or from the dashboard, to apply edits to config.yaml.
@@ -37,10 +38,18 @@ import (
 	"github.com/tut1vog/email-me/internal/upstream"
 )
 
+// version is the release tag, set at build time with
+// -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
 func main() {
 	cmd, args := "serve", os.Args[1:]
-	if len(args) > 0 && (args[0] == "serve" || args[0] == "healthcheck") {
+	if len(args) > 0 && (args[0] == "serve" || args[0] == "healthcheck" || args[0] == "version") {
 		cmd, args = args[0], args[1:]
+	}
+	if cmd == "version" {
+		fmt.Println(version)
+		return
 	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	defaultCfg := os.Getenv("EMAIL_ME_CONFIG")

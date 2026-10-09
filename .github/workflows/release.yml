@@ -1,0 +1,82 @@
+# Publishes a release when a version tag is pushed:
+#
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# The CI checks (ci.yml) run first. Then the release gets a tarball per OS and architecture,
+# checksums.txt and install.sh, and ghcr.io gets a multi-platform image.
+# A tag with a suffix (v1.2.3-rc.1) is a prerelease: install.sh skips it
+# unless asked for by name, and the image's latest tag does not move.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  binaries:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*} arch=${target#*/}
+            name=email-me_${os}_${arch}
+            mkdir -p "build/$name"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags="-s -w -X main.version=$GITHUB_REF_NAME" -o "build/$name/email-me" ./cmd/email-me
+            tar -C "build/$name" -czf "dist/$name.tar.gz" email-me
+          done
+          cp install.sh dist/
+          (cd dist && sha256sum -- * > checksums.txt)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=
+          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes \
+            --title "$GITHUB_REF_NAME" $prerelease
+
+  image:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}

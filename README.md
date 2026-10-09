@@ -53,6 +53,18 @@ The agent-facing contract is the OpenAPI document in [`internal/api/docs/openapi
 
 Why `email-me.localhost` instead of `localhost`: browsers send a host's cookies to every port on it, so if you visit a web server that some local process (an agent, say) runs on `localhost:3000`, it would receive your dashboard session cookie. A dedicated host name keeps the cookie to email-me. The login page reminds you when you use plain `localhost`.
 
+## Install the binary (macOS and Linux)
+
+Docker is the recommended way to run email-me. To run the binary directly instead, install it (or update it to the latest release) with:
+
+```sh
+curl -fsSL https://github.com/tut1vog/email-me/releases/latest/download/install.sh | sh
+```
+
+The script downloads the release for your OS and architecture (amd64 or arm64), checks it against the release's `checksums.txt` and puts `email-me` in `~/.local/bin`, or where `email-me` already is on your `PATH`. Run the same command again to update; restart a running gateway afterwards. `email-me version` prints the installed version. Set `EMAIL_ME_VERSION=v1.2.3` to install a specific release and `EMAIL_ME_INSTALL_DIR` to choose the directory, e.g. `curl -fsSL … | EMAIL_ME_INSTALL_DIR=/usr/local/bin sh`.
+
+Outside the container, adapt the paths in `config.example.yaml`: point `data_dir` and each `*_file` at your own directories, and set both `listen` addresses to `127.0.0.1` (the default `0.0.0.0` relies on Docker publishing the ports on localhost only). Then run `email-me serve --config /path/to/config.yaml` under your service manager.
+
 ## Letting agents on other hosts in
 
 The defaults keep everything on localhost. To accept agents from other machines, expose **only the API** (never the dashboard), and protect the path:
@@ -91,5 +103,9 @@ The defaults keep everything on localhost. To accept agents from other machines,
 ```sh
 go test ./...   # unit + integration tests (fake SMTP server in-process)
 ```
+
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request: `gofmt`, `go mod tidy`, `go vet`, `go test -race`, `shellcheck install.sh` and a multi-platform image build.
+
+Releases: pushing a tag such as `v1.2.3` runs `.github/workflows/release.yml`, which runs the CI checks, attaches the macOS and Linux tarballs, `checksums.txt` and `install.sh` to a GitHub release, and pushes the image to `ghcr.io/tut1vog/email-me` (`1.2.3`, `1.2`, `latest`). A tag with a suffix (`v1.2.3-rc.1`) makes a prerelease that the install script and `latest` skip.
 
 Layout: `cmd/email-me` (binary), `internal/api` (agent API, guide and OpenAPI spec in `internal/api/docs`), `internal/dashboard`, `internal/compose` (MIME), `internal/pgp` (PGP/MIME), `internal/keys` (agent signing keys), `internal/recipients` (recipient registry), `internal/settings` (managed settings), `internal/store` (SQLite), `internal/config`, `internal/policy`.

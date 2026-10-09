@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26-alpine AS build
+# The build stage runs natively and cross-compiles, so multi-platform images
+# need no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/email-me ./cmd/email-me \
+ARG TARGETOS TARGETARCH VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/email-me ./cmd/email-me \
  && mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot
