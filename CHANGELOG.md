@@ -4,6 +4,12 @@ All notable changes to email-me are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-10-11
+
+### Changed
+
+- **Send test message moved to the Recipients list** — each recipient row now has a Send button in its Test message column, and the recipient's own page no longer offers one.
+
 ## [0.1.3] - 2026-10-11
 
 ### Added
