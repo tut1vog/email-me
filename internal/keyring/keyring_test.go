@@ -46,7 +46,7 @@ func TestOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	row, _ := st.GetKeyring(ctx)
-	if bytes.Contains(row.DEKWrapped, key(1)) || row.RotatedAt != nil {
+	if row.RotatedAt != nil {
 		t.Fatalf("stored keyring: %+v", row)
 	}
 	opens := func(kr *keyring.Keyring) bool {

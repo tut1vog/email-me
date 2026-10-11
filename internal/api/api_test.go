@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -37,28 +36,21 @@ import (
 
 // ---- discovery -------------------------------------------------------------
 
-func TestGuideIsGenericAndPointsToSpec(t *testing.T) {
-	h := newHarness(t, testutil.Options{Signing: true})
-	h.agent("secret-agent-name", policy.Policy{Recipients: ptr([]string{"me"})})
+// The guide's content is pinned by the docs package's golden file; here,
+// that both paths serve it with the request's base URL.
+func TestGuidePointsToSpec(t *testing.T) {
+	h := newHarness(t, testutil.Options{})
 	for _, path := range []string{"/", "/llms.txt"} {
 		r := h.do("GET", path, "", nil)
 		if r.status != 200 || !strings.HasPrefix(r.header.Get("Content-Type"), "text/markdown") {
 			t.Fatalf("GET %s = %d %s", path, r.status, r.header.Get("Content-Type"))
 		}
-		g := string(r.body)
-		mustContain(t, g, h.ts.URL+"/openapi.json", h.ts.URL+"/v1/capabilities", "idempotency_key", "e2e_available", "insecure", "Retry-After")
-		for _, leak := range []string{"me@example.com", "work@example.org", "Personal inbox", "secret-agent-name", "gateway@example.com"} {
-			if strings.Contains(g, leak) {
-				t.Errorf("guide leaks deployment data %q", leak)
-			}
-		}
-		if len(g) > 7000 { // ≈1.5-1.75k tokens
-			t.Errorf("guide is %d bytes; keep it within the ~1.5k token budget", len(g))
-		}
+		mustContain(t, string(r.body), h.ts.URL+"/openapi.json", h.ts.URL+"/v1/capabilities")
 	}
 }
 
-func TestOpenAPIServedAndValid(t *testing.T) {
+// The spec's validity is checked by loadSpec in every harness.
+func TestOpenAPIServedWithBaseURL(t *testing.T) {
 	h := newHarness(t, testutil.Options{})
 	r := h.do("GET", "/openapi.json", "", nil)
 	if r.status != 200 {
@@ -71,9 +63,6 @@ func TestOpenAPIServedAndValid(t *testing.T) {
 	servers := doc["servers"].([]any)
 	if servers[0].(map[string]any)["url"] != h.ts.URL {
 		t.Fatalf("server URL = %v", servers)
-	}
-	if doc["openapi"] != "3.1.0" {
-		t.Fatal(doc["openapi"])
 	}
 }
 
@@ -104,7 +93,7 @@ func TestSpecDocumentsEveryErrorCode(t *testing.T) {
 
 func TestHealthNotFoundAndMethods(t *testing.T) {
 	h := newHarness(t, testutil.Options{})
-	if r := h.do("GET", "/healthz", "", nil); r.status != 200 || string(r.body) != "{\"status\":\"ok\"}\n" {
+	if r := h.do("GET", "/healthz", "", nil); r.status != 200 || r.json(t)["status"] != "ok" {
 		t.Fatalf("healthz = %d %s", r.status, r.body)
 	}
 	r := h.do("GET", "/v2/whatever", "", nil)
@@ -120,22 +109,6 @@ func TestHealthNotFoundAndMethods(t *testing.T) {
 	}
 	if r := h.do("POST", "/", "", nil); r.status != 405 || r.code(t) != "method_not_allowed" {
 		t.Fatalf("POST / = %d %s", r.status, r.body)
-	}
-}
-
-func TestDocsAuthenticated(t *testing.T) {
-	h := newHarness(t, testutil.Options{Docs: "authenticated"})
-	_, tok := h.agent("a", policy.Policy{})
-	for _, p := range []string{"/", "/llms.txt", "/openapi.json"} {
-		if r := h.do("GET", p, "", nil); r.status != 401 || bytes.Contains(r.body, []byte("capabilities")) {
-			t.Fatalf("GET %s without token = %d", p, r.status)
-		}
-		if r := h.do("GET", p, tok, nil); r.status != 200 {
-			t.Fatalf("GET %s with token = %d", p, r.status)
-		}
-	}
-	if r := h.do("GET", "/healthz", "", nil); r.status != 200 {
-		t.Fatal("healthz stays public")
 	}
 }
 
@@ -228,7 +201,9 @@ func TestCapabilities(t *testing.T) {
 		E2E       bool `json:"e2e_available"`
 		Transport string
 	}
-	json.Unmarshal(r.body, &c)
+	if err := json.Unmarshal(r.body, &c); err != nil {
+		t.Fatal(err)
+	}
 	if c.Agent != "bench" || len(c.Recipients) != 2 || c.Recipients[0].Alias != "me" || !c.Recipients[0].EncryptionAvailable || c.Recipients[1].EncryptionAvailable {
 		t.Fatalf("recipients: %+v", c.Recipients)
 	}
@@ -242,7 +217,8 @@ func TestCapabilities(t *testing.T) {
 	if !c.Signing.Available || !c.Signing.Required || !c.Signing.Default || c.Signing.Fingerprint != k.Fingerprint {
 		t.Fatalf("signing: %+v", c.Signing)
 	}
-	if c.E2E || c.Transport != "local" || c.SubjectPrefix != "[bench] " || c.Limits["remaining_this_hour"].(float64) != 20 {
+	perHour := h.settings.Current().Effective(a.Policy).RateLimit.PerHour
+	if c.E2E || c.Transport != "local" || c.SubjectPrefix != "[bench] " || c.Limits["remaining_this_hour"].(float64) != float64(perHour) {
 		t.Fatalf("caps: %+v", c)
 	}
 	if bytes.Contains(r.body, []byte("@example")) {
@@ -311,7 +287,7 @@ func TestSendSignedMarkdownByDefault(t *testing.T) {
 	e := rows[0]
 	k, _ := h.st.ActiveKey(context.Background(), a.Name)
 	if e.Status != "sent" || !e.Signed || e.SigningKeyFpr != k.Fingerprint || e.Transport != "local" || e.Subject != "" ||
-		!hasString(e.Services, "markdown") || !hasString(e.Services, "sign") || !hasString(e.Services, "thread") || e.MessageID == "" {
+		!slices.Contains(e.Services, "markdown") || !slices.Contains(e.Services, "sign") || !slices.Contains(e.Services, "thread") || e.MessageID == "" {
 		t.Fatalf("audit row: %+v", e)
 	}
 }
@@ -351,8 +327,11 @@ func TestSendEncryptedAndSigned(t *testing.T) {
 	if all := leafText(t, inner); inner.Header.Get("Subject") != "[bench] Quarterly numbers" || !strings.Contains(all, "3,42") || !strings.Contains(all, "confidential") {
 		t.Fatalf("inner: subject=%q", inner.Header.Get("Subject"))
 	}
-	if !pr.MessageDetails.IsSigned || pr.MessageDetails.SignatureError != nil {
-		t.Fatalf("inner signature: %v", pr.MessageDetails.SignatureError)
+	// The signature is checked only once the decrypted data is read to EOF;
+	// SignedBy is nil when the signer is not the agent's key.
+	io.Copy(io.Discard, pr.MessageDetails.UnverifiedBody)
+	if md := pr.MessageDetails; md.SignedBy == nil || md.Signature == nil || md.SignatureError != nil {
+		t.Fatalf("inner signature does not verify with the agent's public key: signed by %v, error %v", md.SignedBy, md.SignatureError)
 	}
 }
 
@@ -385,9 +364,9 @@ func TestSendE2E(t *testing.T) {
 	if caps["e2e_available"] != true {
 		t.Fatalf("e2e should be available: %v", caps)
 	}
-	r := h.do("GET", "/v1/recipients/me/pgp-key", tok, nil)
-	if r.status != 200 || r.header.Get("X-Email-Me-Key-Fingerprint") != pgp.Fingerprint(h.env.MeKey) {
-		t.Fatalf("key: %d %v", r.status, r.header)
+	keyResp := h.do("GET", "/v1/recipients/me/pgp-key", tok, nil)
+	if keyResp.status != 200 || keyResp.header.Get("X-Email-Me-Key-Fingerprint") != pgp.Fingerprint(h.env.MeKey) {
+		t.Fatalf("key: %d %v", keyResp.status, keyResp.header)
 	}
 	if r := h.do("GET", "/v1/recipients/ops/pgp-key", tok, nil); r.status != 404 {
 		t.Fatalf("ops has no key: %d", r.status)
@@ -395,7 +374,6 @@ func TestSendE2E(t *testing.T) {
 	if r := h.do("GET", "/v1/recipients/work/pgp-key", tok, nil); r.status != 403 || r.code(t) != "recipient_not_allowed" {
 		t.Fatalf("work not allowed: %d", r.status)
 	}
-	keyResp := h.do("GET", "/v1/recipients/me/pgp-key", tok, nil)
 	ring, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(keyResp.body))
 	if err != nil {
 		t.Fatal(err)
@@ -409,7 +387,7 @@ func TestSendE2E(t *testing.T) {
 	aw.Close()
 
 	send := map[string]any{"to": []string{"me"}, "body": map[string]any{"pgp_message": ct.String()}, "options": map[string]any{"encrypt": "e2e"}}
-	r = h.do("POST", "/v1/messages", tok, send)
+	r := h.do("POST", "/v1/messages", tok, send)
 	if r.status != 200 || r.json(t)["signed"] != false || r.json(t)["encrypted"] != true {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
@@ -522,7 +500,10 @@ func TestExpiredSigningKey(t *testing.T) {
 	if _, err := short.Rotate(context.Background(), a.Name); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1100 * time.Millisecond)
+	// A minute later, on both of the server's clocks.
+	later := func() time.Time { return time.Now().Add(time.Minute) }
+	api.SetNow(h.srv, later)
+	h.srv.Keys = keys.NewManager(h.st, keys.Options{Keyring: testutil.Keyring(t, h.env, h.st), Now: later})
 	r := h.do("POST", "/v1/messages", tok, msg("me", "s", "b"))
 	if r.status != 503 || r.code(t) != "signing_unavailable" || !strings.Contains(r.json(t)["message"].(string), "expired") {
 		t.Fatalf("%d %s", r.status, r.body)
@@ -628,18 +609,13 @@ func TestSendHTMLWithInlineImages(t *testing.T) {
 	if r := h.do("POST", "/v1/messages", tok, ok); r.status != 200 {
 		t.Fatalf("%d %s", r.status, r.body)
 	}
+	// The MIME structure and the sanitizer are compose's tests; here, that
+	// both images reach the message.
 	c := h.env.SMTP.Last(t)
-	for _, want := range []string{"multipart/related", "Content-ID: <chart>", "Content-ID: <logo>"} {
+	for _, want := range []string{"Content-ID: <chart>", "Content-ID: <logo>"} {
 		if !bytes.Contains(c.Data, []byte(want)) {
 			t.Errorf("delivered message lacks %q", want)
 		}
-	}
-	e, err := message.Read(bytes.NewReader(c.Data))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if all := leafText(t, e); !strings.Contains(all, "padding: 24px") {
-		t.Error("inline styles must survive")
 	}
 
 	cases := []struct {
@@ -725,26 +701,26 @@ func TestUpstreamFailureAndIdempotency(t *testing.T) {
 
 	// Concurrent duplicates deliver once.
 	body["idempotency_key"] = "run-2"
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	replays := 0
+	results := make(chan resp, 4)
 	for i := 0; i < 4; i++ { // at most maxConcurrentSends in flight per agent
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			r := h.do("POST", "/v1/messages", tok, body)
-			if r.status != 200 {
-				t.Errorf("concurrent: %d", r.status)
-				return
+			r, err := h.try("POST", "/v1/messages", tok, body)
+			if err != nil {
+				t.Error(err)
 			}
-			if r.json(t)["idempotent_replay"] == true {
-				mu.Lock()
-				replays++
-				mu.Unlock()
-			}
+			results <- r
 		}()
 	}
-	wg.Wait()
+	replays := 0
+	for i := 0; i < 4; i++ {
+		r := <-results
+		if r.status != 200 {
+			t.Fatalf("concurrent: %d %s", r.status, r.body)
+		}
+		if r.json(t)["idempotent_replay"] == true {
+			replays++
+		}
+	}
 	if h.env.SMTP.Count() != 2 || replays != 3 {
 		t.Fatalf("delivered %d, replays %d", h.env.SMTP.Count(), replays)
 	}
@@ -867,28 +843,49 @@ func TestMessageIDsAreUnique(t *testing.T) {
 func TestConcurrentSendCap(t *testing.T) {
 	h := newHarness(t, testutil.Options{})
 	_, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"})})
-	h.env.SMTP.SlowDown(400 * time.Millisecond)
-	var wg sync.WaitGroup
-	codes := make(chan int, 6)
-	for i := 0; i < 6; i++ {
-		wg.Add(1)
+	entered, release := h.env.SMTP.Hold(t)
+	results := make(chan resp, 4)
+	for i := 0; i < 4; i++ {
 		go func() {
-			defer wg.Done()
-			r := h.do("POST", "/v1/messages", tok, msg("me", "s", "b"))
-			if r.status == 429 && r.header.Get("Retry-After") != "1" {
-				t.Errorf("Retry-After = %q", r.header.Get("Retry-After"))
+			r, err := h.try("POST", "/v1/messages", tok, msg("me", "s", "b"))
+			if err != nil {
+				t.Error(err)
 			}
-			codes <- r.status
+			results <- r
 		}()
 	}
-	wg.Wait()
-	close(codes)
-	count := map[int]int{}
-	for c := range codes {
-		count[c]++
+	for i := 0; i < 4; i++ {
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of 4 sends reached the upstream", i)
+		}
 	}
-	if count[200] != 4 || count[429] != 2 {
-		t.Fatalf("want 4 sent and 2 rejected for concurrency, got %v", count)
+	// Four sends are in flight: the next ones are refused. (A send let
+	// through would block on the hold, hence the timeout.)
+	for i := 0; i < 2; i++ {
+		over := make(chan resp, 1)
+		go func() {
+			r, err := h.try("POST", "/v1/messages", tok, msg("me", "s", "b"))
+			if err != nil {
+				t.Error(err)
+			}
+			over <- r
+		}()
+		select {
+		case r := <-over:
+			if r.status != 429 || r.code(t) != "rate_limited" || r.header.Get("Retry-After") != "1" {
+				t.Fatalf("send over the cap: %d %s, Retry-After %q", r.status, r.body, r.header.Get("Retry-After"))
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a send over the cap was not refused")
+		}
+	}
+	release()
+	for i := 0; i < 4; i++ {
+		if r := <-results; r.status != 200 {
+			t.Fatalf("held send: %d %s", r.status, r.body)
+		}
 	}
 }
 
@@ -1027,16 +1024,21 @@ func TestSettingsApplyWithoutRestart(t *testing.T) {
 		}
 	}
 
-	// api.docs: the guide needs a token from the next request on.
+	// api.docs: the docs need a token from the next request on.
 	if r := h.do("GET", "/", "", nil); r.status != 200 {
 		t.Fatalf("public guide: %d", r.status)
 	}
 	save(func(s *config.Settings) { s.API.Docs = "authenticated" })
-	if r := h.do("GET", "/", "", nil); r.status != 401 || r.code(t) != "unauthorized" {
-		t.Fatalf("guide after api.docs authenticated: %d", r.status)
+	for _, p := range []string{"/", "/llms.txt", "/openapi.json"} {
+		if r := h.do("GET", p, "", nil); r.status != 401 || r.code(t) != "unauthorized" {
+			t.Fatalf("GET %s without a token after api.docs authenticated: %d", p, r.status)
+		}
+		if r := h.do("GET", p, tok, nil); r.status != 200 {
+			t.Fatalf("GET %s with a token: %d", p, r.status)
+		}
 	}
-	if r := h.do("GET", "/openapi.json", tok, nil); r.status != 200 {
-		t.Fatalf("spec with a token: %d", r.status)
+	if r := h.do("GET", "/healthz", "", nil); r.status != 200 {
+		t.Fatal("healthz stays public")
 	}
 	save(func(s *config.Settings) { s.API.Docs = "public" })
 	if r := h.do("GET", "/", "", nil); r.status != 200 {

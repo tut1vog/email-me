@@ -3,6 +3,7 @@ package host_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	emailme "github.com/tut1vog/email-me"
 	"github.com/tut1vog/email-me/internal/config"
@@ -188,7 +190,7 @@ func TestStartReplacesAStoppedContainer(t *testing.T) {
 }
 
 func TestStartShowsWhyTheGatewayDidNotStart(t *testing.T) {
-	d := &fakeDocker{states: []string{"", "running", "restarting"}, logs: "email-me: the KEK does not open the state database's keyring\n"}
+	d := &fakeDocker{states: []string{"", "restarting"}, logs: "email-me: the KEK does not open the state database's keyring\n"}
 	h, _, errOut := newHost(t, d)
 	h.Healthy = func(context.Context, *config.Config) error { return errors.New("connection refused") }
 	err := h.Start(context.Background())
@@ -240,7 +242,12 @@ func TestStopAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Stop waits for the SMTP timeout plus a margin; start replaces the container.
-	if stop := d.find("container stop"); !slices.Equal(stop, []string{"container", "stop", "--time", "40", host.Container}) {
+	cfg, err := config.Load(filepath.Join(h.Dir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	grace := fmt.Sprint(int((cfg.Upstream.SMTP.Timeout.D() + 10*time.Second).Seconds()))
+	if stop := d.find("container stop"); !slices.Equal(stop, []string{"container", "stop", "--time", grace, host.Container}) {
 		t.Fatalf("stop: %v", stop)
 	}
 	if got := d.commands(); !slices.Equal(got, []string{"container stop", "container rm", "container run"}) {
@@ -260,9 +267,10 @@ func TestStopAndRestart(t *testing.T) {
 
 func TestConsole(t *testing.T) {
 	d := &fakeDocker{states: []string{"running"}}
-	released := make(chan struct{})
+	started, released := make(chan struct{}), make(chan struct{})
 	d.run = func(stdin io.Reader, stdout io.Writer, args []string) error {
 		io.WriteString(stdout, "Dashboard: http://email-me.localhost:8026/login?token=x\n")
+		close(started)
 		io.Copy(io.Discard, stdin) // until the host command lets go
 		close(released)
 		return nil
@@ -271,11 +279,18 @@ func TestConsole(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- h.Console(ctx) }()
+	<-started
+	select {
+	case <-released:
+		t.Fatal("the dashboard must stay open until Ctrl-C")
+	case <-done:
+		t.Fatal("the dashboard must stay open until Ctrl-C")
+	default:
+	}
 	cancel() // Ctrl-C
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	<-released
 	if exec := d.find("container exec"); !slices.Equal(exec, []string{"container", "exec", "--interactive", host.Container, "email-me", "console", "--stdin"}) {
 		t.Fatalf("exec: %v", exec)
 	}

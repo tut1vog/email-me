@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,9 +31,10 @@ func TestMigrationsIdempotent(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer s.Close()
+	files, _ := fs.Glob(migrations, "migrations/*.sql")
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 1 {
-		t.Fatalf("user_version = %d, %v", v, err)
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != len(files) {
+		t.Fatalf("user_version = %d, want %d: %v", v, len(files), err)
 	}
 }
 
@@ -197,9 +199,14 @@ func TestResetKeyring(t *testing.T) {
 		t.Fatalf("retired key: %+v", old)
 	}
 	// A raw password (no keyring) is not the keyring's to discard.
-	s.SetSMTPPassword(ctx, &SMTPPassword{Value: []byte("raw")})
-	if d, _ := s.ResetKeyring(ctx); d.SMTPPassword {
-		t.Fatal("a raw password is kept")
+	if err := s.SetSMTPPassword(ctx, &SMTPPassword{Value: []byte("raw")}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.ResetKeyring(ctx); err != nil || d.SMTPPassword {
+		t.Fatalf("reset with a raw password: %+v %v", d, err)
+	}
+	if p, err := s.GetSMTPPassword(ctx); err != nil || p.Sealed || string(p.Value) != "raw" {
+		t.Fatalf("a raw password is kept: %+v %v", p, err)
 	}
 }
 

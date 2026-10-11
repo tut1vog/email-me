@@ -204,6 +204,17 @@ func (r resp) code(t *testing.T) string {
 // do sends a request and validates the response against openapi.yaml.
 func (h *harness) do(method, path, token string, body any, mods ...func(*http.Request)) resp {
 	h.t.Helper()
+	r, err := h.try(method, path, token, body, mods...)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return r
+}
+
+// try is do for goroutines other than the test's: it returns transport
+// errors instead of failing the test.
+func (h *harness) try(method, path, token string, body any, mods ...func(*http.Request)) (resp, error) {
+	h.t.Helper()
 	var rb []byte
 	switch b := body.(type) {
 	case nil:
@@ -216,7 +227,7 @@ func (h *harness) do(method, path, token string, body any, mods ...func(*http.Re
 	}
 	req, err := http.NewRequest(method, h.ts.URL+path, bytes.NewReader(rb))
 	if err != nil {
-		h.t.Fatal(err)
+		return resp{}, err
 	}
 	if rb != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -229,13 +240,16 @@ func (h *harness) do(method, path, token string, body any, mods ...func(*http.Re
 	}
 	res, err := h.ts.Client().Do(req)
 	if err != nil {
-		h.t.Fatal(err)
+		return resp{}, err
 	}
 	defer res.Body.Close()
-	out, _ := io.ReadAll(res.Body)
+	out, err := io.ReadAll(res.Body)
+	if err != nil {
+		return resp{}, err
+	}
 	r := resp{status: res.StatusCode, header: res.Header, body: out}
 	h.validate(method, path, rb, r)
-	return r
+	return r, nil
 }
 
 func (h *harness) validate(method, path string, reqBody []byte, r resp) {
@@ -280,15 +294,6 @@ func withHost(host string) func(*http.Request) {
 
 func msg(to string, subject string, md string) map[string]any {
 	return map[string]any{"to": []string{to}, "subject": subject, "body": map[string]any{"markdown": md}}
-}
-
-func hasString(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 func mustContain(t *testing.T, s string, subs ...string) {

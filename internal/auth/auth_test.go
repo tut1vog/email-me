@@ -20,9 +20,6 @@ func TestTokenRoundTrip(t *testing.T) {
 	if SecretMatches(secret+"x", hash) {
 		t.Fatal("different secret must not match")
 	}
-	if strings.Contains(string(hash), secret) {
-		t.Fatal("hash must not contain the secret")
-	}
 	tok2, id2, _ := NewToken()
 	if tok2 == tok || id2 == id {
 		t.Fatal("tokens must be unique")

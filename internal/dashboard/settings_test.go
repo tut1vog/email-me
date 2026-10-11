@@ -33,6 +33,7 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 	other := testutil.StartSMTP(t)
 	other.Pass = "other-secret"
 	port := strconv.Itoa(other.Port)
+	d.post("/settings/test-smtp", d.form("back", "/settings"))
 	body := d.saved(d.post("/settings/upstream", d.form("host", "127.0.0.1", "port", port, "security", "none",
 		"username", other.User, "password", "other-secret", "timeout", "5s", "from", "gateway@example.com",
 		"from_name_template", "{agent} via email-me")), "upstream")
@@ -48,8 +49,8 @@ func TestSettingsUpstreamCardAppliesAtOnce(t *testing.T) {
 			t.Errorf("%s: saved settings need no restart", path)
 		}
 	}
-	if strings.Contains(body, "test-smtp-saved") || !strings.Contains(body, "Not checked yet.") {
-		t.Fatal("the tests run against the settings in effect; there is no separate test of saved ones")
+	if !strings.Contains(body, "Not checked yet.") {
+		t.Fatal("a changed upstream clears the last connection test")
 	}
 
 	// The tests and agents' sends use the new server at once.
@@ -101,24 +102,25 @@ func TestSettingsCardsValidate(t *testing.T) {
 	d.login()
 	before, cur := d.settings.Current().Managed(), d.settings.Current()
 	for _, c := range []struct {
-		card string
-		kv   []string
-		want string
+		card  string
+		kv    []string
+		want  string
+		shown string // the submitted value, shown again
 	}{
-		{"api", []string{"docs", "secret"}, "api.docs must be public or authenticated"},
-		{"api", []string{"docs", "public", "trusted_proxies", "10.0.0.0/8 nonsense"}, `api.trusted_proxies: &#34;nonsense&#34; is not an IP or CIDR`},
-		{"api", []string{"docs", "public", "public_url", "ftp://x"}, "api.public_url must be an absolute http(s) URL"},
-		{"audit", []string{"retention_days", "-1"}, "audit.retention_days must be at least 1"},
-		{"audit", []string{"retention_days", "many"}, "Retention must be a number"},
-		{"signing", []string{"key_validity", "12h"}, "signing.key_validity must be between 1d and 50y"},
-		{"upstream", []string{"host", "smtp.example.net:25", "security", "starttls"}, "upstream.smtp.host must be a hostname"},
+		{"api", []string{"docs", "secret"}, "api.docs must be public or authenticated", ""},
+		{"api", []string{"docs", "public", "trusted_proxies", "10.0.0.0/8 nonsense"}, `api.trusted_proxies: &#34;nonsense&#34; is not an IP or CIDR`, "10.0.0.0/8 nonsense"},
+		{"api", []string{"docs", "public", "public_url", "ftp://x"}, "api.public_url must be an absolute http(s) URL", "ftp://x"},
+		{"audit", []string{"retention_days", "-1"}, "audit.retention_days must be at least 1", "-1"},
+		{"audit", []string{"retention_days", "many"}, "Retention must be a number", "many"},
+		{"signing", []string{"key_validity", "12h"}, "signing.key_validity must be between 1d and 50y", "12h"},
+		{"upstream", []string{"host", "smtp.example.net:25", "security", "starttls"}, "upstream.smtp.host must be a hostname", "smtp.example.net:25"},
 	} {
 		p := d.post("/settings/"+c.card, d.form(c.kv...))
 		if p.status != http.StatusUnprocessableEntity || !strings.Contains(p.body, c.want) {
 			t.Errorf("%s %v: %d, want %q", c.card, c.kv, p.status, c.want)
 		}
-		if p.status == http.StatusUnprocessableEntity && !strings.Contains(p.body, `value="`+c.kv[1]+`"`) && c.kv[0] != "docs" {
-			t.Errorf("%s: the submitted value must be shown again", c.card)
+		if c.shown != "" && !strings.Contains(p.body, `value="`+c.shown+`"`) {
+			t.Errorf("%s %v: the submitted value must be shown again", c.card, c.kv)
 		}
 	}
 	if len(config.DiffSettings(d.settings.Current().Managed(), before)) != 0 || d.settings.Current() != cur {
@@ -160,7 +162,9 @@ func TestSettingsCardsValidate(t *testing.T) {
 
 	nd := newDash(t, testutil.Options{})
 	nd.login()
-	if p := nd.post("/settings/signing", nd.form("key_validity", "1y")); p.status != http.StatusSeeOther || !strings.Contains(nd.get("/settings").body, "Signing is not configured") {
+	kv := nd.settings.Current().Signing.KeyValidity
+	if p := nd.post("/settings/signing", nd.form("key_validity", "3y")); p.status != http.StatusSeeOther ||
+		!strings.Contains(nd.get("/settings").body, "set kek.file in config.yaml first") || nd.settings.Current().Signing.KeyValidity != kv {
 		t.Fatal("signing settings need a KEK")
 	}
 }
@@ -197,7 +201,7 @@ func TestSettingsDefaultPolicyCard(t *testing.T) {
 		t.Fatalf("saved policy: %+v", pol)
 	}
 	if !strings.Contains(body, `name="ov_rate" checked`) || !strings.Contains(body, `name="per_hour" value="5"`) ||
-		!strings.Contains(body, `name="ov_max_att" >`) {
+		strings.Contains(body, `name="ov_max_att" checked`) {
 		t.Fatal("the saved policy must round-trip into the form")
 	}
 	// Agents that inherit the default policy get it at once.
@@ -224,7 +228,9 @@ func TestHandEditRefusesSaves(t *testing.T) {
 		t.Fatal("dashboard saves never raise the banner")
 	}
 	edited := read(t, d.env.Path) + "# a hand edit\n"
-	os.WriteFile(d.env.Path, []byte(edited), 0o600)
+	if err := os.WriteFile(d.env.Path, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	banner := d.get("/agents").body
 	if !strings.Contains(banner, `id="restart-banner"`) || !strings.Contains(banner, "email-me restart") {
 		t.Fatal("every page names email-me restart")
@@ -251,7 +257,9 @@ func withoutUpstream(t *testing.T, env *testutil.Env) {
 	t.Helper()
 	start, end := strings.Index(env.YAML, "upstream:\n"), strings.Index(env.YAML, "recipients:\n")
 	env.YAML = env.YAML[:start] + env.YAML[end:]
-	os.WriteFile(env.Path, []byte(env.YAML), 0o600)
+	if err := os.WriteFile(env.Path, []byte(env.YAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	c, err := config.Load(env.Path)
 	if err != nil {
 		t.Fatal(err)

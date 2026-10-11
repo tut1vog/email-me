@@ -45,17 +45,22 @@ func tarball(t *testing.T, binary string) []byte {
 
 func (r *release) serve(t *testing.T) *Updater {
 	t.Helper()
+	// Built here, once per tag: the handlers must not call t.Fatal, and the
+	// checksum must be of the very bytes served.
+	tarballs := map[string][]byte{}
+	for tag, bin := range r.binaries {
+		tarballs[tag] = tarball(t, bin)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/"+Repo+"/releases/latest", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte(`{"tag_name": "` + r.latest + `", "name": "x"}`))
 	})
 	mux.HandleFunc("GET /download/{tag}/{asset}", func(w http.ResponseWriter, req *http.Request) {
-		bin, ok := r.binaries[req.PathValue("tag")]
+		tgz, ok := tarballs[req.PathValue("tag")]
 		if !ok {
 			http.NotFound(w, req)
 			return
 		}
-		tgz := tarball(t, bin)
 		switch req.PathValue("asset") {
 		case "email-me_linux_amd64.tar.gz":
 			w.Write(tgz)

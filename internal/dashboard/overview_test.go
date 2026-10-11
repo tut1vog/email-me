@@ -2,6 +2,7 @@ package dashboard_test
 
 import (
 	"context"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -76,6 +77,10 @@ func TestOverviewTiles(t *testing.T) {
 func TestOverviewAttentionOrderAndLinks(t *testing.T) {
 	d := newDash(t, testutil.Options{PublicURL: "http://gw.example.com:8025"})
 	d.login()
+	a := d.createAgent("bench", "me")
+	if err := d.st.InsertAudit(context.Background(), &store.AuditEntry{Agent: a.Name, Status: store.StatusSent, Transport: "insecure"}); err != nil {
+		t.Fatal(err)
+	}
 	body := d.get("/").body
 	warn := strings.Index(body, "plain HTTP on a non-localhost host")
 	info := strings.Index(body, "Signing is not configured")
@@ -83,13 +88,18 @@ func TestOverviewAttentionOrderAndLinks(t *testing.T) {
 		t.Fatalf("attention list must put warnings before info (warn at %d, info at %d)", warn, info)
 	}
 	// Without a KEK the SMTP password is also stored unencrypted.
-	for _, want := range []string{"Needs attention (3)", `href="/settings"`, `href="/settings#signing"`, `href="/settings#upstream"`, "Stored unencrypted", "Create your first agent"} {
+	for _, want := range []string{"Needs attention (3)", `href="/settings">Fix</a>`, `href="/settings#signing"`, `href="/settings#upstream"`, "Stored unencrypted"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("overview lacks %q", want)
 		}
 	}
 	if strings.Contains(body, "All clear") {
 		t.Error("no all-clear while something needs attention")
+	}
+	_, banner, ok := strings.Cut(body, "Plain HTTP from a non-local network")
+	banner, _, _ = strings.Cut(banner, "</details>")
+	if !ok || !strings.Contains(banner, `href="/agents/bench"`) {
+		t.Error("the plain HTTP banner must name the agent")
 	}
 }
 
@@ -128,18 +138,33 @@ var (
 	inlineHandler = regexp.MustCompile(`(?i)<[^>]*\son[a-z]+\s*=`)
 )
 
+// cspSafe reports whether body has no inline script, style or event
+// handler, which the Content-Security-Policy would block.
+func cspSafe(body string) bool {
+	return !strings.Contains(body, "<script>") && !inlineStyle.MatchString(body) && !inlineHandler.MatchString(body)
+}
+
 func TestPagesHaveNoInlineStyleOrScript(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true, PublicURL: "http://gw.example.com:8025"})
+	if p := d.get("/login"); !cspSafe(p.body) {
+		t.Error("/login has inline script, style or event handler (CSP)")
+	}
 	d.login()
 	a := d.createAgent("bench", "me")
 	d.st.InsertAudit(context.Background(), &store.AuditEntry{Agent: a.Name, Status: store.StatusSent, Transport: "insecure", Signed: true, TS: time.Now()})
-	d.post("/settings/audit", d.form("retention_days", "60")) // a pending restart adds the banner
+	// A hand edit adds the restart banner to every page.
+	if err := os.WriteFile(d.env.Path, []byte(read(t, d.env.Path)+"# a hand edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{"/", "/agents", "/audit", "/settings", "/recipients", "/recipients/new", "/recipients/me", "/recipients/ops", "/recipients/me/delete", "/settings/guide"} {
 		p := d.get(path)
 		if p.status != 200 {
 			t.Fatalf("%s: %d", path, p.status)
 		}
-		if strings.Contains(p.body, "<script>") || inlineStyle.MatchString(p.body) || inlineHandler.MatchString(p.body) {
+		if !strings.Contains(p.body, `id="restart-banner"`) {
+			t.Errorf("%s lacks the restart banner", path)
+		}
+		if !cspSafe(p.body) {
 			t.Errorf("%s has inline script, style or event handler (CSP)", path)
 		}
 	}

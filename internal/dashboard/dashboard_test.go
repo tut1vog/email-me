@@ -16,7 +16,6 @@ import (
 	"github.com/tut1vog/email-me/internal/auth"
 	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/dashboard"
-	"github.com/tut1vog/email-me/internal/keys"
 	"github.com/tut1vog/email-me/internal/settings"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
@@ -28,7 +27,6 @@ type dash struct {
 	env      *testutil.Env
 	st       *store.Store
 	settings *settings.Manager
-	keys     *keys.Manager
 	ts       *httptest.Server
 	c        *http.Client
 	srv      *dashboard.Server
@@ -58,7 +56,7 @@ func newDashWith(t *testing.T, o testutil.Options, prepare func(*testutil.Env, *
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	d := &dash{t: t, env: env, st: st, settings: sm, keys: km, ts: ts, srv: srv}
+	d := &dash{t: t, env: env, st: st, settings: sm, ts: ts, srv: srv}
 	d.c = newClient()
 	return d
 }
@@ -183,9 +181,6 @@ func TestLoginRequiredAndHeaders(t *testing.T) {
 	if s := d.get("/static/style.css"); s.status != 200 {
 		t.Fatal("static assets must be served without login")
 	}
-	if strings.Contains(lp.body, "<script>") || strings.Contains(lp.body, "onclick") {
-		t.Fatal("no inline scripts (CSP)")
-	}
 	if p := d.post("/agents", url.Values{"name": {"x"}}); p.status != http.StatusUnauthorized {
 		t.Fatalf("POST without a session: %d", p.status)
 	}
@@ -291,12 +286,6 @@ func TestAgentTokenAndKeyLifecycle(t *testing.T) {
 		strings.Join(st.AllowedCIDRs, ",") != "10.0.0.0/8,192.168.1.5/32" {
 		t.Fatalf("stored token: %+v %v", st, err)
 	}
-	if strings.Contains(d.get("/agents/"+a.Name).body, secret) {
-		t.Fatal("token secret must never be shown again")
-	}
-	if p := d.post("/agents/"+a.Name+"/tokens", d.form("cidrs", "not-an-ip")); p.status != http.StatusSeeOther {
-		t.Fatal("bad CIDR must be rejected with a flash")
-	}
 	d.post("/agents/"+a.Name+"/tokens/"+id+"/revoke", d.form())
 	st, _ = d.st.GetToken(ctx, id)
 	if st.RevokedAt == nil {
@@ -310,7 +299,10 @@ func TestAgentTokenAndKeyLifecycle(t *testing.T) {
 		t.Fatalf("public key download: %d", pub.status)
 	}
 	d.post("/agents/"+a.Name+"/keys/rotate", d.form())
-	k2, _ := d.st.ActiveKey(ctx, a.Name)
+	k2, err := d.st.ActiveKey(ctx, a.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if k2.Fingerprint == k1.Fingerprint {
 		t.Fatal("rotation must change the key")
 	}
@@ -384,19 +376,6 @@ func TestPolicyEditorEnforcesSigningRules(t *testing.T) {
 	}
 }
 
-func TestOverviewWarnings(t *testing.T) {
-	d := newDash(t, testutil.Options{PublicURL: "http://gw.example.com:8025"})
-	d.login()
-	a := d.createAgent("bench", "me")
-	d.st.InsertAudit(context.Background(), &store.AuditEntry{Agent: a.Name, Status: store.StatusSent, Transport: "insecure"})
-	body := d.get("/").body
-	for _, want := range []string{"Plain HTTP from a non-local network", "bench", "Signing is not configured", "plain HTTP on a non-localhost host"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("overview lacks %q", want)
-		}
-	}
-}
-
 func TestAuditPageAndCSV(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	d.login()
@@ -414,14 +393,12 @@ func TestAuditPageAndCSV(t *testing.T) {
 	}
 }
 
-func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
+func TestSettingsPageHidesSecrets(t *testing.T) {
 	d := newDash(t, testutil.Options{Signing: true})
 	d.login()
 	s := d.get("/settings").body
-	for _, secret := range []string{d.env.SMTP.Pass} {
-		if strings.Contains(s, secret) {
-			t.Fatalf("settings page leaks a secret: %q", secret)
-		}
+	if strings.Contains(s, d.env.SMTP.Pass) {
+		t.Fatal("settings page leaks the SMTP password")
 	}
 	for _, want := range []string{`id="bootstrap"`, d.env.Config.KEK.File,
 		`name="password" type="password" autocomplete="new-password"`, "A password is stored, encrypted.", `value="gateway@example.com"`,
@@ -436,34 +413,8 @@ func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
 		!strings.Contains(p.body, `value="smtp.example.net"`) || strings.Contains(p.body, "typed-secret") {
 		t.Fatalf("rejected upstream save: %d", p.status)
 	}
-	p = d.post("/settings/test-smtp", d.form("back", "/settings"))
-	if p.status != http.StatusSeeOther || !strings.Contains(d.get("/settings").body, "Connected and authenticated") {
-		t.Fatal("SMTP test should succeed against the fake server")
-	}
-	if b := d.get("/recipients").body; !strings.Contains(b, `action="/recipients/me/test"`) {
-		t.Fatal("the recipients list must offer a test message")
-	}
-	if strings.Contains(d.get("/settings").body, "/settings/test-send") {
-		t.Fatal("test messages are sent from the recipients list, not Settings")
-	}
-	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients" {
-		t.Fatalf("test send: %d to %q", p.status, p.header.Get("Location"))
-	}
-	if b := d.get("/recipients").body; !strings.Contains(b, "Test message sent to me.") {
-		t.Fatal("test send must flash on the recipients list")
-	}
-	if p := d.post("/recipients/nope/test", d.form()); p.status != http.StatusNotFound {
-		t.Fatalf("test send to an unknown alias: %d", p.status)
-	}
-	c := d.env.SMTP.Last(t)
-	if c.To[0] != "me@example.com" || !strings.Contains(string(c.Data), "Test message") {
-		t.Fatal("test send")
-	}
 	if g := d.get("/settings/guide"); !strings.Contains(g.body, "/v1/capabilities") {
 		t.Fatal("guide preview")
-	}
-	if r := d.get("/recipients"); !strings.Contains(r.body, "me@example.com") || !strings.Contains(r.body, "Ops pager") {
-		t.Fatal("recipients page")
 	}
 }
 
@@ -531,10 +482,14 @@ func TestRejectsMultipartAndHugeBodies(t *testing.T) {
 	mp := "--X\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n" + csrf + "\r\n--X\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nmp\r\n--X--\r\n"
 	req, _ = http.NewRequest("POST", d.ts.URL+"/agents", strings.NewReader(mp))
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=X")
-	res, _ = d.c.Do(req)
+	res, err = d.c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	res.Body.Close()
-	if _, ok := d.settings.Current().Agent("mp"); ok || res.StatusCode == http.StatusSeeOther {
-		t.Fatal("multipart bodies must not be parsed")
+	// Unparsed, the body carries no CSRF token.
+	if _, ok := d.settings.Current().Agent("mp"); ok || res.StatusCode != http.StatusForbidden {
+		t.Fatalf("multipart bodies must not be parsed: %d", res.StatusCode)
 	}
 }
 

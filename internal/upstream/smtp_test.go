@@ -3,6 +3,7 @@ package upstream_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ func TestNotConfiguredFailsFast(t *testing.T) {
 		"send":  s.Send(ctx, "gateway@example.com", []string{"me@example.com"}, []byte("x")),
 	} {
 		var ue *upstream.Error
-		if !errors.As(err, &ue) || !errors.Is(err, upstream.ErrNotConfigured) || err.Error() != "upstream SMTP: not configured; set it on the dashboard's Settings page" {
+		if !errors.As(err, &ue) || !errors.Is(err, upstream.ErrNotConfigured) || !strings.HasPrefix(err.Error(), "upstream SMTP: not configured") {
 			t.Errorf("%s: %v", name, err)
 		}
 	}

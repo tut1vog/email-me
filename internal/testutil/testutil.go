@@ -41,13 +41,13 @@ type Captured struct {
 
 // SMTPServer is an in-process SMTP server that records messages.
 type SMTPServer struct {
-	Addr     string
 	Host     string
 	Port     int
 	mu       sync.Mutex
 	messages []Captured
 	failCode int
-	delay    time.Duration
+	gate     chan struct{} // see Hold
+	entered  chan struct{}
 	User     string
 	Pass     string
 }
@@ -70,11 +70,25 @@ func (s *SMTPServer) Last(t testing.TB) Captured {
 	return m[len(m)-1]
 }
 
-// SlowDown delays every DATA command (to hold requests in flight).
-func (s *SMTPServer) SlowDown(d time.Duration) {
+// Hold blocks every DATA command until release is called or the test
+// ends, to keep sends in flight. Each DATA command signals entered as it
+// blocks.
+func (s *SMTPServer) Hold(t testing.TB) (entered <-chan struct{}, release func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.delay = d
+	gate, in := make(chan struct{}), make(chan struct{}, 64)
+	s.gate, s.entered = gate, in
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.gate, s.entered = nil, nil
+			s.mu.Unlock()
+			close(gate)
+		})
+	}
+	t.Cleanup(release)
+	return in, release
 }
 
 // FailWith makes DATA fail with the given SMTP code (0 = succeed).
@@ -115,9 +129,15 @@ func (se *session) Data(r io.Reader) error {
 		return err
 	}
 	se.srv.mu.Lock()
-	delay := se.srv.delay
+	gate, entered := se.srv.gate, se.srv.entered
 	se.srv.mu.Unlock()
-	time.Sleep(delay)
+	if gate != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
 	se.srv.mu.Lock()
 	defer se.srv.mu.Unlock()
 	if se.srv.failCode != 0 {
@@ -140,7 +160,6 @@ func StartSMTP(t testing.TB) *SMTPServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs.Addr = l.Addr().String()
 	fs.Host = "127.0.0.1"
 	fs.Port = l.Addr().(*net.TCPAddr).Port
 	go s.Serve(l)
@@ -191,10 +210,7 @@ func ArmorPrivate(t testing.TB, e *openpgp.Entity) string {
 // Options customize the generated config.
 type Options struct {
 	// Signing configures a key-encryption key, which enables signing.
-	Signing bool
-	// Master is a certification key for the keys manager (see SetMaster).
-	Master         *openpgp.Entity
-	Docs           string
+	Signing        bool
 	LogSubject     bool
 	TrustedProxies []string
 	External       bool
@@ -219,7 +235,6 @@ type Env struct {
 	SMTP    *SMTPServer
 	MeKey   *openpgp.Entity // "me" recipient key (with private part, for decrypting in tests)
 	WorkKey *openpgp.Entity
-	Master  *openpgp.Entity // Options.Master
 }
 
 // NewEnv writes a config.yaml and a KEK file into a temp configuration
@@ -236,7 +251,7 @@ func NewEnv(t testing.TB, o Options) *Env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(data) })
-	env := &Env{Dir: dir, DataDir: data, Master: o.Master}
+	env := &Env{Dir: dir, DataDir: data}
 	env.SMTP = StartSMTP(t)
 	write := func(name, content string) string {
 		p := filepath.Join(dir, name)
@@ -248,12 +263,8 @@ func NewEnv(t testing.TB, o Options) *Env {
 	env.MeKey = NewKeyWithLifetime(t, "Me", "me@example.com", o.MeKeyLifetime)
 	env.WorkKey = NewKey(t, "Work", "work@example.org")
 
-	docs := o.Docs
-	if docs == "" {
-		docs = "public"
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "api:\n  listen: \"127.0.0.1:0\"\n  docs: %s\n  external_transport_encryption: %v\n", docs, o.External)
+	fmt.Fprintf(&b, "api:\n  listen: \"127.0.0.1:0\"\n  docs: public\n  external_transport_encryption: %v\n", o.External)
 	if o.PublicURL != "" {
 		fmt.Fprintf(&b, "  public_url: %q\n", o.PublicURL)
 	}
@@ -368,20 +379,13 @@ func Keyring(t testing.TB, env *Env, st *store.Store) *keyring.Keyring {
 }
 
 // Keys returns a keys manager for env, as run builds it: sealed under
-// st's keyring, following m's From address and key validity, and with
-// env.Master as its certification key.
+// st's keyring and following m's From address and key validity.
 func Keys(t testing.TB, env *Env, st *store.Store, m *settings.Manager) *keys.Manager {
 	t.Helper()
-	km := keys.NewManager(st, keys.Options{Keyring: Keyring(t, env, st), From: func() (string, time.Duration) {
+	return keys.NewManager(st, keys.Options{Keyring: Keyring(t, env, st), From: func() (string, time.Duration) {
 		c := m.Current()
 		return c.Upstream.From, c.Signing.KeyValidity.D()
 	}})
-	if env.Master != nil {
-		if _, err := km.SetMaster(context.Background(), []byte(ArmorPrivate(t, env.Master)), nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return km
 }
 
 // SeedState prepares env's state database the way an operator's first

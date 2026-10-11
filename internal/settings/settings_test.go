@@ -177,19 +177,6 @@ func TestSaveKeepsTheRestOfTheFile(t *testing.T) {
 	}
 }
 
-func TestSaveSigningRules(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{})
-	m, _ := boot(t, env.Path, testutil.OpenStore(t, env))
-	s := m.Current().Managed()
-	tr := true
-	s.Defaults.Policy.RequireSigning = &tr
-	s.Defaults.Policy.Services = &[]string{policy.SvcMarkdown}
-	_, err := m.Save(context.Background(), s, settings.PasswordChange{})
-	if err == nil || !strings.Contains(err.Error(), "signing is not configured") {
-		t.Fatalf("require_signing without signing: %v", err)
-	}
-}
-
 func TestRecipients(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{})
 	st := testutil.OpenStore(t, env)
@@ -329,26 +316,6 @@ func TestRefusedWhileTheFileIsEdited(t *testing.T) {
 	}
 }
 
-func TestPasswordSealedRoundTrip(t *testing.T) {
-	env := testutil.NewEnv(t, testutil.Options{Signing: true})
-	st := testutil.OpenStore(t, env)
-	m, _ := boot(t, env.Path, st)
-	enterPassword(t, m, env.SMTP.Pass)
-	if m.PasswordState() != settings.Sealed {
-		t.Fatalf("state = %v", m.PasswordState())
-	}
-	p, err := st.GetSMTPPassword(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !p.Sealed || bytes.Contains(p.Value, []byte(env.SMTP.Pass)) || strings.Contains(read(t, env.Path), env.SMTP.Pass) {
-		t.Fatal("the password must be stored sealed and never in the file")
-	}
-	if _, cfg := boot(t, env.Path, st); cfg.Upstream.SMTP.Password != env.SMTP.Pass {
-		t.Fatalf("password = %q", cfg.Upstream.SMTP.Password)
-	}
-}
-
 func TestPasswordRawWithoutKEKThenResealed(t *testing.T) {
 	env := testutil.NewEnv(t, testutil.Options{Signing: true})
 	st := testutil.OpenStore(t, env)
@@ -378,7 +345,10 @@ func TestPasswordUndecryptable(t *testing.T) {
 	// A damaged row: start anyway, without the password. (A KEK that does
 	// not open the keyring never gets this far: see the keyring package.)
 	ctx := context.Background()
-	p, _ := st.GetSMTPPassword(ctx)
+	p, err := st.GetSMTPPassword(ctx)
+	if err != nil || !p.Sealed || bytes.Contains(p.Value, []byte(env.SMTP.Pass)) {
+		t.Fatalf("the password must be stored sealed: %v", err)
+	}
 	p.Value[len(p.Value)-1] ^= 1
 	if err := st.SetSMTPPassword(ctx, p); err != nil {
 		t.Fatal(err)

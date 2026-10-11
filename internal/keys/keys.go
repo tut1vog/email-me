@@ -55,6 +55,9 @@ type Options struct {
 	// key is generated or a user ID shown, so saved settings apply to the
 	// next key.
 	From func() (email string, validity time.Duration)
+
+	// Now is the clock; nil means time.Now.
+	Now func() time.Time
 }
 
 func NewManager(st *store.Store, o Options) *Manager {
@@ -62,7 +65,11 @@ func NewManager(st *store.Store, o Options) *Manager {
 	if from == nil {
 		from = func() (string, time.Duration) { return o.Email, o.Validity }
 	}
-	return &Manager{store: st, kr: o.Keyring, from: from, now: time.Now, cache: map[string]*openpgp.Entity{}}
+	now := o.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &Manager{store: st, kr: o.Keyring, from: from, now: now, cache: map[string]*openpgp.Entity{}}
 }
 
 // Enabled reports whether signing is configured.

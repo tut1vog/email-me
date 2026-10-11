@@ -213,7 +213,7 @@ func TestKEKFiles(t *testing.T) {
 	write("short", "abc")
 	write("bad", "x")
 	for kek, want := range map[string]string{
-		"  file: absent\n":                      "kek.file",
+		"  file: absent\n":                      "kek.file: open",
 		"  file: short\n":                       "kek.file: must contain 32 random bytes",
 		"  previous_file: bad\n":                "kek.previous_file: must contain",
 		"  file: empty\n  previous_file: kek\n": "kek.previous_file is set but kek.file is empty",

@@ -95,13 +95,16 @@ func TestPolicyDefaultSwitchClearsOverride(t *testing.T) {
 	}
 }
 
+// issueOpenRe matches the issue-token disclosure, open.
+var issueOpenRe = regexp.MustCompile(`<details class="disclosure[^"]*"\s*open>`)
+
 func TestTokensTabSplitsRevoked(t *testing.T) {
 	d := newDash(t, testutil.Options{})
 	d.login()
 	a := d.createAgent("bench", "me")
 	tab := "/agents/" + a.Name + "/tokens"
 
-	if p := d.get(tab).body; !strings.Contains(p, "<details class=\"disclosure mt-0\" open>") || strings.Contains(p, `id="inactive-tokens"`) {
+	if p := d.get(tab).body; !issueOpenRe.MatchString(p) || strings.Contains(p, `id="inactive-tokens"`) {
 		t.Fatal("with no tokens the issue form is open and there is no inactive list")
 	}
 	issue := func(label string) string {
@@ -130,12 +133,10 @@ func TestTokensTabSplitsRevoked(t *testing.T) {
 	if !strings.Contains(active, `Tokens <span class="count">1</span>`) {
 		t.Fatal("tokens tab count must show active tokens only")
 	}
-	if strings.Contains(active, "<details class=\"disclosure mt-0\" open>") {
+	if issueOpenRe.MatchString(active) {
 		t.Fatal("issue form collapses once a token is active")
 	}
 }
-
-var inlineHandlerRe = regexp.MustCompile(` on[a-z]+="`)
 
 func TestAgentPagesAreCSPSafe(t *testing.T) {
 	for _, signing := range []bool{true, false} {
@@ -156,7 +157,7 @@ func TestAgentPagesAreCSPSafe(t *testing.T) {
 		d.post(base+"/keys/rotate", d.form())
 		pages["signing after rotation"] = d.get(base + "/signing").body
 		for name, body := range pages {
-			if strings.Contains(body, ` style="`) || strings.Contains(body, "<script>") || inlineHandlerRe.MatchString(body) {
+			if !cspSafe(body) {
 				t.Errorf("signing=%v %s: inline style, script or handler (CSP)", signing, name)
 			}
 		}

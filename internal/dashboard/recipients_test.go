@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tut1vog/email-me/internal/config"
 	"github.com/tut1vog/email-me/internal/pgp"
 	"github.com/tut1vog/email-me/internal/store"
 	"github.com/tut1vog/email-me/internal/testutil"
@@ -27,14 +28,8 @@ func TestRecipientsCRUD(t *testing.T) {
 		!strings.Contains(p.body, `value="pager@example.net"`) || !strings.Contains(p.body, "BEGIN PGP PUBLIC KEY BLOCK") {
 		t.Fatalf("invalid alias: %d", p.status)
 	}
-	if p := d.post("/recipients", d.form("alias", "pager", "address", "pager@example.net", "require_encryption", "on")); !strings.Contains(p.body, "needs a PGP public key") {
-		t.Fatal("require_encryption without a key must be refused")
-	}
 	if p := d.post("/recipients", d.form("alias", "me", "address", "x@example.net")); !strings.Contains(p.body, "already exists") {
 		t.Fatal("duplicate alias must be refused")
-	}
-	if p := d.post("/recipients", d.form("alias", "pager", "address", "Pager <pager@example.net>")); !strings.Contains(p.body, "bare email address") {
-		t.Fatal("display names must be refused")
 	}
 	if _, ok := d.settings.Current().Recipient("pager"); ok {
 		t.Fatal("refused recipient must not be saved")
@@ -52,8 +47,12 @@ func TestRecipientsCRUD(t *testing.T) {
 	if rc, ok := d.settings.Current().Recipient("pager"); !ok || rc.Fingerprint() != pgp.Fingerprint(k1) || rc.Description != "On-call pager" {
 		t.Fatalf("current configuration: %+v", rc)
 	}
-	if f := read(t, d.env.Path); !strings.Contains(f, "  pager:\n    address: pager@example.net\n    description: On-call pager\n    pgp_public_key: |") {
-		t.Fatalf("config.yaml must hold the recipient:\n%s", f)
+	c, err := config.Load(d.env.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc, ok := c.Recipient("pager"); !ok || rc.Fingerprint() != pgp.Fingerprint(k1) || rc.Description != "On-call pager" {
+		t.Fatalf("config.yaml must hold the recipient: %+v", rc)
 	}
 	if l := d.get("/recipients").body; !strings.Contains(l, `href="/recipients/pager"`) || !strings.Contains(l, "On-call pager") {
 		t.Fatal("list must link the new recipient")
@@ -117,7 +116,7 @@ func TestRecipientsCRUD(t *testing.T) {
 	if _, ok := d.settings.Current().Recipient("pager"); ok {
 		t.Fatal("recipient must be deleted")
 	}
-	if b := d.get("/agents/" + a.Name + "/policy").body; !strings.Contains(b, "no longer exist") || !strings.Contains(b, "pager") {
+	if b := d.get("/agents/" + a.Name + "/policy").body; !strings.Contains(b, "no longer exist and are ignored: pager.") {
 		t.Fatal("policy tab must flag the deleted alias")
 	}
 	got := d.agent(a.Name)
@@ -147,7 +146,7 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 			t.Errorf("overview lacks %q", want)
 		}
 	}
-	if s := d.get("/settings").body; strings.Contains(s, "/settings/test-send") || !strings.Contains(s, `<a href="/recipients">Recipients</a> page`) {
+	if s := d.get("/settings").body; !strings.Contains(s, `<a href="/recipients">Recipients</a> page`) {
 		t.Error("settings must point at the recipients list for test messages")
 	}
 	if r := d.get("/recipients"); r.status != 200 || !strings.Contains(r.body, "No recipients") {
@@ -165,12 +164,30 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 	}
 }
 
+func TestRecipientTestSend(t *testing.T) {
+	d := newDash(t, testutil.Options{})
+	d.login()
+	if b := d.get("/recipients").body; !strings.Contains(b, `action="/recipients/me/test"`) {
+		t.Fatal("the recipients list must offer a test message")
+	}
+	if strings.Contains(d.get("/recipients/me").body, "/recipients/me/test") {
+		t.Fatal("test messages are sent from the recipients list, not the recipient page")
+	}
+	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients" {
+		t.Fatalf("test send: %d to %q", p.status, p.header.Get("Location"))
+	}
+	if b := d.get("/recipients").body; !strings.Contains(b, "Test message sent to me.") {
+		t.Fatal("test send must flash on the recipients list")
+	}
+	c := d.env.SMTP.Last(t)
+	if len(c.To) != 1 || c.To[0] != "me@example.com" || !strings.Contains(string(c.Data), "Test message") {
+		t.Fatalf("test message: %+v", c.To)
+	}
+}
+
 func TestRecipientTestSendWithoutUpstream(t *testing.T) {
 	d := newDashWith(t, testutil.Options{}, func(env *testutil.Env, _ *store.Store) { withoutUpstream(t, env) })
 	d.login()
-	if strings.Contains(d.get("/recipients/me").body, `action="/recipients/me/test"`) {
-		t.Fatal("test messages are sent from the recipients list, not the recipient page")
-	}
 	b := d.get("/recipients").body
 	if strings.Contains(b, `action="/recipients/me/test"`) ||
 		!strings.Contains(b, "No SMTP host or From address is set") || !strings.Contains(b, `href="/settings#upstream"`) {

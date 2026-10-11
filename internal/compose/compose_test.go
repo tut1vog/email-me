@@ -161,8 +161,10 @@ func TestMarkdownWithAttachments(t *testing.T) {
 
 func TestHeaderInjectionIsImpossible(t *testing.T) {
 	m := baseMessage()
-	m.Subject = CleanHeaderText("hi\r\nBcc: victim@example.com\r\n\r\nbody", 255)
-	m.Agent = "bench\r\nX-Evil: 1" // defense in depth: writer strips CR/LF too
+	// Build is the last line of defense: it must neutralize CR/LF even in
+	// fields the API layer failed to clean.
+	m.Subject = "hi\r\nBcc: victim@example.com\r\n\r\nbody"
+	m.Agent = "bench\r\nX-Evil: 1"
 	raw, err := Build(m)
 	if err != nil {
 		t.Fatal(err)
@@ -226,8 +228,8 @@ func TestSignedMessageHasProtectedHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	io.Copy(io.Discard, e.Body)
-	if r.MessageDetails.SignatureError != nil {
-		t.Fatalf("signature: %v", r.MessageDetails.SignatureError)
+	if d := r.MessageDetails; !d.IsSigned || d.SignedBy == nil || d.SignatureError != nil {
+		t.Fatalf("signature: signed=%v by=%v err=%v", d.IsSigned, d.SignedBy, d.SignatureError)
 	}
 	if e.Header.Get("X-Email-Me-Agent") != "bench" || e.Header.Get("From") == "" || e.Header.Get("Message-Id") == "" {
 		t.Fatalf("protected headers missing: %v", e.Header.Map())
@@ -304,7 +306,7 @@ func TestSanitizeNewsletterHTML(t *testing.T) {
 	for _, good := range []string{
 		`role="presentation"`, `width="600"`, `cellpadding="0"`, `align="center"`, `bgcolor="#ffffff"`,
 		`max-width: 600px`, `background-color: #fff`, `valign="top"`, `font-family: Arial,sans-serif`,
-		`<img src="cid:logo" alt="Logo" width="120" style="display: block; border: 0">`,
+		`src="cid:logo"`, `alt="Logo"`, `width="120"`, `display: block`, `border: 0`,
 		`color: #333; line-height: 1.5`, `noreferrer`, `display: none`,
 	} {
 		if !strings.Contains(got, good) {

@@ -1,6 +1,7 @@
 package docs
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"os"
@@ -46,9 +47,10 @@ func TestOpenAPIJSONSetsServer(t *testing.T) {
 	if doc["servers"].([]any)[0].(map[string]any)["url"] != "https://x.example" {
 		t.Fatal(doc["servers"])
 	}
-	// The shared spec map must not be mutated between calls.
-	json.Unmarshal(OpenAPIJSON("https://y.example"), &doc)
-	if doc["servers"].([]any)[0].(map[string]any)["url"] != "https://y.example" {
-		t.Fatal("server URL leaked between calls")
+	// The shared spec map must not be mutated: requests render it concurrently.
+	before, _ := json.Marshal(spec["servers"])
+	OpenAPIJSON("https://y.example")
+	if after, _ := json.Marshal(spec["servers"]); !bytes.Equal(before, after) {
+		t.Fatalf("OpenAPIJSON changed the shared spec's servers: %s → %s", before, after)
 	}
 }
