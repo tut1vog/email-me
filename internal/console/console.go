@@ -226,6 +226,17 @@ func Attach(ctx context.Context, path string, stdin io.Reader, out io.Writer) er
 	case <-gone:
 		return errors.New("email-me stopped; the dashboard is closed")
 	}
+	// Tell the gateway and wait until it has closed the dashboard: it closes
+	// the connection only after it ended the sessions and freed the console
+	// slot, so a console started right after this one returns is not
+	// refused as "already open".
+	if uc, ok := conn.(*net.UnixConn); ok {
+		_ = uc.CloseWrite()
+		select {
+		case <-gone:
+		case <-time.After(10 * time.Second):
+		}
+	}
 	fmt.Fprintln(out, "Dashboard closed.")
 	return nil
 }
