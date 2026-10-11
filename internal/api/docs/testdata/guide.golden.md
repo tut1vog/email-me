@@ -27,6 +27,7 @@ curl -s -X POST https://email-me.example.ts.net/v1/messages \
 
 - `body` takes exactly one of `text`, `markdown`, `html`, or `pgp_message`. Prefer `markdown`.
 - Attachments (service `attachments`): `"attachments":[{"filename":"results.csv","content_type":"text/csv","content_base64":"..."}]`.
+- `html` is for layouts you style yourself, such as newsletters: use inline `style` attributes (no `<style>` blocks) and table layout. Remote images are rejected; attach each image with a `content_id` (service `attachments`) and reference it as `<img src="cid:<content_id>">`.
 - `options.thread`: a stable key such as `"nightly-bench"` groups related reports into one inbox thread. Keep the subject stable too.
 - `options.priority`: `low`, `normal` or `high` (`high` needs service `priority`).
 - `options.encrypt: "pgp"`: the gateway encrypts to the recipient's key; the mail provider sees only ciphertext and a generic subject. Available when `encryption_available` is true for that alias. Use it for sensitive content.

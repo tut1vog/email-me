@@ -170,6 +170,15 @@ paths:
                     - {filename: results.csv, content_type: text/csv, content_base64: "cnVuLHA1MAoxLDEybXMK"}
                   options: {encrypt: pgp}
                   idempotency_key: export-8841
+              newsletter:
+                summary: HTML newsletter with an inline image
+                value:
+                  to: [me]
+                  subject: Weekly digest
+                  body: {html: "<table role=\"presentation\" width=\"600\" align=\"center\" style=\"background-color:#ffffff\"><tr><td style=\"padding:24px;font-family:Arial,sans-serif\"><img src=\"cid:chart\" alt=\"Weekly chart\" width=\"552\"><h1 style=\"font-size:20px\">This week</h1><p>Three releases shipped.</p></td></tr></table>"}
+                  attachments:
+                    - {filename: chart.png, content_type: image/png, content_id: chart, content_base64: "iVBORw0KGgo="}
+                  idempotency_key: digest-2026-41
               e2e:
                 summary: End-to-end encrypted (no subject, no attachments)
                 value:
@@ -285,7 +294,7 @@ components:
       properties:
         text: {type: string, description: Plain text.}
         markdown: {type: string, description: "GitHub-flavored markdown, rendered to sanitized HTML with the markdown kept as the plain-text alternative. Requires the `markdown` service."}
-        html: {type: string, description: "HTML, sanitized with a strict allowlist (no images, scripts or styles). Requires the `html` service."}
+        html: {type: string, description: "HTML you lay out yourself, such as a newsletter. Requires the `html` service. Presented as you styled it: put CSS in inline `style` attributes (`<style>` blocks, scripts, forms and remote resources are removed; `url()` and positioning are dropped from styles). Images must be inline attachments referenced as `src=\"cid:<content_id>\"`; any other image source is rejected."}
         pgp_message: {type: string, description: "ASCII-armored OpenPGP ciphertext of a MIME entity. Only with `options.encrypt: e2e`."}
     Attachment:
       type: object
@@ -295,6 +304,10 @@ components:
         filename: {type: string}
         content_type: {type: string, description: "Media type, e.g. `text/csv`."}
         content_base64: {type: string, description: Standard base64 of the file content.}
+        content_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          description: "Makes this an inline image of `body.html`, shown where the HTML has `<img src=\"cid:<content_id>\">`. Only with `body.html`; the type must be `image/*`, and the HTML must reference it. Counts toward attachment limits."
     Options:
       type: object
       additionalProperties: false

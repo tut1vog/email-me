@@ -608,6 +608,66 @@ func TestRejections(t *testing.T) {
 	}
 }
 
+func TestSendHTMLWithInlineImages(t *testing.T) {
+	h := newHarness(t, testutil.Options{})
+	_, tok := h.agent("digest", policy.Policy{
+		Recipients:             ptr([]string{"me"}),
+		Services:               ptr([]string{policy.SvcHTML, policy.SvcMarkdown, policy.SvcAttachments}),
+		AllowedAttachmentTypes: ptr([]string{"image/png", "text/plain"}),
+	})
+	png := base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\nfake"))
+	img := func(cid, ct string) map[string]any {
+		return map[string]any{"filename": cid + ".png", "content_type": ct, "content_base64": png, "content_id": cid}
+	}
+	send := func(html string, atts ...map[string]any) map[string]any {
+		return map[string]any{"to": []string{"me"}, "subject": "Weekly digest", "body": map[string]any{"html": html}, "attachments": atts}
+	}
+
+	ok := send(`<table width="600" style="background-color:#fff"><tr><td style="padding:24px"><img src="cid:chart" alt="chart"><img src="CID:logo"></td></tr></table>`,
+		img("chart", "image/png"), img("logo", "image/png"))
+	if r := h.do("POST", "/v1/messages", tok, ok); r.status != 200 {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+	c := h.env.SMTP.Last(t)
+	for _, want := range []string{"multipart/related", "Content-ID: <chart>", "Content-ID: <logo>"} {
+		if !bytes.Contains(c.Data, []byte(want)) {
+			t.Errorf("delivered message lacks %q", want)
+		}
+	}
+	e, err := message.Read(bytes.NewReader(c.Data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all := leafText(t, e); !strings.Contains(all, "padding: 24px") {
+		t.Error("inline styles must survive")
+	}
+
+	cases := []struct {
+		name   string
+		body   any
+		status int
+	}{
+		{"remote image", send(`<img src="https://tracker.example/p.gif">`), 422},
+		{"image without src", send(`<img alt="x">`), 422},
+		{"unknown cid", send(`<img src="cid:nope">`, img("chart", "image/png")), 422},
+		{"unreferenced inline image", send(`<p>no images</p>`, img("chart", "image/png")), 422},
+		{"inline non-image", send(`<img src="cid:notes">`, img("notes", "text/plain")), 422},
+		{"bad content_id", send(`<img src="cid:a b">`, img("a b", "image/png")), 422},
+		{"duplicate content_id", send(`<img src="cid:x">`, img("x", "image/png"), img("x", "image/png")), 422},
+		{"content_id with markdown", map[string]any{"to": []string{"me"}, "subject": "s", "body": map[string]any{"markdown": "x"}, "attachments": []any{img("x", "image/png")}}, 422},
+		{"inline type not allowed", send(`<img src="cid:x">`, img("x", "image/gif")), 415},
+	}
+	for _, c := range cases {
+		r := h.do("POST", "/v1/messages", tok, c.body)
+		if r.status != c.status {
+			t.Errorf("%s: got %d %s, want %d", c.name, r.status, r.body, c.status)
+		}
+	}
+	if h.env.SMTP.Count() != 1 {
+		t.Fatal("rejected requests must not be delivered")
+	}
+}
+
 func TestRateLimit(t *testing.T) {
 	h := newHarness(t, testutil.Options{})
 	_, tok := h.agent("a", policy.Policy{Recipients: ptr([]string{"me"}), RateLimit: &policy.RateLimit{PerHour: 2, PerDay: 10}})

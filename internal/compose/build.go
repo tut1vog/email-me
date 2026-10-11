@@ -29,6 +29,9 @@ type Attachment struct {
 	Filename    string
 	ContentType string
 	Data        []byte
+	// ContentID makes the attachment an inline image of the HTML, which
+	// references it as cid:<ContentID>. Ignored when there is no HTML.
+	ContentID string
 }
 
 // Message is a fully authorized message ready to build.
@@ -48,7 +51,7 @@ type Message struct {
 	Priority     string // low | normal | high
 
 	Text        string // plain text (for markdown: the markdown source)
-	HTML        string // sanitized body HTML (optional)
+	HTML        string // complete HTML document, from MarkdownDocument or HTMLDocument (optional)
 	Attachments []Attachment
 
 	E2E string // ciphertext re-armored by pgp.NormalizeCiphertext (mutually exclusive with Text/HTML)
@@ -216,31 +219,50 @@ func (e entity) bytes() []byte {
 
 func (m *Message) content(protected bool) (entity, error) {
 	var body entity
+	attachments := m.Attachments
 	if m.HTML != "" {
-		body = multipart("alternative", []entity{
-			textPart("text/plain", m.Text),
-			textPart("text/html", Document(m.HTML)),
-		})
+		html := textPart("text/html", m.HTML)
+		var inline []entity
+		attachments = nil
+		for _, a := range m.Attachments {
+			if a.ContentID != "" {
+				inline = append(inline, attachmentPart(a))
+			} else {
+				attachments = append(attachments, a)
+			}
+		}
+		if len(inline) > 0 {
+			html = multipart("related", append([]entity{html}, inline...))
+			setParam(html.h, "type", "text/html")
+		}
+		body = multipart("alternative", []entity{textPart("text/plain", m.Text), html})
 	} else {
 		body = textPart("text/plain", m.Text)
 	}
-	if len(m.Attachments) > 0 {
+	if len(attachments) > 0 {
 		parts := []entity{body}
-		for _, a := range m.Attachments {
+		for _, a := range attachments {
 			parts = append(parts, attachmentPart(a))
 		}
 		body = multipart("mixed", parts)
 	}
 	if protected {
-		ct := body.h.get("Content-Type")
-		mt, params, err := mime.ParseMediaType(ct)
-		if err != nil {
+		if err := setParam(body.h, "protected-headers", "v1"); err != nil {
 			return entity{}, err
 		}
-		params["protected-headers"] = "v1"
-		body.h.set("Content-Type", mime.FormatMediaType(mt, params))
 	}
 	return body, nil
+}
+
+// setParam sets a parameter on the entity's Content-Type.
+func setParam(h hdr, k, v string) error {
+	mt, params, err := mime.ParseMediaType(h.get("Content-Type"))
+	if err != nil {
+		return err
+	}
+	params[k] = v
+	h.set("Content-Type", mime.FormatMediaType(mt, params))
+	return nil
 }
 
 func textPart(mediaType, s string) entity {
@@ -269,7 +291,12 @@ func attachmentPart(a Attachment) entity {
 	var h hdr
 	h.add("Content-Type", mime.FormatMediaType(mt, params))
 	h.add("Content-Transfer-Encoding", "base64")
-	h.add("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": a.Filename}))
+	if a.ContentID != "" {
+		h.add("Content-ID", "<"+a.ContentID+">")
+		h.add("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": a.Filename}))
+	} else {
+		h.add("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": a.Filename}))
+	}
 
 	enc := base64.StdEncoding.EncodeToString(a.Data)
 	var body bytes.Buffer

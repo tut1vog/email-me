@@ -108,7 +108,7 @@ func TestMarkdownWithAttachments(t *testing.T) {
 			t.Errorf("expected %q in %s", good, html)
 		}
 	}
-	m.Text, m.HTML = "## Results", html
+	m.Text, m.HTML = "## Results", MarkdownDocument(html)
 	m.Attachments = []Attachment{
 		{Filename: "results.csv", ContentType: "text/csv", Data: []byte("a,b\n1,2\n")},
 		{Filename: "résumé.bin", ContentType: "application/octet-stream", Data: bytes.Repeat([]byte{0xff, 0x00}, 200)},
@@ -285,6 +285,92 @@ func TestThreadRootDeterministic(t *testing.T) {
 	}
 	if !strings.HasSuffix(a, "@"+MessageIDDomain) || !strings.HasPrefix(a, "thread-") {
 		t.Fatal(a)
+	}
+}
+
+func TestSanitizeNewsletterHTML(t *testing.T) {
+	got := SanitizeHTML(`<html><head><title>Weekly</title><style>.x{color:red}</style><link rel="stylesheet" href="https://t.example/s.css"></head><body>
+<table role="presentation" width="600" cellpadding="0" align="center" bgcolor="#ffffff" style="max-width:600px;background:url(https://t.example/b.png);background-color:#fff;position:absolute;top:0">
+<tr><td valign="top" style="padding:24px;font-family:Arial,sans-serif;background-image:url(https://t.example/c.png)">
+<img src="cid:logo" alt="Logo" width="120" style="display:block;border:0"><img src="https://t.example/p.gif">
+<p style="color:#333;line-height:1.5"><a href="https://example.com" style="color:#06c">link</a></p>
+<span style="display:none">preheader</span><form action="https://t.example"><input name="a"></form><script>alert(1)</script>
+</td></tr></table></body></html>`)
+	for _, bad := range []string{"t.example", "<style", "<link", "<script", "<form", "<input", "position", "Weekly", "url("} {
+		if strings.Contains(got, bad) {
+			t.Errorf("sanitizer let %q through: %s", bad, got)
+		}
+	}
+	for _, good := range []string{
+		`role="presentation"`, `width="600"`, `cellpadding="0"`, `align="center"`, `bgcolor="#ffffff"`,
+		`max-width: 600px`, `background-color: #fff`, `valign="top"`, `font-family: Arial,sans-serif`,
+		`<img src="cid:logo" alt="Logo" width="120" style="display: block; border: 0">`,
+		`color: #333; line-height: 1.5`, `noreferrer`, `display: none`,
+	} {
+		if !strings.Contains(got, good) {
+			t.Errorf("expected %q in %s", good, got)
+		}
+	}
+	if srcs := ImageSources(`<img src="cid:a"><!-- <img src="x"> --><IMG SRC=" https://x.example/p.gif "><img>`); strings.Join(srcs, ",") != "cid:a,https://x.example/p.gif," {
+		t.Fatalf("ImageSources = %q", srcs)
+	}
+}
+
+func TestInlineImages(t *testing.T) {
+	m := baseMessage()
+	body := `<p>Chart:</p><img src="cid:chart" alt="chart">`
+	m.Text, m.HTML = HTMLToText(body), HTMLDocument(SanitizeHTML(body))
+	png := []byte("\x89PNG\r\n\x1a\nfake")
+	m.Attachments = []Attachment{
+		{Filename: "chart.png", ContentType: "image/png", Data: png, ContentID: "chart"},
+		{Filename: "data.csv", ContentType: "text/csv", Data: []byte("a,b\n")},
+	}
+	raw, err := Build(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkLines(t, raw)
+	e, err := message.Read(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mixed[alternative[text/plain, related[text/html, image/png]], text/csv]
+	var tree func(e *message.Entity) string
+	tree = func(e *message.Entity) string {
+		mt, params, _ := e.Header.ContentType()
+		mr := e.MultipartReader()
+		if mr == nil {
+			if cid := e.Header.Get("Content-Id"); cid != "" {
+				disp, _, _ := e.Header.ContentDisposition()
+				b, _ := io.ReadAll(e.Body)
+				if cid != "<chart>" || disp != "inline" || !bytes.Equal(b, png) {
+					t.Errorf("inline part: cid=%q disposition=%q data ok=%v", cid, disp, bytes.Equal(b, png))
+				}
+			}
+			return mt
+		}
+		if mt == "multipart/related" && params["type"] != "text/html" {
+			t.Errorf("multipart/related type = %q", params["type"])
+		}
+		var parts []string
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts = append(parts, tree(p))
+		}
+		return mt + "[" + strings.Join(parts, ",") + "]"
+	}
+	want := "multipart/mixed[multipart/alternative[text/plain,multipart/related[text/html,image/png]],text/csv]"
+	if got := tree(e); got != want {
+		t.Fatalf("MIME tree = %s, want %s", got, want)
+	}
+	if bytes.Contains(raw, []byte(".email-me")) {
+		t.Fatal("agent HTML must not get the markdown stylesheet")
 	}
 }
 

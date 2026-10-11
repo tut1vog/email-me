@@ -46,6 +46,7 @@ type attachmentInput struct {
 	Filename      string `json:"filename"`
 	ContentType   string `json:"content_type"`
 	ContentBase64 string `json:"content_base64"`
+	ContentID     string `json:"content_id"`
 }
 
 type sendOptions struct {
@@ -345,9 +346,36 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 		if err != nil {
 			return p, newErr(http.StatusUnprocessableEntity, CodeValidation, "attachments[%d].content_base64 is not valid standard base64.", i)
 		}
-		atts = append(atts, compose.Attachment{Filename: compose.CleanFilename(a.Filename), ContentType: mt, Data: data})
+		if a.ContentID != "" {
+			if req.Body.HTML == nil {
+				return p, newErr(http.StatusUnprocessableEntity, CodeValidation,
+					"attachments[%d].content_id is only valid with body.html (inline images). Omit it to send a regular attachment.", i)
+			}
+			if !compose.ContentIDPattern.MatchString(a.ContentID) {
+				return p, newErr(http.StatusUnprocessableEntity, CodeValidation,
+					"attachments[%d].content_id %q must be 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit.", i, a.ContentID)
+			}
+			if !strings.HasPrefix(mt, "image/") {
+				return p, newErr(http.StatusUnprocessableEntity, CodeValidation,
+					"attachments[%d] has a content_id but type %s; inline attachments must be images (e.g. image/png).", i, mt)
+			}
+			for _, prev := range atts {
+				if prev.ContentID == a.ContentID {
+					return p, newErr(http.StatusUnprocessableEntity, CodeValidation, "attachments[%d].content_id %q is used twice.", i, a.ContentID)
+				}
+			}
+		}
+		atts = append(atts, compose.Attachment{Filename: compose.CleanFilename(a.Filename), ContentType: mt, Data: data, ContentID: a.ContentID})
 	}
 	p.nAttach = len(atts)
+
+	var cleanHTML string
+	if req.Body.HTML != nil {
+		if e := checkImages(*req.Body.HTML, atts); e != nil {
+			return p, e
+		}
+		cleanHTML = compose.SanitizeHTML(*req.Body.HTML)
+	}
 
 	// --- recipients -----------------------------------------------------
 	// Resolved once: later steps use this snapshot, so a recipient edited or
@@ -537,10 +565,9 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 		if err != nil {
 			return p, newErr(http.StatusUnprocessableEntity, CodeValidation, "body.markdown could not be rendered: %v.", err)
 		}
-		msg.Text, msg.HTML = *req.Body.Markdown, html
+		msg.Text, msg.HTML = *req.Body.Markdown, compose.MarkdownDocument(html)
 	case req.Body.HTML != nil:
-		clean := compose.SanitizeHTML(*req.Body.HTML)
-		msg.HTML, msg.Text = clean, compose.HTMLToText(clean)
+		msg.HTML, msg.Text = compose.HTMLDocument(cleanHTML), compose.HTMLToText(cleanHTML)
 	case req.Body.PGPMessage != nil:
 		msg.E2E = e2eArmor // re-armored by the gateway; never the agent's raw text
 	}
@@ -551,6 +578,35 @@ func (s *Server) prepare(ctx context.Context, cfg *config.Config, c *caller, req
 	p.msg = msg
 	p.subject = subject
 	return p, nil
+}
+
+// checkImages rejects images the message would not show: every <img> must
+// reference an inline attachment by cid:, and every inline attachment must
+// be referenced.
+func checkImages(body string, atts []compose.Attachment) *apiError {
+	used := map[string]bool{}
+	for _, src := range compose.ImageSources(body) {
+		scheme, id, ok := strings.Cut(src, ":")
+		if !ok || !strings.EqualFold(scheme, "cid") {
+			if len(src) > 100 {
+				src = src[:100] + "…"
+			}
+			return newErr(http.StatusUnprocessableEntity, CodeValidation,
+				"body.html has an image with src %q; only inline images are allowed (remote images are tracking beacons). Attach the image with a content_id and use src=\"cid:<content_id>\".", src)
+		}
+		if !slices.ContainsFunc(atts, func(a compose.Attachment) bool { return a.ContentID == id }) {
+			return newErr(http.StatusUnprocessableEntity, CodeValidation,
+				"body.html references cid:%s, but no attachment has content_id %q.", id, id)
+		}
+		used[id] = true
+	}
+	for i, a := range atts {
+		if a.ContentID != "" && !used[a.ContentID] {
+			return newErr(http.StatusUnprocessableEntity, CodeValidation,
+				"attachments[%d] has content_id %q, but body.html never references cid:%s. Reference it in an <img>, or omit content_id to send a regular attachment.", i, a.ContentID, a.ContentID)
+		}
+	}
+	return nil
 }
 
 func decodeBase64(s string) ([]byte, error) {
