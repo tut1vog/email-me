@@ -4,6 +4,12 @@ All notable changes to email-me are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-10-11
+
+### Fixed
+
+- **Reopening the console right after closing it no longer fails** — `email-me console` now returns only once the dashboard is closed, so starting it again at once is no longer refused with "a console is already open".
+
 ## [0.1.4] - 2026-10-11
 
 ### Changed
