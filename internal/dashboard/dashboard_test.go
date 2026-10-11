@@ -440,17 +440,17 @@ func TestSettingsHideSecretsAndTestSMTP(t *testing.T) {
 	if p.status != http.StatusSeeOther || !strings.Contains(d.get("/settings").body, "Connected and authenticated") {
 		t.Fatal("SMTP test should succeed against the fake server")
 	}
-	if b := d.get("/recipients/me").body; !strings.Contains(b, `action="/recipients/me/test"`) {
-		t.Fatal("the recipient page must offer a test message")
+	if b := d.get("/recipients").body; !strings.Contains(b, `action="/recipients/me/test"`) {
+		t.Fatal("the recipients list must offer a test message")
 	}
 	if strings.Contains(d.get("/settings").body, "/settings/test-send") {
-		t.Fatal("test messages are sent from the recipient page, not Settings")
+		t.Fatal("test messages are sent from the recipients list, not Settings")
 	}
-	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients/me" {
+	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients" {
 		t.Fatalf("test send: %d to %q", p.status, p.header.Get("Location"))
 	}
-	if b := d.get("/recipients/me").body; !strings.Contains(b, "Test message sent to me.") {
-		t.Fatal("test send must flash on the recipient page")
+	if b := d.get("/recipients").body; !strings.Contains(b, "Test message sent to me.") {
+		t.Fatal("test send must flash on the recipients list")
 	}
 	if p := d.post("/recipients/nope/test", d.form()); p.status != http.StatusNotFound {
 		t.Fatalf("test send to an unknown alias: %d", p.status)

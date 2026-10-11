@@ -942,12 +942,14 @@ func keyExpiryNote(rc *config.Recipient, now time.Time) string {
 }
 
 func (s *Server) recipients(w http.ResponseWriter, r *http.Request) {
-	now := s.now()
+	now, cfg := s.now(), s.Config()
 	var rows []recipientRow
-	for _, rc := range s.Config().RecipientList() {
+	for _, rc := range cfg.RecipientList() {
 		rows = append(rows, recipientRow{R: rc, KeyFpr: rc.Fingerprint(), KeyExpiry: rc.KeyExpiry(), KeyState: recipientKeyState(rc, now)})
 	}
-	s.render(w, r, "recipients", "Recipients", map[string]any{"Rows": rows})
+	s.render(w, r, "recipients", "Recipients", map[string]any{
+		"Rows": rows, "Configured": upstreamConfigured(cfg), "Missing": missingUpstreamNote(cfg),
+	})
 }
 
 // loadRecipient returns the recipient named in the path, or nil after
@@ -1008,7 +1010,7 @@ func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
 	if rc == nil {
 		return
 	}
-	now, cfg := s.now(), s.Config()
+	now := s.now()
 	state, exp := recipientKeyState(rc, now), rc.KeyExpiry()
 	s.render(w, r, "recipient", rc.Alias, map[string]any{
 		"Recipient":  rc,
@@ -1017,8 +1019,6 @@ func (s *Server) recipientPage(w http.ResponseWriter, r *http.Request) {
 		"KeyUsable":  state == "ok" || state == "expiring",
 		"KeyExpired": !exp.IsZero() && !now.Before(exp),
 		"Expiring":   state == "expiring",
-		"Configured": upstreamConfigured(cfg),
-		"Missing":    missingUpstreamNote(cfg),
 	})
 }
 

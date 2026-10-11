@@ -488,13 +488,13 @@ func (s *Server) testSMTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // testSendRecipient sends the recipient named in the path a test message
-// through the running sender, then returns to its page.
+// through the running sender, then returns to the recipients list.
 func (s *Server) testSendRecipient(w http.ResponseWriter, r *http.Request) {
 	rc := s.loadRecipient(w, r)
 	if rc == nil {
 		return
 	}
-	alias, back, cfg := rc.Alias, "/recipients/"+rc.Alias, s.Config()
+	alias, back, cfg := rc.Alias, "/recipients", s.Config()
 	if !upstreamConfigured(cfg) {
 		s.flash(r, "error", "Test message not sent: %s Set it on the Settings page.", missingUpstreamNote(cfg))
 		s.redirect(w, r, back)

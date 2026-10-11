@@ -147,8 +147,8 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 			t.Errorf("overview lacks %q", want)
 		}
 	}
-	if s := d.get("/settings").body; strings.Contains(s, "/settings/test-send") || !strings.Contains(s, `<a href="/recipients">recipient's page</a>`) {
-		t.Error("settings must point at the recipient pages for test messages")
+	if s := d.get("/settings").body; strings.Contains(s, "/settings/test-send") || !strings.Contains(s, `<a href="/recipients">Recipients</a> page`) {
+		t.Error("settings must point at the recipients list for test messages")
 	}
 	if r := d.get("/recipients"); r.status != 200 || !strings.Contains(r.body, "No recipients") {
 		t.Error("recipients page needs an empty state")
@@ -168,19 +168,22 @@ func TestOverviewNoRecipientsNotice(t *testing.T) {
 func TestRecipientTestSendWithoutUpstream(t *testing.T) {
 	d := newDashWith(t, testutil.Options{}, func(env *testutil.Env, _ *store.Store) { withoutUpstream(t, env) })
 	d.login()
-	b := d.get("/recipients/me").body
+	if strings.Contains(d.get("/recipients/me").body, `action="/recipients/me/test"`) {
+		t.Fatal("test messages are sent from the recipients list, not the recipient page")
+	}
+	b := d.get("/recipients").body
 	if strings.Contains(b, `action="/recipients/me/test"`) ||
 		!strings.Contains(b, "No SMTP host or From address is set") || !strings.Contains(b, `href="/settings#upstream"`) {
-		t.Fatal("without upstream the recipient page must say what is missing instead of offering a test")
+		t.Fatal("without upstream the recipients list must say what is missing instead of offering a test")
 	}
 	sent := d.env.SMTP.Count()
-	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients/me" {
+	if p := d.post("/recipients/me/test", d.form()); p.status != http.StatusSeeOther || p.header.Get("Location") != "/recipients" {
 		t.Fatalf("test send without upstream: %d to %q", p.status, p.header.Get("Location"))
 	}
 	if d.env.SMTP.Count() != sent {
 		t.Fatal("nothing may be sent without upstream")
 	}
-	if b := d.get("/recipients/me").body; !strings.Contains(b, "Test message not sent: No SMTP host or From address is set") {
+	if b := d.get("/recipients").body; !strings.Contains(b, "Test message not sent: No SMTP host or From address is set") {
 		t.Fatal("the refusal must say what is missing")
 	}
 }

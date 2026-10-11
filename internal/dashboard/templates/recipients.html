@@ -4,7 +4,7 @@
 <section class="card">
   <div class="table-wrap">
   <table>
-    <thead><tr><th>Alias</th><th>Address</th><th>Description</th><th>Encryption</th><th>PGP key</th></tr></thead>
+    <thead><tr><th>Alias</th><th>Address</th><th>Description</th><th>Encryption</th><th>PGP key</th><th>Test message</th></tr></thead>
     <tbody>
     {{range .Data.Rows}}
       <tr>
@@ -13,6 +13,10 @@
         <td class="text-2">{{.R.Description}}</td>
         <td>{{if .R.RequireEncryption}}<span class="tag info">required</span>{{else if or (eq .KeyState "ok") (eq .KeyState "expiring")}}<span class="tag ok">available</span>{{else}}<span class="tag">unavailable</span>{{end}}</td>
         <td>{{if eq .KeyState "damaged"}}<span class="tag danger">unreadable</span>{{else if .KeyFpr}}<code class="fpr" title="{{.KeyFpr}}">{{short .KeyFpr}}</code>{{if eq .KeyState "expired"}} <span class="tag danger">expired</span>{{else if eq .KeyState "expiring"}} <span class="tag warn">expiring</span>{{end}}{{if not .KeyExpiry.IsZero}}<span class="sub">expires {{ts .KeyExpiry}}</span>{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
+        <td class="actions">{{if $.Data.Configured}}
+          <form method="post" action="/recipients/{{.R.Alias}}/test">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="secondary sm"><svg class="icon" aria-hidden="true"><use href="#icon-mail"/></svg>Send</button>
+          </form>{{else}}<span class="muted">unavailable</span>{{end}}</td>
       </tr>
     {{end}}
     </tbody>
@@ -20,6 +24,7 @@
   </div>
 </section>
 <p class="small muted">Agents see only alias and description.</p>
+{{if not .Data.Configured}}<p class="small muted">{{.Data.Missing}} <a href="/settings#upstream">Set it on the Settings page</a> to send a test message.</p>{{end}}
 {{else}}
 <section class="card">
   <div class="empty">
